@@ -44,4 +44,4 @@ USER botuser
 
 # Entrypoint: start via the Telegram controller so /start launches the bot
 # (switch to `python main.py` if you want the bot to start automatically)
-CMD ["python", "telegram/controller.py"]
+CMD ["python", "main.py"]
