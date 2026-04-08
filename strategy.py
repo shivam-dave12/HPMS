@@ -136,9 +136,7 @@ class HPMSStrategy:
             self._last_signal = signal
 
             if signal is None or signal.signal_type == SignalType.FLAT:
-                # Log the flat reason at DEBUG (not INFO) — one line per bar is too spammy
-                if signal:
-                    logger.debug(f"bar={self._bar_count} FLAT | {signal.reason}")
+                # Engine already emits per-bar INFO diagnostics in on_bar_close
                 return signal
 
             # ── Signal present: try to trade ──────────────────────────────────

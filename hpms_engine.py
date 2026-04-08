@@ -695,6 +695,43 @@ class HPMSEngine:
 
         self._state.signal_count += 1
 
+        # ── INFO-level bar summary — always visible, no DEBUG needed ─────────
+        bar_n = self._state.signal_count
+        pct   = lambda v: f"{v*100:+.4f}%"  # noqa: E731
+
+        if signal_type != SignalType.FLAT:
+            logger.info(
+                f"▶ bar#{bar_n:4d}  ${current_price:,.1f}  "
+                f"Δq={pct(predicted_pct_move)}  "
+                f"|dH/dt|={abs(dH_dt):.5f}  |p|={abs(p_pred):.6f}  "
+                f"→ {signal_type.name}  conf={confidence:.1%}  "
+                f"TP=${tp_price:,.1f}  SL=${sl_price:,.1f}  [{compute_us:.0f}µs]"
+            )
+        else:
+            dq_pct  = abs(predicted_pct_move) / self._delta_q_threshold * 100 if self._delta_q_threshold else 0
+            dh_pct  = abs(dH_dt) / self._dH_dt_max * 100 if self._dH_dt_max else 0
+            mom_pct = abs(p_pred) / self._min_momentum * 100 if self._min_momentum else 0
+            g = lambda ok: "✓" if ok else "✗"  # noqa: E731
+            blockers = []
+            if not delta_q_ok:
+                blockers.append(f"{g(False)}Δq={pct(predicted_pct_move)}({dq_pct:.0f}%/thr)")
+            if not energy_conserved:
+                blockers.append(f"{g(False)}dH={abs(dH_dt):.5f}({dh_pct:.0f}%/max)")
+            if not momentum_ok:
+                blockers.append(f"{g(False)}|p|={abs(p_pred):.6f}({mom_pct:.0f}%/min)")
+            if self._acceleration_check:
+                if predicted_pct_move > 0 and not accel_long:
+                    blockers.append(f"✗accel_L(dVdq={dV_at_q:+.5f},p={p_pred:+.5f})")
+                elif predicted_pct_move < 0 and not accel_short:
+                    blockers.append(f"✗accel_S(dVdq={dV_at_q:+.5f},p={p_pred:+.5f})")
+            blocking_str = "  ".join(blockers) if blockers else "no criteria met"
+            logger.info(
+                f"  bar#{bar_n:4d}  ${current_price:,.1f}  "
+                f"q={q_now:+.4f} p={p_now:+.5f} H={H_now:.4f} "
+                f"dH/dt={dH_dt:+.5f} KDE={'OK' if self._landscape.is_built else 'NO'}  "
+                f"FLAT {blocking_str}"
+            )
+
         return HPMSSignal(
             signal_type=signal_type,
             confidence=confidence,

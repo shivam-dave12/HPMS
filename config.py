@@ -45,11 +45,15 @@ HPMS_TRAJECTORY_LOG_DEPTH = 20     # keep last N trajectories for diagnostics
 # ═══════════════════════════════════════════════════════════════════════════════
 # SIGNAL THRESHOLDS
 # ═══════════════════════════════════════════════════════════════════════════════
-SIGNAL_DELTA_Q_THRESHOLD  = 0.0022  # 0.22% predicted move for entry
-SIGNAL_DH_DT_MAX          = 0.05    # max |dH/dt| for energy conservation check
+# delta_q_threshold: predicted log-price move required for entry.
+#   predicted_pct_move = delta_q_zscored * std(log_prices_120bar)
+#   On 1m BTC, std_log ≈ 0.001–0.003, so 0.0022 required delta_q>0.73–2.2σ
+#   — almost never fires.  0.0006 = ~0.06% predicted move, ~$43 at $71k. 
+SIGNAL_DELTA_Q_THRESHOLD  = 0.0006  # was 0.0022 — lowered to fire on 1m BTC
+SIGNAL_DH_DT_MAX          = 0.08    # was 0.05 — slightly relaxed
 SIGNAL_H_PERCENTILE       = 99.0    # skip if |H| above this percentile (chaotic)
-SIGNAL_MIN_MOMENTUM       = 0.0001  # min |predicted p| at horizon
-SIGNAL_ACCELERATION_CHECK = True    # require downhill acceleration in V(q)
+SIGNAL_MIN_MOMENTUM       = 0.00005 # was 0.0001 — lowered to match scaled units
+SIGNAL_ACCELERATION_CHECK = False   # was True — disable until signal rate confirmed
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TRADE EXECUTION

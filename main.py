@@ -45,16 +45,74 @@ logger = logging.getLogger("hpms")
 # LOGGING SETUP
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class _ColoredFormatter(logging.Formatter):
+    """
+    Pretty, color-coded terminal formatter.
+    Strips the package prefix from logger names so the column stays narrow.
+    """
+    _RESET  = "\033[0m"
+    _BOLD   = "\033[1m"
+    _DIM    = "\033[2m"
+    _LEVELS = {
+        logging.DEBUG:    ("\033[36m",  "DBG"),   # cyan
+        logging.INFO:     ("\033[32m",  "INF"),   # green
+        logging.WARNING:  ("\033[33m",  "WRN"),   # yellow
+        logging.ERROR:    ("\033[31m",  "ERR"),   # red
+        logging.CRITICAL: ("\033[35m",  "CRT"),   # magenta
+    }
+    # Short display names for known loggers
+    _NAME_MAP = {
+        "hpms":                       "HPMS",
+        "strategy":                   "STRAT",
+        "hpms_engine":                "ENGINE",
+        "risk_manager":               "RISK",
+        "order_manager":              "ORDER",
+        "telegram_bot":               "TG",
+        "logger_core":                "ELOG",
+        "exchanges.delta.api":        "DAPI",
+        "exchanges.delta.data_manager": "DATA",
+        "exchanges.delta.websocket":  "WS",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        color, lvl = self._LEVELS.get(record.levelno, ("", "???"))
+        short_name = self._NAME_MAP.get(record.name, record.name.split(".")[-1][:8])
+        ts = self.formatTime(record, "%H:%M:%S")
+        ms = f"{record.msecs:03.0f}"
+        header = (
+            f"{self._DIM}{ts}.{ms}{self._RESET} "
+            f"{color}{self._BOLD}{lvl}{self._RESET} "
+            f"{self._DIM}{short_name:<8}{self._RESET} "
+        )
+        msg = record.getMessage()
+        # Indent continuation lines
+        msg_indented = msg.replace("\n", "\n" + " " * 24)
+        if record.exc_info:
+            msg_indented += "\n" + self.formatException(record.exc_info)
+        return header + msg_indented
+
+
 def setup_logging():
     root = logging.getLogger()
     root.setLevel(getattr(logging, config.LOG_LEVEL, logging.INFO))
-    fmt = logging.Formatter(
-        "%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+
     ch = logging.StreamHandler()
-    ch.setFormatter(fmt)
+    ch.setFormatter(_ColoredFormatter())
     root.addHandler(ch)
+
+    # ── Silence noisy third-party loggers ────────────────────────────────────
+    # httpx logs every single getUpdates poll — suppress to WARNING
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    # python-telegram-bot internals
+    logging.getLogger("telegram").setLevel(logging.WARNING)
+    logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+    logging.getLogger("apscheduler").setLevel(logging.WARNING)
+    # Exchange websocket reconnect chatter
+    logging.getLogger("websocket").setLevel(logging.WARNING)
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+    # hpms.elog stays at DEBUG so structured traces are available with LOG_LEVEL=DEBUG
+    # but won't surface at INFO (desired behaviour)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
