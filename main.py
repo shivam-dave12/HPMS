@@ -1,11 +1,17 @@
 """
 main.py — HPMS System Orchestrator
 =====================================
+Initializes all components and runs the main loop:
+  DataManager -> HPMSEngine -> Strategy -> OrderManager -> TelegramBot
+
 Usage:
   python main.py              # live mode
   python main.py --testnet    # testnet mode
-  python main.py --dry-run    # signal-only, no orders
-  python main.py --no-auto-start  # start paused; enable via /start_trading
+  python main.py --dry-run    # signal-only mode (no orders)
+
+NOTE: All conditional strings are pre-computed OUTSIDE f-strings to maintain
+compatibility with Python 3.6 - 3.11 (f-string expressions cannot include
+backslashes in those versions).
 """
 
 from __future__ import annotations
@@ -26,6 +32,9 @@ from risk_manager import RiskManager
 from order_manager import OrderManager
 from strategy import HPMSStrategy
 from telegram_bot import TelegramBot
+from logger_core import elog
+from state import STATE
+
 from exchanges.delta.api import DeltaAPI
 from exchanges.delta.data_manager import DeltaDataManager
 
@@ -39,7 +48,6 @@ logger = logging.getLogger("hpms")
 def setup_logging():
     root = logging.getLogger()
     root.setLevel(getattr(logging, config.LOG_LEVEL, logging.INFO))
-
     fmt = logging.Formatter(
         "%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -48,47 +56,36 @@ def setup_logging():
     ch.setFormatter(fmt)
     root.addHandler(ch)
 
-    # ── Silence noisy third-party loggers ─────────────────────────────────────
-    # httpx fires INFO on every Telegram getUpdates poll (~every 10s).
-    # None of that is useful — suppress to WARNING so real errors still show.
-    for noisy in ("httpx", "telegram", "telegram.ext",
-                  "telegram.ext.Application", "telegram.ext.Updater",
-                  "websocket"):          # low-level websocket-client library
-        logging.getLogger(noisy).setLevel(logging.WARNING)
-
-    # Exchange layers: WS subscription spam → WARNING; DM warmup → INFO; API → WARNING
-    logging.getLogger("exchanges.delta.websocket").setLevel(logging.WARNING)
-    logging.getLogger("exchanges.delta.data_manager").setLevel(logging.INFO)
-    logging.getLogger("exchanges.delta.api").setLevel(logging.WARNING)
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DRY-RUN API STUB
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class DryRunAPI:
-    """Passes read-only calls to real API; returns fake success for all writes."""
-
-    _READ = {
-        "get_ticker", "get_tickers", "get_orderbook", "get_candles",
-        "get_balance", "get_positions", "get_position", "get_open_orders",
-        "get_product_id", "prefetch_product_ids", "get_server_time",
-        "get_wallet_balances", "get_products", "get_product",
-        "get_recent_trades", "get_funding_rate", "get_mark_price",
-        "self_test", "_symbol_to_product_id", "get_leverage",
-    }
+    """Simulates API calls without touching the exchange."""
 
     def __init__(self, real_api):
         self._real = real_api
 
     def __getattr__(self, name):
-        if name in self._READ:
+        _READ_METHODS = {
+            "get_ticker", "get_tickers", "get_orderbook", "get_candles",
+            "get_balance", "get_positions", "get_position", "get_open_orders",
+            "get_product_id", "prefetch_product_ids", "get_server_time",
+            "get_wallet_balances", "get_products", "get_product",
+            "get_recent_trades", "get_funding_rate", "get_mark_price",
+            "self_test", "_symbol_to_product_id",
+        }
+        if name in _READ_METHODS:
             return getattr(self._real, name)
+
         def fake(*args, **kwargs):
-            logger.debug(f"[DRY-RUN] {name}({args}, {kwargs})")
-            return {"success": True,
-                    "result": {"order_id": f"dry_{int(time.time()*1000)}", "status": "simulated"},
-                    "error": None}
+            elog.log("SYSTEM_START", component="DryRunAPI", call=name)
+            return {
+                "success": True,
+                "result":  {"order_id": "dry_" + str(int(time.time() * 1000)), "status": "simulated"},
+                "error":   None,
+            }
         return fake
 
 
@@ -97,14 +94,12 @@ class DryRunAPI:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class HPMSRunner:
-    HEARTBEAT_INTERVAL          = 300   # console heartbeat every 5 min
-    TELEGRAM_HEARTBEAT_INTERVAL = 3600  # Telegram hourly summary
+    """Main application runner."""
 
-    def __init__(self, dry_run=False, testnet=False, auto_start=True):
-        self._dry_run    = dry_run
-        self._testnet    = testnet or config.DELTA_TESTNET
-        self._auto_start = auto_start
-        self._shutdown   = threading.Event()
+    def __init__(self, dry_run=False, testnet=False):
+        self._dry_run  = dry_run
+        self._testnet  = testnet or config.DELTA_TESTNET
+        self._shutdown = threading.Event()
 
         self._api      = None
         self._data_mgr = None
@@ -115,30 +110,52 @@ class HPMSRunner:
         self._telegram = None
 
     def start(self):
-        mode = "DRY-RUN" if self._dry_run else "LIVE"
-        net  = "TESTNET" if self._testnet else "MAINNET"
+        # Pre-compute all display strings OUTSIDE f-strings.
+        # This eliminates the "f-string expression part cannot include a backslash"
+        # SyntaxError that occurs on Python 3.6 - 3.11 when ternary operators
+        # or string literals containing backslashes appear inside {}.
+        mode_str = "DRY-RUN" if self._dry_run else "LIVE"
+        net_str  = "TESTNET" if self._testnet  else "MAINNET"
+
+        elog.log("SYSTEM_START", component="HPMSRunner",
+                 mode=mode_str, network=net_str, symbol=config.DELTA_SYMBOL)
 
         logger.info("=" * 60)
-        logger.info(f"  HPMS  |  {mode}  |  {net}  |  {config.DELTA_SYMBOL}")
+        logger.info("  HPMS - Hamiltonian Phase-Space Micro-Scalping")
+        logger.info("  Mode:    " + mode_str)
+        logger.info("  Network: " + net_str)
+        logger.info("  Symbol:  " + config.DELTA_SYMBOL)
         logger.info("=" * 60)
 
-        # 1 — API
+        # ── 0. Validate critical config ───────────────────────────────────────
+        if not config.TELEGRAM_BOT_TOKEN:
+            elog.error("SYSTEM_START", error="TELEGRAM_BOT_TOKEN missing", component="config")
+            logger.error("TELEGRAM NOT CONFIGURED: TELEGRAM_BOT_TOKEN is empty")
+        if not config.TELEGRAM_CHAT_ID:
+            elog.error("SYSTEM_START", error="TELEGRAM_CHAT_ID missing", component="config")
+            logger.error("TELEGRAM NOT CONFIGURED: TELEGRAM_CHAT_ID is empty")
+
+        # ── 1. Exchange API ───────────────────────────────────────────────────
         if self._testnet:
             config.DELTA_TESTNET = True
-        real_api = DeltaAPI(api_key=config.DELTA_API_KEY,
-                            secret_key=config.DELTA_SECRET_KEY,
-                            testnet=config.DELTA_TESTNET)
-        self._api = DryRunAPI(real_api) if self._dry_run else real_api
-        logger.info("API ready")
 
-        # 2 — Data Manager
+        real_api = DeltaAPI(
+            api_key=config.DELTA_API_KEY,
+            secret_key=config.DELTA_SECRET_KEY,
+            testnet=config.DELTA_TESTNET,
+        )
+        self._api = DryRunAPI(real_api) if self._dry_run else real_api
+        elog.log("SYSTEM_START", component="DeltaAPI",
+                 testnet=config.DELTA_TESTNET, dry_run=self._dry_run)
+
+        # ── 2. Data Manager ──────────────────────────────────────────────────
         self._data_mgr = DeltaDataManager()
         if not self._data_mgr.start():
-            logger.error("DataManager failed to start — aborting")
+            elog.error("SYSTEM_START", error="DataManager failed to start")
             return False
-        logger.info("DataManager ready")
+        elog.log("SYSTEM_START", component="DeltaDataManager", status="ready")
 
-        # 3 — HPMS Engine
+        # ── 3. HPMS Engine ────────────────────────────────────────────────────
         self._engine = HPMSEngine(
             tau=config.HPMS_TAU,
             lookback=config.HPMS_LOOKBACK,
@@ -160,13 +177,8 @@ class HPMSRunner:
             kde_rebuild_interval=config.HPMS_KDE_REBUILD_INTERVAL,
             trajectory_log_depth=config.HPMS_TRAJECTORY_LOG_DEPTH,
         )
-        logger.info(
-            f"HPMS Engine ready — τ={config.HPMS_TAU} lookback={config.HPMS_LOOKBACK} "
-            f"horizon={config.HPMS_PREDICTION_HORIZON} integrator={config.HPMS_INTEGRATOR} "
-            f"TP={config.TRADE_TP_PCT:.2%} SL={config.TRADE_SL_PCT:.2%}"
-        )
 
-        # 4 — Risk Manager
+        # ── 4. Risk Manager ──────────────────────────────────────────────────
         self._risk = RiskManager(
             max_position_usd=config.RISK_MAX_POSITION_USD,
             max_position_contracts=config.RISK_MAX_POSITION_CONTRACTS,
@@ -178,26 +190,20 @@ class HPMSRunner:
             max_drawdown_pct=config.RISK_MAX_DRAWDOWN_PCT,
             equity_pct_per_trade=config.RISK_EQUITY_PCT_PER_TRADE,
         )
-        logger.info(
-            f"Risk Manager ready — max_loss=${config.RISK_MAX_DAILY_LOSS_USD} "
-            f"max_trades={config.RISK_MAX_DAILY_TRADES} cooldown={config.RISK_COOLDOWN_SECONDS}s "
-            f"max_consec_loss={config.RISK_MAX_CONSECUTIVE_LOSSES}"
-        )
 
-        # 5 — Order Manager
+        # ── 5. Order Manager ─────────────────────────────────────────────────
         self._orders = OrderManager(
             api=self._api,
             symbol=config.DELTA_SYMBOL,
             contract_value=getattr(config, "TRADE_CONTRACT_VALUE", 0.001),
         )
-        logger.info("Order Manager ready")
 
-        # 6 — Telegram Bot (start early so it can receive commands during setup)
+        # ── 6. Telegram Bot ──────────────────────────────────────────────────
         self._telegram = TelegramBot(
             token=config.TELEGRAM_BOT_TOKEN,
             chat_id=config.TELEGRAM_CHAT_ID,
             admin_ids=config.TELEGRAM_ADMIN_IDS,
-            strategy=None,   # filled after strategy init
+            strategy=None,
             engine=self._engine,
             risk_mgr=self._risk,
             order_mgr=self._orders,
@@ -205,9 +211,8 @@ class HPMSRunner:
             api=self._api,
             config=config,
         )
-        self._telegram.start()
 
-        # 7 — Strategy
+        # ── 7. Strategy ──────────────────────────────────────────────────────
         self._strategy = HPMSStrategy(
             engine=self._engine,
             risk_mgr=self._risk,
@@ -217,156 +222,113 @@ class HPMSRunner:
             config=config,
             notify_fn=self._telegram.send_message,
         )
-        # Back-fill the strategy reference into the bot
         self._telegram._strategy = self._strategy
 
-        # Wire Telegram notifier into RiskManager so circuit-breaker halts
-        # push to Telegram instantly without going through the strategy.
-        self._risk.set_notify_fn(self._telegram.send_message)
-
-        logger.info("Strategy ready")
-
-        # 8 — Leverage
+        # ── 8. Set leverage on exchange ───────────────────────────────────────
         try:
             self._api.set_leverage(symbol=config.DELTA_SYMBOL, leverage=config.RISK_LEVERAGE)
-            logger.info(f"Leverage confirmed: {config.RISK_LEVERAGE}x")
+            elog.log("RISK_PARAM_UPDATE", key="leverage",
+                     value=config.RISK_LEVERAGE, source="startup")
         except Exception as e:
-            logger.warning(f"Leverage set failed (non-fatal): {e}")
+            elog.error("SYSTEM_START", error=str(e), stage="set_leverage")
 
-        # 9 — Auto-start
-        if self._auto_start:
-            self._strategy.start()
-        else:
-            logger.info("Strategy PAUSED — send /start_trading in Telegram to begin")
+        # ── 9. Start Telegram ─────────────────────────────────────────────────
+        self._telegram.start()
 
-        # 10 — Startup notification (small delay ensures bot loop is ready)
-        time.sleep(2)
+        # ── 10. Start strategy (sets STATE.trading_enabled = True) ────────────
+        self._strategy.start()
+
+        elog.log("SYSTEM_START", component="HPMSRunner", status="fully_operational")
+
+        # Startup notification — built with concatenation, no f-string ternaries
         self._telegram.send_message(
-            f"🚀 *HPMS Online*\n"
-            f"Mode: `{mode}` | Net: `{net}`\n"
-            f"Symbol: `{config.DELTA_SYMBOL}` | Lev: `{config.RISK_LEVERAGE}x`\n"
-            f"Strategy: `{'▶ RUNNING' if self._auto_start else '⏸ PAUSED — /start\\_trading to begin'}`\n"
-            f"TP `{config.TRADE_TP_PCT:.2%}` | SL `{config.TRADE_SL_PCT:.2%}` | "
-            f"MaxLoss `${config.RISK_MAX_DAILY_LOSS_USD}`\n"
-            f"τ=`{config.HPMS_TAU}` lb=`{config.HPMS_LOOKBACK}` "
-            f"hz=`{config.HPMS_PREDICTION_HORIZON}` ({config.HPMS_INTEGRATOR})"
+            "*HPMS System Online*\n\n"
+            "Mode: " + mode_str + "\n"
+            "Network: " + net_str + "\n"
+            "Symbol: " + config.DELTA_SYMBOL + "\n"
+            "Leverage: " + str(config.RISK_LEVERAGE) + "x\n"
+            "Integrator: " + str(config.HPMS_INTEGRATOR) + "\n"
+            "tau=" + str(config.HPMS_TAU) +
+            " lookback=" + str(config.HPMS_LOOKBACK) +
+            " horizon=" + str(config.HPMS_PREDICTION_HORIZON)
         )
 
-        logger.info("🚀 HPMS fully operational")
         self._main_loop()
         return True
 
     # ─── MAIN LOOP ────────────────────────────────────────────────────────────
 
     def _main_loop(self):
-        last_bar_ts             = 0
-        last_heartbeat          = time.time()
-        last_tg_heartbeat       = time.time()
-        last_health_check       = time.time()
-        health_interval         = 60
+        """
+        Polls DataManager for new 1m candles and feeds them to the strategy.
+        Uses TIMESTAMP-based bar detection — immune to deque maxlen rollover.
+        """
+        last_bar_ts           = 0
+        health_check_interval = 60
+        last_health_check     = time.time()
 
         while not self._shutdown.is_set():
             try:
                 candles = self._data_mgr.get_candles("1m", limit=300)
+
                 if candles:
                     newest_ts = candles[-1].get("t", 0)
                     if newest_ts > last_bar_ts:
                         last_bar_ts = newest_ts
                         self._strategy.on_bar_close(candles)
 
-                now = time.time()
-
-                if now - last_heartbeat > self.HEARTBEAT_INTERVAL:
-                    last_heartbeat = now
-                    self._console_heartbeat()
-
-                if now - last_tg_heartbeat > self.TELEGRAM_HEARTBEAT_INTERVAL:
-                    last_tg_heartbeat = now
-                    self._telegram_heartbeat()
-
-                if now - last_health_check > health_interval:
-                    last_health_check = now
+                if time.time() - last_health_check > health_check_interval:
+                    last_health_check = time.time()
                     self._health_check()
 
                 self._shutdown.wait(0.5)
 
             except Exception as e:
-                logger.error(f"Main loop error: {e}", exc_info=True)
-                self._telegram.send_message(f"⚠️ Main loop error: `{e}`")
+                elog.error("SYSTEM_START", error=str(e), stage="main_loop")
                 time.sleep(5)
-
-    def _console_heartbeat(self):
-        price   = self._data_mgr.get_last_price() if self._data_mgr else 0
-        risk    = self._risk.get_status()
-        pos     = self._orders.get_status()
-        in_pos  = f"IN {pos['side'].upper()} {pos['size']}c" if pos.get("in_position") else "flat"
-        logger.info(
-            f"♥ price=${price:,.1f} | {in_pos} "
-            f"| pnl=${risk['daily_pnl']:+.2f} | trades={risk['trades_today']} "
-            f"| strategy={'ON' if self._strategy.is_enabled else 'OFF'} "
-            f"| halted={risk['is_halted']}"
-        )
-
-    def _telegram_heartbeat(self):
-        price  = self._data_mgr.get_last_price() if self._data_mgr else 0
-        risk   = self._risk.get_status()
-        pos    = self._orders.get_status()
-        pos_tx = (f"📈 {pos['side'].upper()} {pos['size']}c @ ${pos['entry_price']:,.1f}"
-                  if pos.get("in_position") else "⬜ Flat")
-        self._telegram.send_message(
-            f"📊 *Hourly Summary*\n"
-            f"Price: `${price:,.1f}`\n"
-            f"Position: {pos_tx}\n"
-            f"Daily PnL: `${risk['daily_pnl']:+.2f}`\n"
-            f"Trades: `{risk['trades_today']}` | Consec losses: `{risk['consecutive_losses']}`\n"
-            f"Strategy: `{'ON ▶' if self._strategy.is_enabled else 'OFF ⏸'}`\n"
-            f"Risk: `{'🔴 HALTED — ' + risk['halt_reason'] if risk['is_halted'] else '🟢 OK'}`"
-        )
 
     def _health_check(self):
         if not self._data_mgr.is_ready:
-            logger.warning("DataManager not ready — restarting streams")
-            self._telegram.send_message("⚠️ *DataManager not ready* — restarting WS streams")
+            elog.warn("SYSTEM_HEALTH", issue="DataManager_not_ready")
+            self._telegram.send_message("DataManager not ready - restarting streams")
             self._data_mgr.restart_streams()
-        elif not self._data_mgr.is_price_fresh(max_stale_seconds=120):
-            logger.warning("Price data stale (>120s)")
-            self._telegram.send_message("⚠️ *Price data stale* (>2 min) — check connection")
 
-    # ─── SHUTDOWN ─────────────────────────────────────────────────────────────
+        if not self._data_mgr.is_price_fresh(max_stale_seconds=120):
+            elog.warn("SYSTEM_HEALTH", issue="price_stale_gt_120s")
+            self._telegram.send_message("Price data stale - check exchange connection")
 
     def shutdown(self):
-        logger.info("Shutting down HPMS...")
+        elog.log("SYSTEM_SHUTDOWN", component="HPMSRunner")
         self._shutdown.set()
+
         if self._strategy:
             self._strategy.stop()
         if self._orders and self._orders.is_in_position:
-            logger.warning("Closing open position on shutdown")
+            elog.warn("SYSTEM_SHUTDOWN", note="closing_open_position")
             price = self._data_mgr.get_last_price() if self._data_mgr else 0
             self._orders.close_position(reason="SHUTDOWN", current_price=price)
         if self._data_mgr:
             self._data_mgr.stop()
         if self._telegram:
-            self._telegram.send_message("🔌 *HPMS Shutdown*")
-            time.sleep(1)
+            self._telegram.send_message("*HPMS System Shutdown*")
             self._telegram.stop()
-        logger.info("Shutdown complete")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
     parser = argparse.ArgumentParser(description="HPMS Trading System")
-    parser.add_argument("--dry-run",       action="store_true")
-    parser.add_argument("--testnet",       action="store_true")
-    parser.add_argument("--no-auto-start", action="store_true",
-                        help="Start paused; use /start_trading in Telegram")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--testnet", action="store_true")
     args = parser.parse_args()
 
     setup_logging()
-    runner = HPMSRunner(dry_run=args.dry_run, testnet=args.testnet,
-                        auto_start=not args.no_auto_start)
 
-    def handle_signal(sig, frame):
+    runner = HPMSRunner(dry_run=args.dry_run, testnet=args.testnet)
+
+    def handle_signal(signum, frame):
         runner.shutdown()
         sys.exit(0)
 
@@ -378,7 +340,7 @@ def main():
     except KeyboardInterrupt:
         runner.shutdown()
     except Exception as e:
-        logger.critical(f"Fatal error: {e}", exc_info=True)
+        elog.error("SYSTEM_SHUTDOWN", error=str(e), stage="fatal")
         runner.shutdown()
         sys.exit(1)
 
