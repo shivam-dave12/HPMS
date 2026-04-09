@@ -320,30 +320,89 @@ class HPMSRunner:
 
     # ─── MAIN LOOP ────────────────────────────────────────────────────────────
 
+    def _warm_start(self):
+        """
+        Immediately feed REST warmup candles into the strategy so the engine
+        starts building H-history without waiting up to 60 s for the first
+        live WebSocket bar to close.
+
+        Returns the timestamp of the most recent warmup candle so the main
+        loop knows not to re-process it.
+        """
+        try:
+            candles = self._data_mgr.get_candles("1m", limit=300)
+            if not candles:
+                logger.warning("[WARM_START] DataManager returned no candles — "
+                               "engine will wait for first live bar")
+                return 0
+
+            last_ts    = candles[-1].get("t", 0)
+            last_price = candles[-1].get("c", 0)
+            logger.info(
+                "[WARM_START] feeding %d warmup candles into engine "
+                "(last ts=%s price=%.1f)",
+                len(candles), last_ts, last_price,
+            )
+            self._strategy.on_bar_close(candles)
+            logger.info("[WARM_START] done — engine history primed, "
+                        "main loop will wait for next live bar")
+            return last_ts
+
+        except Exception as e:
+            logger.error("[WARM_START] exception: %s", e, exc_info=True)
+            return 0
+
     def _main_loop(self):
         """
         Polls DataManager for new 1m candles and feeds them to the strategy.
         Uses TIMESTAMP-based bar detection — immune to deque maxlen rollover.
+
+        IMPORTANT: get_candles() may return an empty list during the first
+        ~60 s if the DataManager's live buffer is separate from the REST
+        warmup buffer and no WebSocket bar has closed yet.  The warm_start()
+        call above pre-populates the engine from REST data so the system is
+        active from second 0.
         """
-        last_bar_ts           = 0
+        # Prime the engine with REST warmup data immediately
+        last_bar_ts = self._warm_start()
+
         health_check_interval = 60
         last_health_check     = time.time()
+        poll_n                = 0
 
         while not self._shutdown.is_set():
             try:
+                poll_n += 1
                 candles = self._data_mgr.get_candles("1m", limit=300)
 
-                if candles:
-                    newest_ts = candles[-1].get("t", 0)
-                    if newest_ts > last_bar_ts:
+                if not candles:
+                    # Normal for the first ~60 s if the WS buffer is separate
+                    # from the REST warmup buffer.  Log every 20 polls (~10 s)
+                    # so the terminal shows the loop is alive.
+                    if poll_n % 20 == 1:
                         logger.debug(
-                            "[LOOP] new bar ts=%s candles=%d last_close=%s",
-                            newest_ts, len(candles), candles[-1].get("c", "?"),
+                            "[LOOP] poll #%d — DataManager returned no candles "
+                            "(waiting for first live bar close)", poll_n
+                        )
+                else:
+                    newest_ts  = candles[-1].get("t", 0)
+                    last_close = candles[-1].get("c", 0)
+
+                    if newest_ts > last_bar_ts:
+                        logger.info(
+                            "[LOOP] ▶ new bar detected | ts=%s close=%.1f "
+                            "candles=%d poll=#%d",
+                            newest_ts, last_close, len(candles), poll_n,
                         )
                         last_bar_ts = newest_ts
                         self._strategy.on_bar_close(candles)
                     else:
-                        logger.debug("[LOOP] poll — waiting for next bar (last_ts=%s)", newest_ts)
+                        # Throttle: log once every 20 polls (~10 s)
+                        if poll_n % 20 == 1:
+                            logger.debug(
+                                "[LOOP] poll #%d — same bar ts=%s close=%.1f",
+                                poll_n, newest_ts, last_close,
+                            )
 
                 if time.time() - last_health_check > health_check_interval:
                     last_health_check = time.time()
@@ -352,7 +411,9 @@ class HPMSRunner:
                 self._shutdown.wait(0.5)
 
             except Exception as e:
-                elog.error("SYSTEM_START", error=str(e), stage="main_loop")
+                logger.error("[LOOP] unhandled exception (will retry in 5s): %s",
+                             e, exc_info=True)
+                elog.error("SYSTEM_MAIN_LOOP", error=str(e), stage="main_loop")
                 time.sleep(5)
 
     def _health_check(self):
