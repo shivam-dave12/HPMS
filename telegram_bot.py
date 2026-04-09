@@ -90,6 +90,11 @@ def _mk(text: str) -> str:
     return text
 
 
+def _md_safe(text: str) -> str:
+    """Strip characters that break Telegram Markdown v1 code-spans (backticks, asterisks)."""
+    return str(text).replace("`", "'").replace("*", "x").replace("_", "-")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # TELEGRAM BOT
 # ══════════════════════════════════════════════════════════════════════════════
@@ -576,7 +581,7 @@ class TelegramBot:
                     f"(min {mom_thresh})",
                     f"\n  Signal:     *{sig.signal_type.name}*  "
                     f"conf `{sig.confidence:.1%}`",
-                    f"  Reason:     `{sig.reason[:100]}`",
+                    f"  Reason:     `{_md_safe(sig.reason[:100])}`",
                     f"  Compute:    `{sig.compute_time_us:.0f}µs`",
                 ]
             else:
@@ -591,7 +596,7 @@ class TelegramBot:
                 cd = rs.get("cooldown_remaining", 0)
                 lines += [
                     f"  {_gate(can_trade)} Can trade: `{reason}`",
-                    f"  Halted:    `{'Yes — ' + rs.get('halt_reason','') if rs.get('is_halted') else 'No'}`",
+                    f"  Halted:    `{'Yes — ' + _md_safe(rs.get('halt_reason','')) if rs.get('is_halted') else 'No'}`",
                     f"  Cooldown:  `{cd:.0f}s` remaining",
                     f"  Daily PnL: `${rs.get('daily_pnl', 0):+.2f}` "
                     f"/ limit `${p.get('max_daily_loss', '?')}`",
@@ -624,7 +629,11 @@ class TelegramBot:
             else:
                 lines.append("  👀 Watching — no signal this bar")
 
-            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+            try:
+                await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+            except Exception:
+                plain = "\n".join(lines).replace("`", "").replace("*", "").replace("_", "")
+                await update.message.reply_text(plain)
 
         except Exception as e:
             logger.error(f"Thinking error: {e}", exc_info=True)

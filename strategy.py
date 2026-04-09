@@ -184,8 +184,7 @@ class HPMSStrategy:
                 )
                 self._push(
                     f"⚠️ *Margin too low* — need `${margin_needed:.2f}` for `{size}c` "
-                    f"@ `{leverage}x` lev, have `${equity:.2f}`
-"
+                    f"@ `{leverage}x` lev, have `${equity:.2f}`\n"
                     f"Use /leverage to raise leverage or deposit funds."
                 )
                 return signal
