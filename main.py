@@ -259,6 +259,8 @@ class HPMSRunner:
             symbol=config.DELTA_SYMBOL,
             contract_value=getattr(config, "TRADE_CONTRACT_VALUE", 0.001),
         )
+        # Wire real-time fill/order events from WebSocket into OrderManager
+        self._orders.register_with_data_manager(self._data_mgr)
 
         # ── 6. Telegram Bot ──────────────────────────────────────────────────
         self._telegram = TelegramBot(

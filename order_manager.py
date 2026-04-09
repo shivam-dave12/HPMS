@@ -301,6 +301,107 @@ class OrderManager:
             if self._position_side:
                 self._entry_bar += 1
 
+    # ─── DATA MANAGER INTEGRATION ────────────────────────────────────────────
+
+    def register_with_data_manager(self, data_mgr) -> None:
+        """
+        Wire real-time order/fill events from DataManager's WebSocket.
+        Call once after both objects are constructed.
+        """
+        data_mgr.register_fill_callback(self._on_ws_fill)
+        data_mgr.register_order_callback(self._on_ws_order)
+        logger.info("OrderManager registered fill+order callbacks with DataManager")
+
+    def _on_ws_fill(self, data: dict) -> None:
+        """
+        Called immediately when the WS fills channel fires.
+        Detects bracket TP/SL fills and records the actual exit price + PnL.
+        """
+        with self._lock:
+            if self._position_side is None:
+                return
+            try:
+                fill_price = float(data.get("price") or data.get("fill_price") or 0)
+                fill_side  = str(data.get("side", "")).lower()   # "buy" | "sell"
+                fill_size  = float(data.get("size") or data.get("fill_quantity") or 0)
+                role       = str(data.get("role", "")).lower()   # "taker" | "maker"
+
+                if fill_price <= 0 or fill_size <= 0:
+                    return
+
+                # Exit fills are on the OPPOSITE side to our position
+                expected_exit_side = "buy" if self._position_side == "short" else "sell"
+                if fill_side != expected_exit_side:
+                    return
+
+                # Determine TP vs SL from price
+                reason = self._classify_exit(fill_price)
+                pnl    = self._compute_pnl(fill_price)
+
+                logger.info(
+                    f"🔔 WS FILL detected: {reason} {self._position_side.upper()} "
+                    f"fill_price={fill_price:.1f} pnl=${pnl:.2f}"
+                )
+
+                if self._on_close_cb:
+                    self._on_close_cb(fill_price, pnl, self._entry_bar, reason)
+                self._reset_position()
+
+            except Exception as e:
+                logger.debug(f"_on_ws_fill error: {e}")
+
+    def _on_ws_order(self, data: dict) -> None:
+        """
+        Called when WS order state changes. Used as a belt-and-suspenders
+        check: if an order in 'closed'/'filled' state arrives and we're still
+        tracking a position, trigger reconcile.
+        """
+        with self._lock:
+            if self._position_side is None:
+                return
+            state = str(data.get("state", "")).lower()
+            if state in ("filled", "closed", "cancelled"):
+                logger.debug(f"WS order state={state} — scheduling reconcile check")
+
+    # ─── PNL HELPERS ──────────────────────────────────────────────────────────
+
+    def _compute_pnl(self, exit_price: float) -> float:
+        """Compute USD PnL for the current open position at the given exit price."""
+        if exit_price <= 0 or self._entry_price <= 0:
+            return 0.0
+        diff = exit_price - self._entry_price
+        if self._position_side == "short":
+            diff = -diff
+        return diff * self._contract_value * self._position_size
+
+    def _classify_exit(self, exit_price: float) -> str:
+        """Return 'TP_HIT', 'SL_HIT', or 'EXCHANGE_CLOSE' based on price vs entry."""
+        if exit_price <= 0:
+            return "EXCHANGE_CLOSE"
+        if self._position_side == "long":
+            return "TP_HIT" if exit_price > self._entry_price else "SL_HIT"
+        else:
+            return "TP_HIT" if exit_price < self._entry_price else "SL_HIT"
+
+    def _get_exit_price_from_fills(self) -> tuple:
+        """Fetch most recent fill from REST API to get actual exit price."""
+        try:
+            resp = self._api.get_fills(symbol=self._symbol, page_size=5)
+            if resp.get("success"):
+                raw = resp.get("result", {})
+                # Delta wraps fills under 'fills' or 'data' key
+                fills = raw if isinstance(raw, list) else \
+                        raw.get("fills", raw.get("data", []))
+                if fills:
+                    latest    = fills[0]
+                    price_val = latest.get("price") or latest.get("fill_price") or 0
+                    price     = float(price_val)
+                    if price > 0:
+                        return price, self._classify_exit(price)
+        except Exception as e:
+            logger.debug(f"get_fills error during reconcile: {e}")
+        return 0.0, "EXCHANGE_CLOSE"
+
     # ─── RECONCILIATION ──────────────────────────────────────────────────────
 
     def reconcile_position(self) -> Optional[str]:
@@ -319,11 +420,16 @@ class OrderManager:
                     result = pos.get("result", {})
                     size = result.get("size", 0)
                     if size == 0 or result.get("side") is None:
-                        # Position closed on exchange (SL/TP hit)
-                        logger.info("Position closed on exchange (SL/TP hit detected)")
-                        reason = "EXCHANGE_CLOSE"
+                        # Position closed on exchange (SL/TP hit) — get real exit price
+                        exit_price, reason = self._get_exit_price_from_fills()
+                        pnl_usd = self._compute_pnl(exit_price)
+
+                        logger.info(
+                            f"Position closed on exchange ({reason}) "
+                            f"exit_price={exit_price:.1f} pnl=${pnl_usd:.2f}"
+                        )
                         if self._on_close_cb:
-                            self._on_close_cb(0.0, 0.0, self._entry_bar, reason)
+                            self._on_close_cb(exit_price, pnl_usd, self._entry_bar, reason)
                         self._reset_position()
                         return reason
             except Exception as e:

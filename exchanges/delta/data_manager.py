@@ -90,6 +90,10 @@ class DeltaDataManager:
         self.is_streaming  = False
         self._product_id:  Optional[int] = None
 
+        # External callbacks for order/fill events (registered by OrderManager)
+        self._external_order_callbacks: list = []
+        self._external_fill_callbacks:  list = []
+
         logger.info("DeltaDataManager initialised")
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -123,6 +127,7 @@ class DeltaDataManager:
             # Private channels
             if config.DELTA_API_KEY:
                 self.ws.subscribe_orders(symbol,    callback=self._on_order_update)
+                self.ws.subscribe_fills(symbol,     callback=self._on_fill)
                 self.ws.subscribe_positions(symbol, callback=self._on_position_update)
                 self.ws.subscribe_account(          callback=self._on_account_update)
 
@@ -440,6 +445,19 @@ class DeltaDataManager:
 
     def _on_order_update(self, data: Dict) -> None:
         logger.debug(f"Delta order update: state={data.get('state')} id={data.get('id')}")
+        for cb in self._external_order_callbacks:
+            try:
+                cb(data)
+            except Exception as e:
+                logger.debug(f"Order callback error: {e}")
+
+    def _on_fill(self, data: Dict) -> None:
+        logger.debug(f"Delta fill: price={data.get('price')} size={data.get('size')} side={data.get('side')}")
+        for cb in self._external_fill_callbacks:
+            try:
+                cb(data)
+            except Exception as e:
+                logger.debug(f"Fill callback error: {e}")
 
     def _on_position_update(self, data: Dict) -> None:
         logger.debug(f"Delta position update: size={data.get('size')}")
@@ -470,6 +488,16 @@ class DeltaDataManager:
         return True
 
     # ── Public interface ──────────────────────────────────────────────────────
+
+    def register_order_callback(self, fn) -> None:
+        """Register an external handler for WS order state updates (e.g. from OrderManager)."""
+        if fn not in self._external_order_callbacks:
+            self._external_order_callbacks.append(fn)
+
+    def register_fill_callback(self, fn) -> None:
+        """Register an external handler for WS fill events (e.g. from OrderManager)."""
+        if fn not in self._external_fill_callbacks:
+            self._external_fill_callbacks.append(fn)
 
     def get_last_price(self) -> float:
         with self._lock: return self._last_price
