@@ -102,4 +102,4 @@ FILTER_VOLATILITY_MAX_PCT    = 2.0  # max 1m ATR% (avoid insane vol)
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING — console only, no disk writes
 # ═══════════════════════════════════════════════════════════════════════════════
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG")

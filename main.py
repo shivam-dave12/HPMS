@@ -94,25 +94,29 @@ class _ColoredFormatter(logging.Formatter):
 
 def setup_logging():
     root = logging.getLogger()
-    root.setLevel(getattr(logging, config.LOG_LEVEL, logging.INFO))
+    root.setLevel(getattr(logging, config.LOG_LEVEL, logging.DEBUG))
 
     ch = logging.StreamHandler()
     ch.setFormatter(_ColoredFormatter())
+    ch.setLevel(logging.DEBUG)          # handler must not re-filter below root
     root.addHandler(ch)
 
+    # ── hpms.elog: ALWAYS at DEBUG regardless of LOG_LEVEL ───────────────────
+    # elog emits structured JSON for every engine calculation (ENGINE_PHASE_STATE,
+    # ENGINE_CRITERIA, ENGINE_TRAJECTORY, ENGINE_KDE_REBUILD, ENGINE_SIGNAL,
+    # ENGINE_SKIP).  Without an explicit DEBUG level on this logger the
+    # isEnabledFor(DEBUG) guard inside _ELog.log() evaluates False at INFO,
+    # silently dropping all per-bar diagnostics.
+    logging.getLogger("hpms.elog").setLevel(logging.DEBUG)
+
     # ── Silence noisy third-party loggers ────────────────────────────────────
-    # httpx logs every single getUpdates poll — suppress to WARNING
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
-    # python-telegram-bot internals
     logging.getLogger("telegram").setLevel(logging.WARNING)
     logging.getLogger("telegram.ext").setLevel(logging.WARNING)
     logging.getLogger("apscheduler").setLevel(logging.WARNING)
-    # Exchange websocket reconnect chatter
     logging.getLogger("websocket").setLevel(logging.WARNING)
     logging.getLogger("websockets").setLevel(logging.WARNING)
-    # hpms.elog stays at DEBUG so structured traces are available with LOG_LEVEL=DEBUG
-    # but won't surface at INFO (desired behaviour)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -332,8 +336,14 @@ class HPMSRunner:
                 if candles:
                     newest_ts = candles[-1].get("t", 0)
                     if newest_ts > last_bar_ts:
+                        logger.debug(
+                            "[LOOP] new bar ts=%s candles=%d last_close=%s",
+                            newest_ts, len(candles), candles[-1].get("c", "?"),
+                        )
                         last_bar_ts = newest_ts
                         self._strategy.on_bar_close(candles)
+                    else:
+                        logger.debug("[LOOP] poll — waiting for next bar (last_ts=%s)", newest_ts)
 
                 if time.time() - last_health_check > health_check_interval:
                     last_health_check = time.time()
