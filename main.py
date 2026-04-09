@@ -395,7 +395,9 @@ class HPMSRunner:
         active from second 0.
         """
         # Prime the engine with REST warmup data immediately
+        self._strategy.set_warming_up(True)
         self._warm_start()
+        self._strategy.set_warming_up(False)
 
         health_check_interval = 60
         last_health_check     = time.time()

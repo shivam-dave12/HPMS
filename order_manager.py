@@ -140,6 +140,27 @@ class OrderManager:
                 self._entry_time     = time.time()
                 self._entry_bar      = 0
 
+                # For bracket orders Delta returns the leg IDs directly in the result.
+                # Capture them now so _cancel_sl_tp() can cancel them on a force-exit.
+                if use_bracket and order_type == "market":
+                    result_data = resp.get("result", {})
+                    sl_id = result_data.get("bracket_stop_loss_order_id") or \
+                            result_data.get("stop_loss_order", {}).get("order_id")
+                    tp_id = result_data.get("bracket_take_profit_order_id") or \
+                            result_data.get("take_profit_order", {}).get("order_id")
+                    self._sl_order_id = str(sl_id) if sl_id else None
+                    self._tp_order_id = str(tp_id) if tp_id else None
+                    if self._sl_order_id or self._tp_order_id:
+                        logger.info(
+                            f"Bracket legs captured: SL={self._sl_order_id} TP={self._tp_order_id}"
+                        )
+                    else:
+                        logger.warning(
+                            "Bracket order placed but leg IDs not found in response — "
+                            "force-exit will rely on exchange auto-cancel. "
+                            f"Response keys: {list(result_data.keys())}"
+                        )
+
                 logger.info(
                     f"✅ ENTRY {side.upper()} {size} contracts @ ~{price:.1f} "
                     f"TP={tp_price:.1f} SL={sl_price:.1f} id={order_id}"

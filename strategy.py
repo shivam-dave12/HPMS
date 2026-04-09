@@ -62,6 +62,7 @@ class HPMSStrategy:
 
         self._lock               = threading.RLock()
         self._enabled            = False
+        self._warming_up         = False   # True during replay — engine runs, orders suppressed
         self._bar_count          = 0
         self._last_signal:       Optional[HPMSSignal] = None
 
@@ -85,6 +86,14 @@ class HPMSStrategy:
         self._enabled = False
         logger.info("HPMSStrategy STOPPED")
         self._push("⏹ *Strategy STOPPED* — no new entries (open positions remain)")
+
+    def set_warming_up(self, value: bool):
+        """
+        Call with True before warm-start replay, False after.
+        While warming_up the engine is primed normally but NO orders are placed.
+        """
+        self._warming_up = value
+        logger.info(f"HPMSStrategy warming_up={'ON (replay mode — orders suppressed)' if value else 'OFF (live trading active)'}")
 
     @property
     def is_enabled(self) -> bool:
@@ -146,6 +155,10 @@ class HPMSStrategy:
                 f"conf={signal.confidence:.1%} Δq={signal.predicted_delta_q:+.5f} "
                 f"|dH/dt|={abs(signal.dH_dt):.5f} compute={signal.compute_time_us:.0f}µs"
             )
+
+            # During warm-start replay the engine is primed but no real orders fire
+            if self._warming_up:
+                return signal
 
             # ── Pre-trade risk gate ───────────────────────────────────────────
             can_trade, reason = self._risk.can_trade()
