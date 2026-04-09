@@ -439,10 +439,24 @@ class HPMSEngine:
         dV_at_q = self._landscape.dV_dq(q_now)
 
         # ── EMA-smoothed H for stable dH/dt ──────────────────────────────────
+        #
+        # KDE REBASE (Bug fix):
+        # Every kde_rebuild_interval bars, V(q) is reconstructed from scratch.
+        # H = p²/2m + V(q) therefore jumps discontinuously.  If we feed that
+        # jump straight into the EMA, the smoothed dH/dt = H_ema[t] - H_ema[t-1]
+        # spikes far above SIGNAL_DH_DT_MAX for several bars, setting
+        # energy_conserved=False and blocking every signal on rebuild bars.
+        #
+        # Fix: when a rebuild just happened, overwrite the previously stored EMA
+        # with H_now before computing the new value.  This makes the baseline
+        # match the new landscape so dH/dt on the rebuild bar measures only the
+        # within-bar market-driven energy change, not the cross-landscape jump.
         alpha = 2.0 / (self._H_ema_span + 1.0)
         if self._state.H_ema_history:
-            H_ema_prev = self._state.H_ema_history[-1]
-            H_ema_now  = alpha * H_now + (1.0 - alpha) * H_ema_prev
+            if kde_rebuilt:
+                # Rebase: align the stored EMA baseline to the new landscape.
+                self._state.H_ema_history[-1] = H_now
+            H_ema_now = alpha * H_now + (1.0 - alpha) * self._state.H_ema_history[-1]
         else:
             H_ema_now = H_now
 
@@ -462,13 +476,16 @@ class HPMSEngine:
             if len(lst) > max_hist:
                 del lst[:-max_hist]
 
+        # H_history and H_ema_history are always appended together, so their
+        # lengths are identical.  A single guard suffices for both.
         if len(self._state.H_ema_history) < 2:
             elog.log("ENGINE_SKIP", reason="WARMING_UP",
                      history_len=len(self._state.H_ema_history))
             return None
 
+        # len >= 2 is guaranteed by the guard above — [-2] access is safe.
         dH_dt     = H_ema_now - self._state.H_ema_history[-2]
-        dH_dt_raw = H_now - self._state.H_history[-2] if len(self._state.H_history) >= 2 else 0.0
+        dH_dt_raw = H_now     - self._state.H_history[-2]
 
         # ── LOG: Phase state snapshot ─────────────────────────────────────────
         # This is the "what is the engine currently seeing" log.

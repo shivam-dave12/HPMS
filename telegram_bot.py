@@ -225,31 +225,40 @@ class TelegramBot:
         for name, handler in cmds.items():
             self._app.add_handler(CommandHandler(name, handler))
 
-        # ── Bot command menu ──────────────────────────────────────────────────
-        await self._app.bot.set_my_commands([
-            BotCommand("status",        "Full system dashboard"),
-            BotCommand("thinking",      "HPMS decision stack — why we trade or not"),
-            BotCommand("phase",         "Phase-space state (q, p, H, dH/dt)"),
-            BotCommand("signal",        "Last signal detail"),
-            BotCommand("market",        "Price, spread, ATR, data readiness"),
-            BotCommand("filter",        "Filter gate pass/fail vs market"),
-            BotCommand("pnl",           "Daily P&L summary"),
-            BotCommand("trades",        "Recent trade log"),
-            BotCommand("position",      "Open position + unrealised PnL"),
-            BotCommand("risk",          "Risk gate status"),
-            BotCommand("balance",       "Exchange wallet balance"),
-            BotCommand("price",         "Current price + spread"),
-            BotCommand("start_trading", "▶ Enable trading"),
-            BotCommand("stop_trading",  "⏸ Disable trading (positions remain)"),
-            BotCommand("halt",          "⛔ Emergency halt + flatten"),
-            BotCommand("resume",        "✅ Resume from halt"),
-            BotCommand("resetrisk",     "🔄 Clear lockout (no flatten)"),
-            BotCommand("flatten",       "🔨 Close all positions + cancel orders"),
-            BotCommand("params",        "All tunable parameters"),
-            BotCommand("set",           "Set a parameter live"),
-            BotCommand("leverage",      "View / set exchange leverage"),
-            BotCommand("help",          "Command list"),
-        ])
+        # ── Bot command menu ───────────────────────────────────────────────────
+        # Wrapped in asyncio.wait_for so a network timeout cannot crash the bot
+        # thread before _ready.set() is called.  A failure here is non-fatal —
+        # all commands still work; the Telegram UI menu simply won't update.
+        try:
+            await asyncio.wait_for(
+                self._app.bot.set_my_commands([
+                    BotCommand("status",        "Full system dashboard"),
+                    BotCommand("thinking",      "HPMS decision stack — why we trade or not"),
+                    BotCommand("phase",         "Phase-space state (q, p, H, dH/dt)"),
+                    BotCommand("signal",        "Last signal detail"),
+                    BotCommand("market",        "Price, spread, ATR, data readiness"),
+                    BotCommand("filter",        "Filter gate pass/fail vs market"),
+                    BotCommand("pnl",           "Daily P&L summary"),
+                    BotCommand("trades",        "Recent trade log"),
+                    BotCommand("position",      "Open position + unrealised PnL"),
+                    BotCommand("risk",          "Risk gate status"),
+                    BotCommand("balance",       "Exchange wallet balance"),
+                    BotCommand("price",         "Current price + spread"),
+                    BotCommand("start_trading", "▶ Enable trading"),
+                    BotCommand("stop_trading",  "⏸ Disable trading (positions remain)"),
+                    BotCommand("halt",          "⛔ Emergency halt + flatten"),
+                    BotCommand("resume",        "✅ Resume from halt"),
+                    BotCommand("resetrisk",     "🔄 Clear lockout (no flatten)"),
+                    BotCommand("flatten",       "🔨 Close all positions + cancel orders"),
+                    BotCommand("params",        "All tunable parameters"),
+                    BotCommand("set",           "Set a parameter live"),
+                    BotCommand("leverage",      "View / set exchange leverage"),
+                    BotCommand("help",          "Command list"),
+                ]),
+                timeout=10.0,
+            )
+        except Exception as e:
+            logger.warning(f"set_my_commands failed (non-fatal, commands still work): {e}")
 
         await self._app.initialize()
         await self._app.start()
@@ -504,9 +513,7 @@ class TelegramBot:
             lines.append("*━━ LAYER 1: PHASE-SPACE STATE*")
             ps = self._engine.get_phase_state() if self._engine else None
             if ps:
-                # Momentum direction arrow
                 p_arrow = "⬆️" if ps.p > 0 else ("⬇️" if ps.p < 0 else "➡️")
-                # Energy conservation indicator
                 dH_max  = getattr(self._config, "SIGNAL_DH_DT_MAX", 0.05) if self._config else 0.05
                 dH_ok   = abs(ps.dH_dt) <= dH_max
                 dH_icon = "🟢" if dH_ok else "🔴"
@@ -610,7 +617,6 @@ class TelegramBot:
                 )
             elif sig and sig.signal_type.name != "FLAT":
                 can_trade = self._risk.can_trade()[0] if self._risk else False
-                filter_ok = "—"   # already shown above
                 if can_trade:
                     lines.append("  🎯 *Signal present + risk OK — watching filters*")
                 else:
@@ -638,7 +644,6 @@ class TelegramBot:
             asks  = ob.get("asks", [])
             dm_ok = self._data.is_ready if self._data else False
 
-            # Spread
             spread_txt = "N/A"
             spread_pct = 0.0
             if bids and asks:
@@ -655,7 +660,6 @@ class TelegramBot:
                 except Exception:
                     pass
 
-            # Bid/ask depth (top 3)
             depth_lines = []
             for a in list(reversed(asks[:3])):
                 try:
@@ -669,7 +673,6 @@ class TelegramBot:
                 except Exception:
                     pass
 
-            # ATR proxy from recent 1m candles
             candles = self._data.get_candles("1m", limit=15) if self._data else []
             atr_txt = "N/A"
             vol_txt = "N/A"
@@ -692,7 +695,6 @@ class TelegramBot:
                 except Exception:
                     pass
 
-            # Data freshness
             fresh_ok = False
             try:
                 fresh_ok = self._data.is_price_fresh(max_stale_seconds=30)
@@ -725,7 +727,6 @@ class TelegramBot:
         lines = []
         cfg   = self._config
 
-        # Spread
         ob   = self._data.get_orderbook()
         bids = ob.get("bids", [])
         asks = ob.get("asks", [])
@@ -743,14 +744,12 @@ class TelegramBot:
         candles = self._data.get_candles("1m", limit=15) or []
         price   = self._data.get_last_price() or 0
 
-        # Volume
         if candles:
             last_vol = candles[-1].get("v", 0)
             min_vol  = getattr(cfg, "FILTER_MIN_VOLUME_1M", 10.0)
             vol_ok   = last_vol >= min_vol
             lines.append(f"  {_gate(vol_ok)} Volume:   `{last_vol:.1f}` (min {min_vol})")
 
-        # Volatility
         if len(candles) >= 10 and price:
             try:
                 atr     = sum(c["h"] - c["l"] for c in candles[-10:]) / 10
