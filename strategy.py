@@ -170,6 +170,26 @@ class HPMSStrategy:
             size = self._risk.compute_size(current_price, equity)
             side = "long" if signal.signal_type == SignalType.LONG else "short"
 
+            # ── Pre-flight margin check ───────────────────────────────────────
+            # Avoid burning an API round-trip on a guaranteed-fail order.
+            # margin_needed = notional / leverage = price * contract_value / leverage
+            contract_value = getattr(self._orders, "_contract_value", 0.001)
+            leverage       = getattr(self._config, "RISK_LEVERAGE", 10)
+            margin_needed  = (current_price * contract_value * size) / max(leverage, 1)
+            if margin_needed > equity * 0.95:
+                logger.warning(
+                    "MARGIN_PREFLIGHT FAIL: need $%.2f for %d contract(s) @ "
+                    "%.0fx but equity=$%.2f — skipping entry",
+                    margin_needed, size, leverage, equity,
+                )
+                self._push(
+                    f"⚠️ *Margin too low* — need `${margin_needed:.2f}` for `{size}c` "
+                    f"@ `{leverage}x` lev, have `${equity:.2f}`
+"
+                    f"Use /leverage to raise leverage or deposit funds."
+                )
+                return signal
+
             # ── EXECUTE ENTRY ─────────────────────────────────────────────────
             result = self._orders.open_position(
                 side=side,

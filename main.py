@@ -336,7 +336,7 @@ class HPMSRunner:
             if not candles:
                 logger.warning("[WARM_START] DataManager returned no candles — "
                                "engine will wait for first live bar")
-                return 0, "t"
+                return
 
             # ── Auto-detect timestamp key ─────────────────────────────────────
             # Try common field names; pick the one with the largest non-zero value.
@@ -377,11 +377,11 @@ class HPMSRunner:
                 "last_ts=%.0f  main loop now watching for ts > %.0f",
                 n - start + 1, last_ts, last_ts,
             )
-            return last_ts, ts_key
+            return
 
         except Exception as e:
             logger.error("[WARM_START] exception: %s", e, exc_info=True)
-            return 0, "t"
+            return
 
     def _main_loop(self):
         """
@@ -395,13 +395,21 @@ class HPMSRunner:
         active from second 0.
         """
         # Prime the engine with REST warmup data immediately
-        last_bar_ts, ts_key = self._warm_start()
-        logger.info("[LOOP] starting live poll | last_bar_ts=%.0f ts_key='%s'",
-                    last_bar_ts, ts_key)
+        self._warm_start()
 
         health_check_interval = 60
         last_health_check     = time.time()
         poll_n                = 0
+
+        # Candle timestamps from this DataManager are always 0 (timestamp field
+        # absent or zero in the normalised candle dict).  Use minute-boundary
+        # wall-clock detection instead: fire on_bar_close once per calendar minute.
+        # This is drift-free and works regardless of the exchange API format.
+        last_bar_minute = int(time.time() / 60)
+        logger.info(
+            "[LOOP] starting live poll — minute-boundary bar detection "
+            "(current minute=%d)", last_bar_minute,
+        )
 
         while not self._shutdown.is_set():
             try:
@@ -409,32 +417,30 @@ class HPMSRunner:
                 candles = self._data_mgr.get_candles("1m", limit=300)
 
                 if not candles:
-                    # Normal for the first ~60 s if the WS buffer is separate
-                    # from the REST warmup buffer.  Log every 20 polls (~10 s)
-                    # so the terminal shows the loop is alive.
                     if poll_n % 20 == 1:
                         logger.debug(
                             "[LOOP] poll #%d — DataManager returned no candles "
-                            "(waiting for first live bar close)", poll_n
+                            "(waiting for WS data)", poll_n
                         )
                 else:
-                    newest_ts  = float(candles[-1].get(ts_key, 0))
-                    last_close = candles[-1].get("c", 0)
+                    current_minute = int(time.time() / 60)
+                    last_close     = candles[-1].get("c", 0)
 
-                    if newest_ts > last_bar_ts:
+                    if current_minute > last_bar_minute:
                         logger.info(
-                            "[LOOP] ▶ new bar detected | ts=%s close=%.1f "
+                            "[LOOP] ▶ new 1m bar | minute=%d close=%.1f "
                             "candles=%d poll=#%d",
-                            newest_ts, last_close, len(candles), poll_n,
+                            current_minute, last_close, len(candles), poll_n,
                         )
-                        last_bar_ts = newest_ts
+                        last_bar_minute = current_minute
                         self._strategy.on_bar_close(candles)
                     else:
-                        # Throttle: log once every 20 polls (~10 s)
                         if poll_n % 20 == 1:
+                            secs_to_next = 60 - (time.time() % 60)
                             logger.debug(
-                                "[LOOP] poll #%d — same bar ts=%s close=%.1f",
-                                poll_n, newest_ts, last_close,
+                                "[LOOP] poll #%d — waiting for bar close "
+                                "(%.0fs remaining) close=%.1f",
+                                poll_n, secs_to_next, last_close,
                             )
 
                 if time.time() - last_health_check > health_check_interval:

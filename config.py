@@ -72,7 +72,7 @@ TRADE_CONTRACT_VALUE      = 0.001   # base asset units per contract (Delta BTCUS
 # ═══════════════════════════════════════════════════════════════════════════════
 RISK_MAX_POSITION_USD     = 500.0   # max notional per trade
 RISK_MAX_POSITION_CONTRACTS = 100   # max contracts per trade
-RISK_LEVERAGE             = 10      # exchange leverage setting
+RISK_LEVERAGE             = 50      # exchange leverage setting  ← raised from 10 so 1 contract (~$72 notional) needs only ~$1.44 margin
 RISK_MAX_DAILY_LOSS_USD   = 200.0   # daily loss circuit breaker
 RISK_MAX_DAILY_TRADES     = 50      # max trades per day
 RISK_MAX_CONSECUTIVE_LOSSES = 5     # pause after N consecutive losses
