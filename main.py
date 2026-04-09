@@ -322,35 +322,66 @@ class HPMSRunner:
 
     def _warm_start(self):
         """
-        Immediately feed REST warmup candles into the strategy so the engine
-        starts building H-history without waiting up to 60 s for the first
-        live WebSocket bar to close.
+        Feed REST warmup candles into the engine in a rolling window so the
+        engine builds a full H-EMA history (needs ≥2 bars) before going live.
 
-        Returns the timestamp of the most recent warmup candle so the main
-        loop knows not to re-process it.
+        Also discovers the real timestamp key used by the DataManager
+        (some implementations use "t", others use "timestamp", "close_time",
+        etc.) so the main loop's bar-detection works correctly.
+
+        Returns (last_ts_value, ts_key) so the main loop can detect new bars.
         """
         try:
             candles = self._data_mgr.get_candles("1m", limit=300)
             if not candles:
                 logger.warning("[WARM_START] DataManager returned no candles — "
                                "engine will wait for first live bar")
-                return 0
+                return 0, "t"
 
-            last_ts    = candles[-1].get("t", 0)
-            last_price = candles[-1].get("c", 0)
+            # ── Auto-detect timestamp key ─────────────────────────────────────
+            # Try common field names; pick the one with the largest non-zero value.
+            ts_candidates = ["t", "timestamp", "close_time", "time",
+                             "open_time", "ts", "closeTime"]
+            last_c  = candles[-1]
+            ts_key  = "t"
+            ts_best = 0
+            for k in ts_candidates:
+                v = last_c.get(k, 0)
+                try:
+                    v = float(v)
+                except Exception:
+                    continue
+                if v > ts_best:
+                    ts_best = v
+                    ts_key  = k
+            logger.info("[WARM_START] timestamp key detected: '%s' → %s", ts_key, ts_best)
+
+            # ── Rolling warm-up: feed candles one window at a time ────────────
+            # The engine needs on_bar_close called with the FULL slice ending at
+            # bar N, not just the last bar.  We call it once per bar in the
+            # second half of the warmup so the H-EMA history fills up properly.
+            n       = len(candles)
+            # Process the last 30 bars as rolling windows so dH/dt history builds
+            start   = max(1, n - 30)
             logger.info(
-                "[WARM_START] feeding %d warmup candles into engine "
-                "(last ts=%s price=%.1f)",
-                len(candles), last_ts, last_price,
+                "[WARM_START] replaying bars %d–%d of %d warmup candles "
+                "(ts_key='%s' last_price=%.1f)",
+                start, n, n, ts_key, last_c.get("c", 0),
             )
-            self._strategy.on_bar_close(candles)
-            logger.info("[WARM_START] done — engine history primed, "
-                        "main loop will wait for next live bar")
-            return last_ts
+            for i in range(start, n + 1):
+                self._strategy.on_bar_close(candles[:i])
+
+            last_ts = float(last_c.get(ts_key, 0))
+            logger.info(
+                "[WARM_START] done — engine primed over %d bar replay. "
+                "last_ts=%.0f  main loop now watching for ts > %.0f",
+                n - start + 1, last_ts, last_ts,
+            )
+            return last_ts, ts_key
 
         except Exception as e:
             logger.error("[WARM_START] exception: %s", e, exc_info=True)
-            return 0
+            return 0, "t"
 
     def _main_loop(self):
         """
@@ -364,7 +395,9 @@ class HPMSRunner:
         active from second 0.
         """
         # Prime the engine with REST warmup data immediately
-        last_bar_ts = self._warm_start()
+        last_bar_ts, ts_key = self._warm_start()
+        logger.info("[LOOP] starting live poll | last_bar_ts=%.0f ts_key='%s'",
+                    last_bar_ts, ts_key)
 
         health_check_interval = 60
         last_health_check     = time.time()
@@ -385,7 +418,7 @@ class HPMSRunner:
                             "(waiting for first live bar close)", poll_n
                         )
                 else:
-                    newest_ts  = candles[-1].get("t", 0)
+                    newest_ts  = float(candles[-1].get(ts_key, 0))
                     last_close = candles[-1].get("c", 0)
 
                     if newest_ts > last_bar_ts:
