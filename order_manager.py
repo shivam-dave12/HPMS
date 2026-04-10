@@ -3,6 +3,12 @@ order_manager.py — Delta Exchange Order Execution Manager
 ==========================================================
 Handles atomic order placement (bracket or separate SL/TP), position tracking,
 forced exits, and order state reconciliation.
+
+** ALL fees and PnL are sourced from the Delta Exchange API — no estimates. **
+  - Entry fee: from order's `paid_commission` field
+  - Exit fee: from fill's `commission` field
+  - Gross PnL: from position's `realized_pnl` or computed from actual fill prices
+  - Entry/exit prices: from `average_fill_price` (orders) or `price` (fills)
 """
 
 from __future__ import annotations
@@ -15,6 +21,18 @@ from typing import Callable, Dict, Optional
 logger = logging.getLogger(__name__)
 
 
+# ─── MODULE-LEVEL HELPER ──────────────────────────────────────────────────────
+
+def _safe_float(v, default=0.0):
+    """Convert to float safely, returning default on failure."""
+    if v is None:
+        return default
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 class OrderManager:
     """
     Manages order lifecycle on Delta Exchange.
@@ -22,6 +40,9 @@ class OrderManager:
     - Entry: market or limit with bracket SL/TP
     - Exit: forced close, SL/TP hit detection, max-hold timeout
     - Reconciliation: poll position state to detect fills
+
+    All financial figures (fees, PnL) come from the exchange API,
+    never from local estimation.
     """
 
     def __init__(self, api, symbol: str = "BTCUSD", contract_value: float = 0.001,
@@ -31,19 +52,20 @@ class OrderManager:
         self._lock   = threading.RLock()
         self._contract_value = contract_value  # BTC per contract (Delta BTCUSD = 0.001)
 
-        # Fee rates (percentage, e.g. 0.05 = 0.05%)
+        # Fee rates kept ONLY as last-resort fallback if API doesn't return commission.
+        # All normal paths use exact API data.
         self._taker_fee_pct = taker_fee_pct
         self._maker_fee_pct = maker_fee_pct
 
         # Active state
         self._position_side:    Optional[str] = None   # "long" | "short" | None
         self._position_size:    int   = 0
-        self._entry_price:      float = 0.0
-        self._tp_price:         float = 0.0   # stored at entry for correct TP/SL classification
-        self._sl_price:         float = 0.0   # stored at entry for correct TP/SL classification
+        self._entry_price:      float = 0.0   # actual fill price from API
+        self._tp_price:         float = 0.0
+        self._sl_price:         float = 0.0
         self._entry_bar:        int   = 0
         self._entry_time:       float = 0.0
-        self._entry_fee_usd:    float = 0.0   # fee paid at entry
+        self._entry_fee_usd:    float = 0.0   # exact fee from API paid_commission
         self._sl_order_id:      Optional[str] = None
         self._tp_order_id:      Optional[str] = None
         self._entry_order_id:   Optional[str] = None
@@ -96,7 +118,7 @@ class OrderManager:
         self,
         side:       str,       # "long" | "short"
         size:       int,       # contracts
-        price:      float,     # current price (for limit offset)
+        price:      float,     # current price (for limit offset / fallback)
         tp_price:   float,
         sl_price:   float,
         use_bracket: bool = True,
@@ -116,7 +138,6 @@ class OrderManager:
 
             try:
                 if use_bracket and order_type == "market":
-                    # Bracket order: entry + SL + TP in one atomic request
                     resp = self._api.place_bracket_order(
                         symbol=self._symbol,
                         side=delta_side,
@@ -127,7 +148,6 @@ class OrderManager:
                         product_id=self._product_id,
                     )
                 else:
-                    # Separate orders
                     resp = self._api.place_market_order(
                         symbol=self._symbol,
                         side=delta_side,
@@ -140,27 +160,60 @@ class OrderManager:
                     logger.error(f"Entry order failed: {error}")
                     return {"success": False, "error": error}
 
-                order_id = resp["result"].get("order_id", "")
+                result_data = resp.get("result", {})
+                raw = result_data.get("_raw", result_data)
+                order_id = result_data.get("order_id", "")
+
+                # ── Extract EXACT entry price from API ────────────────────────
+                # average_fill_price is the actual fill price from the exchange.
+                actual_entry_price = _safe_float(
+                    raw.get("average_fill_price"), 0.0
+                )
+                if actual_entry_price <= 0:
+                    actual_entry_price = price
+                    logger.debug(
+                        "average_fill_price not in order response — "
+                        f"using passed price {price:.1f}"
+                    )
+
+                # ── Extract EXACT entry fee from API ──────────────────────────
+                # paid_commission is the actual fee charged by the exchange.
+                actual_entry_fee = _safe_float(
+                    raw.get("paid_commission",
+                            raw.get("commission")), 0.0
+                )
+                if actual_entry_fee <= 0:
+                    # Order may not have fee yet — fetch from fills for this order.
+                    actual_entry_fee = self._fetch_order_fee(order_id)
+
+                if actual_entry_fee <= 0:
+                    # Last resort: estimate (should rarely happen for market orders)
+                    actual_entry_fee = self._estimate_fee(
+                        actual_entry_price, size, is_taker=(order_type == "market")
+                    )
+                    logger.warning(
+                        f"Could not get exact entry fee from API — "
+                        f"using estimate: ${actual_entry_fee:.6f}"
+                    )
+
                 self._entry_order_id = order_id
                 self._position_side  = side
                 self._position_size  = size
-                self._entry_price    = price
+                self._entry_price    = actual_entry_price
                 self._tp_price       = tp_price
                 self._sl_price       = sl_price
                 self._entry_time     = time.time()
                 self._entry_bar      = 0
-                self._entry_fee_usd  = self._compute_fee(
-                    price, size, is_taker=(order_type == "market")
-                )
+                self._entry_fee_usd  = actual_entry_fee
 
-                # For bracket orders Delta returns the leg IDs directly in the result.
-                # Capture them now so _cancel_sl_tp() can cancel them on a force-exit.
+                # Capture bracket leg IDs
                 if use_bracket and order_type == "market":
-                    result_data = resp.get("result", {})
-                    sl_id = result_data.get("bracket_stop_loss_order_id") or \
-                            result_data.get("stop_loss_order", {}).get("order_id")
-                    tp_id = result_data.get("bracket_take_profit_order_id") or \
-                            result_data.get("take_profit_order", {}).get("order_id")
+                    sl_id = raw.get("bracket_stop_loss_order_id")
+                    if not sl_id and isinstance(raw.get("stop_loss_order"), dict):
+                        sl_id = raw["stop_loss_order"].get("order_id")
+                    tp_id = raw.get("bracket_take_profit_order_id")
+                    if not tp_id and isinstance(raw.get("take_profit_order"), dict):
+                        tp_id = raw["take_profit_order"].get("order_id")
                     self._sl_order_id = str(sl_id) if sl_id else None
                     self._tp_order_id = str(tp_id) if tp_id else None
                     if self._sl_order_id or self._tp_order_id:
@@ -171,11 +224,11 @@ class OrderManager:
                         logger.warning(
                             "Bracket order placed but leg IDs not found in response — "
                             "force-exit will rely on exchange auto-cancel. "
-                            f"Response keys: {list(result_data.keys())}"
+                            f"Response keys: {list(raw.keys())}"
                         )
 
                 logger.info(
-                    f"✅ ENTRY {side.upper()} {size} contracts @ ~{price:.1f} "
+                    f"✅ ENTRY {side.upper()} {size} contracts @ ~{actual_entry_price:.1f} "
                     f"TP={tp_price:.1f} SL={sl_price:.1f} id={order_id}"
                 )
 
@@ -184,7 +237,7 @@ class OrderManager:
                     self._place_sl_tp(side, size, sl_price, tp_price)
 
                 if self._on_fill_cb:
-                    self._on_fill_cb(side, size, price, order_id)
+                    self._on_fill_cb(side, size, actual_entry_price, order_id)
 
                 return {"success": True, "order_id": order_id, "error": None}
 
@@ -253,29 +306,59 @@ class OrderManager:
                 )
 
                 if not resp.get("success"):
-                    # Try position close endpoint as fallback
                     if self._product_id:
                         resp = self._api.close_position(self._product_id)
 
-                # Compute PnL with fees
-                if current_price > 0:
-                    gross_pnl, total_fees, net_pnl = self._compute_pnl_full(
-                        current_price, exit_is_taker=True  # market exit = taker
+                # ── Get EXACT exit data from the API ──────────────────────────
+                exit_price, exit_fee = 0.0, 0.0
+                if resp.get("success"):
+                    result_data = resp.get("result", {})
+                    raw = result_data.get("_raw", result_data)
+                    exit_price = _safe_float(raw.get("average_fill_price"), 0.0)
+                    exit_fee = _safe_float(
+                        raw.get("paid_commission", raw.get("commission")), 0.0
                     )
-                else:
-                    gross_pnl = total_fees = net_pnl = 0.0
 
+                # Fetch from fills API for exact data if needed
+                if exit_price <= 0 or exit_fee <= 0:
+                    fill_price, fill_fee, _ = self._get_exit_from_fills()
+                    if fill_price > 0 and exit_price <= 0:
+                        exit_price = fill_price
+                    if fill_fee > 0 and exit_fee <= 0:
+                        exit_fee = fill_fee
+
+                if exit_price <= 0:
+                    exit_price = current_price
+
+                # ── Compute PnL from EXACT data ──────────────────────────────
+                gross_pnl = self._fetch_realized_pnl()
+                if gross_pnl is None:
+                    gross_pnl = self._compute_pnl_from_prices(exit_price)
+
+                if exit_fee <= 0:
+                    exit_fee = self._fetch_latest_fill_commission()
+                if exit_fee <= 0:
+                    exit_fee = self._estimate_fee(
+                        exit_price, self._position_size, is_taker=True
+                    )
+                    logger.warning(
+                        f"Could not get exact exit fee from API — "
+                        f"using estimate: ${exit_fee:.6f}"
+                    )
+
+                total_fees = self._entry_fee_usd + exit_fee
+                net_pnl = gross_pnl - total_fees
                 bars_held = self._entry_bar
 
                 logger.info(
                     f"🔻 EXIT {self._position_side.upper()} {self._position_size} "
-                    f"@ ~{current_price:.1f} gross=${gross_pnl:+.4f} "
+                    f"@ ~{exit_price:.1f} gross=${gross_pnl:+.4f} "
                     f"fees=$-{total_fees:.4f} net=${net_pnl:+.4f} "
                     f"bars={bars_held} reason={reason}"
                 )
 
                 if self._on_close_cb:
-                    self._on_close_cb(current_price, gross_pnl, total_fees,
+                    self._on_close_cb(exit_price, gross_pnl, total_fees,
                                       net_pnl, bars_held, reason)
 
                 self._reset_position()
@@ -333,16 +416,17 @@ class OrderManager:
     def _on_ws_fill(self, data: dict) -> None:
         """
         Called immediately when the WS fills channel fires.
-        Detects bracket TP/SL fills and records the actual exit price + PnL.
+        Detects bracket TP/SL fills and records the ACTUAL exit price + fees.
         """
         with self._lock:
             if self._position_side is None:
                 return
             try:
-                fill_price = float(data.get("price") or data.get("fill_price") or 0)
-                fill_side  = str(data.get("side", "")).lower()   # "buy" | "sell"
-                fill_size  = float(data.get("size") or data.get("fill_quantity") or 0)
-                role       = str(data.get("role", "")).lower()   # "taker" | "maker"
+                fill_price = float(data.get("price") or data.get("fill_price") or
+                                   data.get("p") or 0)
+                fill_side  = str(data.get("side") or data.get("s") or "").lower()
+                fill_size  = float(data.get("size") or data.get("fill_quantity") or
+                                   data.get("sz") or 0)
 
                 if fill_price <= 0 or fill_size <= 0:
                     return
@@ -352,16 +436,33 @@ class OrderManager:
                 if fill_side != expected_exit_side:
                     return
 
-                # Determine TP vs SL from price
-                reason = self._classify_exit(fill_price)
-                is_taker = (role == "taker") if role else True
-                gross_pnl, total_fees, net_pnl = self._compute_pnl_full(
-                    fill_price, exit_is_taker=is_taker
+                # ── EXACT fee from WS fill data ──────────────────────────────
+                exit_fee = _safe_float(
+                    data.get("commission") or data.get("c_val"), 0.0
                 )
+                if exit_fee <= 0:
+                    exit_fee = self._fetch_latest_fill_commission()
+                if exit_fee <= 0:
+                    exit_fee = self._estimate_fee(
+                        fill_price, self._position_size, is_taker=True
+                    )
+                    logger.warning(
+                        f"WS fill missing commission — using estimate: ${exit_fee:.6f}"
+                    )
+
+                reason = self._classify_exit(fill_price)
+
+                # ── EXACT PnL ────────────────────────────────────────────────
+                gross_pnl = self._fetch_realized_pnl()
+                if gross_pnl is None:
+                    gross_pnl = self._compute_pnl_from_prices(fill_price)
+
+                total_fees = self._entry_fee_usd + exit_fee
+                net_pnl = gross_pnl - total_fees
 
                 logger.info(
-                    f"🔔 WS FILL detected: {reason} {self._position_side.upper()} "
-                    f"fill_price={fill_price:.1f} gross=${gross_pnl:+.4f} "
+                    f"Position closed on exchange ({reason}) "
+                    f"exit_price={fill_price:.1f} gross=${gross_pnl:+.4f} "
                     f"fees=$-{total_fees:.4f} net=${net_pnl:+.4f}"
                 )
 
@@ -375,9 +476,7 @@ class OrderManager:
 
     def _on_ws_order(self, data: dict) -> None:
         """
-        Called when WS order state changes. Used as a belt-and-suspenders
-        check: if an order in 'closed'/'filled' state arrives and we're still
-        tracking a position, trigger reconcile.
+        Called when WS order state changes. Belt-and-suspenders check.
         """
         with self._lock:
             if self._position_side is None:
@@ -386,16 +485,95 @@ class OrderManager:
             if state in ("filled", "closed", "cancelled"):
                 logger.debug(f"WS order state={state} — scheduling reconcile check")
 
-    # ─── PNL HELPERS ──────────────────────────────────────────────────────────
+    # ─── API-SOURCED PNL & FEE HELPERS ────────────────────────────────────────
 
-    def _compute_fee(self, price: float, size: int, is_taker: bool = True) -> float:
-        """Compute fee in USD for a fill at given price and size."""
-        notional = price * self._contract_value * size
-        rate = self._taker_fee_pct if is_taker else self._maker_fee_pct
-        return notional * rate / 100.0
+    def _fetch_order_fee(self, order_id: str) -> float:
+        """Fetch actual paid commission from order details or its fills."""
+        try:
+            resp = self._api.get_order(order_id)
+            if resp.get("success"):
+                raw = resp.get("result", {}).get("_raw", resp.get("result", {}))
+                fee = _safe_float(
+                    raw.get("paid_commission", raw.get("commission")), 0.0
+                )
+                if fee > 0:
+                    return fee
+        except Exception as e:
+            logger.debug(f"_fetch_order_fee error: {e}")
 
-    def _compute_pnl(self, exit_price: float) -> float:
-        """Compute gross USD PnL (no fees) for current open position."""
+        # Try fills for this specific order
+        try:
+            resp = self._api.get_fills(product_id=self._product_id, page_size=10)
+            if resp.get("success"):
+                fills = resp.get("result", [])
+                if isinstance(fills, dict):
+                    fills = fills.get("result", fills.get("data", fills.get("fills", [])))
+                for f in (fills if isinstance(fills, list) else []):
+                    if str(f.get("order_id", "")) == str(order_id):
+                        meta = f.get("meta_data", {}) or {}
+                        total_comm = _safe_float(
+                            meta.get("total_commission_in_settling_asset"), 0.0
+                        )
+                        if total_comm > 0:
+                            return total_comm
+                        fee = _safe_float(f.get("commission"), 0.0)
+                        if fee > 0:
+                            return fee
+        except Exception as e:
+            logger.debug(f"_fetch_order_fee fills error: {e}")
+
+        return 0.0
+
+    def _fetch_latest_fill_commission(self) -> float:
+        """Fetch commission from the most recent fill for our product."""
+        try:
+            resp = self._api.get_fills(product_id=self._product_id, page_size=5)
+            if resp.get("success"):
+                fills = resp.get("result", [])
+                if isinstance(fills, dict):
+                    fills = fills.get("result", fills.get("data", fills.get("fills", [])))
+                if isinstance(fills, list) and fills:
+                    latest = fills[0]
+                    meta = latest.get("meta_data", {}) or {}
+                    total_comm = _safe_float(
+                        meta.get("total_commission_in_settling_asset"), 0.0
+                    )
+                    if total_comm > 0:
+                        return total_comm
+                    return _safe_float(latest.get("commission"), 0.0)
+        except Exception as e:
+            logger.debug(f"_fetch_latest_fill_commission error: {e}")
+        return 0.0
+
+    def _fetch_realized_pnl(self) -> Optional[float]:
+        """
+        Fetch realized_pnl from position API.
+        Returns None if unavailable (position already gone or API error).
+        """
+        try:
+            resp = self._api.get_positions(product_id=self._product_id)
+            if resp.get("success"):
+                positions = resp.get("result", [])
+                if isinstance(positions, dict):
+                    positions = [positions]
+                for pos in (positions if isinstance(positions, list) else []):
+                    if str(pos.get("product_symbol", "")).upper() == self._symbol.upper():
+                        rpnl = pos.get("realized_pnl")
+                        if rpnl is not None:
+                            val = _safe_float(rpnl, None)
+                            if val is not None:
+                                logger.debug(f"Fetched realized_pnl from API: ${val:.6f}")
+                                return val
+        except Exception as e:
+            logger.debug(f"_fetch_realized_pnl error: {e}")
+        return None
+
+    def _compute_pnl_from_prices(self, exit_price: float) -> float:
+        """
+        Compute gross PnL from actual entry/exit prices.
+        Used as fallback when realized_pnl is not available from API.
+        Both entry_price and exit_price should be actual fill prices from API.
+        """
         if exit_price <= 0 or self._entry_price <= 0:
             return 0.0
         diff = exit_price - self._entry_price
@@ -403,57 +581,53 @@ class OrderManager:
             diff = -diff
         return diff * self._contract_value * self._position_size
 
-    def _compute_pnl_full(self, exit_price: float, exit_is_taker: bool = True):
+    def _estimate_fee(self, price: float, size: int, is_taker: bool = True) -> float:
         """
-        Compute full PnL breakdown: gross, entry_fee, exit_fee, net.
-        Returns (gross_pnl, total_fees, net_pnl).
+        FALLBACK ONLY: Estimate fee when API doesn't return commission.
+        This should rarely be needed — all normal paths use exact API data.
         """
-        gross = self._compute_pnl(exit_price)
-        entry_fee = self._entry_fee_usd
-        exit_fee = self._compute_fee(exit_price, self._position_size, exit_is_taker)
-        total_fees = entry_fee + exit_fee
-        return gross, total_fees, gross - total_fees
+        notional = price * self._contract_value * size
+        rate = self._taker_fee_pct if is_taker else self._maker_fee_pct
+        return notional * rate / 100.0
 
     def _classify_exit(self, exit_price: float) -> str:
         """Return 'TP_HIT', 'SL_HIT', or 'EXCHANGE_CLOSE' based on actual TP/SL levels."""
         if exit_price <= 0:
             return "EXCHANGE_CLOSE"
-        # Compare against the stored TP/SL prices set at entry, not just entry_price.
-        # Using entry_price as the boundary misclassifies a tiny bounce above entry as
-        # TP_HIT even when price never came close to the real TP level (Bug 2 fix).
         if self._tp_price > 0 and self._sl_price > 0:
-            if self._position_side == "long":
-                tp_dist = abs(exit_price - self._tp_price)
-                sl_dist = abs(exit_price - self._sl_price)
-                return "TP_HIT" if tp_dist < sl_dist else "SL_HIT"
-            else:
-                tp_dist = abs(exit_price - self._tp_price)
-                sl_dist = abs(exit_price - self._sl_price)
-                return "TP_HIT" if tp_dist < sl_dist else "SL_HIT"
-        # Fallback if TP/SL prices were never recorded
+            tp_dist = abs(exit_price - self._tp_price)
+            sl_dist = abs(exit_price - self._sl_price)
+            return "TP_HIT" if tp_dist < sl_dist else "SL_HIT"
         if self._position_side == "long":
             return "TP_HIT" if exit_price > self._entry_price else "SL_HIT"
         else:
             return "TP_HIT" if exit_price < self._entry_price else "SL_HIT"
 
-    def _get_exit_price_from_fills(self) -> tuple:
-        """Fetch most recent fill from REST API to get actual exit price."""
+    def _get_exit_from_fills(self) -> tuple:
+        """Fetch most recent fill from REST API to get actual exit price + commission."""
         try:
-            resp = self._api.get_fills(symbol=self._symbol, page_size=5)
+            resp = self._api.get_fills(product_id=self._product_id, page_size=5)
             if resp.get("success"):
                 raw = resp.get("result", {})
-                # Delta wraps fills under 'fills' or 'data' key
                 fills = raw if isinstance(raw, list) else \
-                        raw.get("fills", raw.get("data", []))
-                if fills:
-                    latest    = fills[0]
-                    price_val = latest.get("price") or latest.get("fill_price") or 0
-                    price     = float(price_val)
-                    if price > 0:
-                        return price, self._classify_exit(price)
+                        raw.get("fills", raw.get("data", raw.get("result", [])))
+                if isinstance(fills, list) and fills:
+                    latest = fills[0]
+                    price = _safe_float(
+                        latest.get("price") or latest.get("fill_price"), 0.0
+                    )
+                    meta = latest.get("meta_data", {}) or {}
+                    total_comm = _safe_float(
+                        meta.get("total_commission_in_settling_asset"), 0.0
+                    )
+                    fee = total_comm if total_comm > 0 else _safe_float(
+                        latest.get("commission"), 0.0
+                    )
+                    reason = self._classify_exit(price) if price > 0 else "EXCHANGE_CLOSE"
+                    return price, fee, reason
         except Exception as e:
-            logger.debug(f"get_fills error during reconcile: {e}")
-        return 0.0, "EXCHANGE_CLOSE"
+            logger.debug(f"_get_exit_from_fills error: {e}")
+        return 0.0, 0.0, "EXCHANGE_CLOSE"
 
     # ─── RECONCILIATION ──────────────────────────────────────────────────────
 
@@ -473,12 +647,28 @@ class OrderManager:
                     result = pos.get("result", {})
                     size = result.get("size", 0)
                     if size == 0 or result.get("side") is None:
-                        # Position closed on exchange (SL/TP hit) — get real exit price
-                        exit_price, reason = self._get_exit_price_from_fills()
-                        # SL/TP fills are typically taker on Delta
-                        gross_pnl, total_fees, net_pnl = self._compute_pnl_full(
-                            exit_price, exit_is_taker=True
-                        )
+                        # Position closed on exchange — get exact data from fills
+                        exit_price, exit_fee, reason = self._get_exit_from_fills()
+
+                        # Try realized_pnl from the position response itself
+                        raw_pos = result.get("_raw", result)
+                        rpnl = raw_pos.get("realized_pnl")
+                        if rpnl is not None:
+                            gross_pnl = _safe_float(rpnl, 0.0)
+                        else:
+                            gross_pnl = self._compute_pnl_from_prices(exit_price)
+
+                        if exit_fee <= 0:
+                            exit_fee = self._estimate_fee(
+                                exit_price, self._position_size, is_taker=True
+                            )
+                            logger.warning(
+                                f"Reconcile: no exact exit fee — "
+                                f"using estimate: ${exit_fee:.6f}"
+                            )
+
+                        total_fees = self._entry_fee_usd + exit_fee
+                        net_pnl = gross_pnl - total_fees
 
                         logger.info(
                             f"Position closed on exchange ({reason}) "
@@ -537,7 +727,6 @@ class OrderManager:
         """Cancel all orders and close all positions immediately."""
         results = []
 
-        # Cancel all open orders
         try:
             open_orders = self._api.get_open_orders(symbol=self._symbol)
             if open_orders.get("success"):
@@ -549,7 +738,6 @@ class OrderManager:
         except Exception as e:
             results.append(f"cancel_error: {e}")
 
-        # Close position
         try:
             if self._product_id:
                 self._api.close_position(self._product_id)

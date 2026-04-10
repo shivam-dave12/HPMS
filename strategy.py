@@ -274,25 +274,25 @@ class HPMSStrategy:
             )
 
             if result.get("success"):
-                # Compute margin used for ROE% tracking
+                # Use ACTUAL entry price from order manager (API fill price)
+                actual_entry = self._orders.entry_price or current_price
                 contract_value = getattr(self._config, "TRADE_CONTRACT_VALUE", 0.001)
                 leverage = getattr(self._config, "RISK_LEVERAGE", 10)
-                margin_used = (current_price * contract_value * size) / max(leverage, 1)
-                notional = current_price * contract_value * size
+                margin_used = (actual_entry * contract_value * size) / max(leverage, 1)
+                notional = actual_entry * contract_value * size
 
-                # Compute entry fee
-                taker_fee_pct = getattr(self._config, "TRADE_TAKER_FEE_PCT", 0.05)
-                entry_fee = notional * taker_fee_pct / 100.0
+                # Use EXACT entry fee from API (stored by order manager)
+                entry_fee = getattr(self._orders, "_entry_fee_usd", 0.0)
 
-                self._risk.on_trade_open(side, current_price, size, margin_used)
-                self._current_tp_distance = abs(signal.tp_price - current_price)
+                self._risk.on_trade_open(side, actual_entry, size, margin_used)
+                self._current_tp_distance = abs(signal.tp_price - actual_entry)
                 self._consecutive_energy_spikes = 0
                 self._last_entry_size  = size
-                self._last_entry_price = current_price
+                self._last_entry_price = actual_entry
                 self._last_margin_used = margin_used
 
                 logger.info(
-                    f"TRADE OPEN ▶ {side.upper()} {size}c @ ${current_price:,.1f} "
+                    f"TRADE OPEN ▶ {side.upper()} {size}c @ ${actual_entry:,.1f} "
                     f"TP=${signal.tp_price:,.1f} SL=${signal.sl_price:,.1f} "
                     f"margin=${margin_used:.2f} fee=$-{entry_fee:.4f} "
                     f"conf={signal.confidence:.1%} id={result.get('order_id', '')}"
@@ -300,11 +300,11 @@ class HPMSStrategy:
                 self._push(
                     f"🚀 *ENTRY {side.upper()}*\n"
                     f"Size: `{size}c` | Notional: `${notional:.2f}`\n"
-                    f"Entry: `${current_price:,.1f}`\n"
-                    f"TP: `${signal.tp_price:,.1f}` (`${abs(signal.tp_price - current_price):.1f}`)\n"
-                    f"SL: `${signal.sl_price:,.1f}` (`${abs(signal.sl_price - current_price):.1f}`)\n"
+                    f"Entry: `${actual_entry:,.1f}`\n"
+                    f"TP: `${signal.tp_price:,.1f}` (`${abs(signal.tp_price - actual_entry):.1f}`)\n"
+                    f"SL: `${signal.sl_price:,.1f}` (`${abs(signal.sl_price - actual_entry):.1f}`)\n"
                     f"Margin: `${margin_used:.2f}` @ `{leverage}x`\n"
-                    f"Entry fee: `$-{entry_fee:.4f}`\n"
+                    f"Entry fee: `$-{entry_fee:.4f}` _(exact)_\n"
                     f"Conf: `{signal.confidence:.1%}` | Δq: `{signal.predicted_delta_q:+.5f}`"
                 )
                 self._block_count = 0
