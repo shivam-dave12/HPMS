@@ -523,7 +523,7 @@ class TelegramBot:
                 f"Bars:      `{s.get('bar_count', 0)}`\n\n"
                 f"💰 *Today*\n"
                 f"Gross:  `${risk.get('daily_gross_pnl', 0):+.4f}`\n"
-                f"Fees:   `${risk.get('daily_fees', 0):.4f}`\n"
+                f"Fees:   `$-{risk.get('daily_fees', 0):.4f}`\n"
                 f"*Net:   `${risk.get('daily_pnl', 0):+.4f}`* "
                 f"(high `${risk.get('session_high_pnl', 0):+.4f}`)\n"
                 f"Trades: `{risk.get('trades_today', 0)}`/"
@@ -866,7 +866,7 @@ class TelegramBot:
             gate_icon = "🟢" if can_trade else "🔴"
 
             pnl_bar = _pct_bar(
-                abs(rs.get("daily_pnl", 0)), 0, p.get("max_daily_loss", 200)
+                max(0.0, -rs.get("daily_pnl", 0)), 0, p.get("max_daily_loss", 200)
             )
             trd_bar = _pct_bar(
                 rs.get("trades_today", 0), 0, p.get("max_daily_trades", 50)
@@ -1057,7 +1057,7 @@ class TelegramBot:
             lines.append(
                 f"{emoji} `{t['time']}` {t['side'].upper()} {t.get('size', 1)}c "
                 f"gross `${t['gross_pnl']:+.4f}` "
-                f"fee `${t['fees']:.4f}` "
+                f"fee `$-{t['fees']:.4f}` "
                 f"*net `${t['net_pnl']:+.4f}`* "
                 f"ROE `{t.get('roe_pct', 0):+.1f}%` "
                 f"({t['bars']}b) _{t['reason']}_"
@@ -1066,7 +1066,9 @@ class TelegramBot:
             total_fees += t["fees"]
             total_net += t["net_pnl"]
         lines.append(
-            f"\nGross: `${total_gross:+.4f}` | Fees: `${total_fees:.4f}`\n"
+            f"
+Gross: `${total_gross:+.4f}` | Fees: `$-{total_fees:.4f}`
+"
             f"*Net: `${total_net:+.4f}`*"
         )
         try:
@@ -1084,12 +1086,12 @@ class TelegramBot:
         gross_pnl = r.get("daily_gross_pnl", 0)
         fees     = r.get("daily_fees", 0)
         pnl_max  = p.get("max_daily_loss", 200)
-        pnl_bar  = _pct_bar(abs(net_pnl), 0, pnl_max)
+        pnl_bar  = _pct_bar(max(0.0, -net_pnl), 0, pnl_max)
         pnl_icon = "💰" if net_pnl >= 0 else "🔻"
         await update.message.reply_text(
             f"{pnl_icon} *Daily P&L*\n\n"
             f"Gross PnL:    `${gross_pnl:+.4f}`\n"
-            f"Total fees:   `${fees:.4f}`\n"
+            f"Total fees:   `$-{fees:.4f}`\n"
             f"*Net PnL:     `${net_pnl:+.4f}`* / limit `$-{pnl_max}`\n"
             f"              [{pnl_bar}]\n"
             f"Session high: `${r.get('session_high_pnl', 0):+.4f}`\n"
@@ -1144,7 +1146,7 @@ class TelegramBot:
             pnl_block = (
                 f"\n*Unrealised P&L:*\n"
                 f"  Gross: `${gross_pnl:+.4f}`\n"
-                f"  Fees (est): `${total_fees:.4f}` (entry `${entry_fee:.4f}` + exit `${exit_fee:.4f}`)\n"
+                f"  Fees (est): `$-{total_fees:.4f}` (entry `$-{entry_fee:.4f}` + exit `$-{exit_fee:.4f}`)\n"
                 f"  *Net: `${net_pnl:+.4f}`*\n"
                 f"  ROE: `{roe_pct:+.2f}%` on `${margin:.2f}` margin"
             )

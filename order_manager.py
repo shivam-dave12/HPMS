@@ -266,7 +266,7 @@ class OrderManager:
                 logger.info(
                     f"🔻 EXIT {self._position_side.upper()} {self._position_size} "
                     f"@ ~{current_price:.1f} gross=${gross_pnl:+.4f} "
-                    f"fees=${total_fees:.4f} net=${net_pnl:+.4f} "
+                    f"fees=$-{total_fees:.4f} net=${net_pnl:+.4f} "
                     f"bars={bars_held} reason={reason}"
                 )
 
@@ -356,7 +356,7 @@ class OrderManager:
                 logger.info(
                     f"🔔 WS FILL detected: {reason} {self._position_side.upper()} "
                     f"fill_price={fill_price:.1f} gross=${gross_pnl:+.4f} "
-                    f"fees=${total_fees:.4f} net=${net_pnl:+.4f}"
+                    f"fees=$-{total_fees:.4f} net=${net_pnl:+.4f}"
                 )
 
                 if self._on_close_cb:
@@ -464,7 +464,7 @@ class OrderManager:
                         logger.info(
                             f"Position closed on exchange ({reason}) "
                             f"exit_price={exit_price:.1f} gross=${gross_pnl:+.4f} "
-                            f"fees=${total_fees:.4f} net=${net_pnl:+.4f}"
+                            f"fees=$-{total_fees:.4f} net=${net_pnl:+.4f}"
                         )
                         if self._on_close_cb:
                             self._on_close_cb(exit_price, gross_pnl, total_fees,

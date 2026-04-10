@@ -66,7 +66,7 @@ class RiskManager:
         self._daily_pnl:         float = 0.0
         self._total_fees:        float = 0.0
         self._session_high_pnl:  float = 0.0
-        self._consecutive_losses: int  = 0
+        self._consecutive_losses: float = 0.0
         self._last_trade_time:   float = 0.0
         self._is_halted:         bool  = False
         self._halt_reason:       str   = ""
@@ -292,7 +292,7 @@ class RiskManager:
                         f"(weighted +{self._soft_loss_weight})"
                     )
                 else:
-                    self._consecutive_losses = int(self._consecutive_losses) + 1
+                    self._consecutive_losses += 1
             else:
                 self._consecutive_losses = 0
 

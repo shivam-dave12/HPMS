@@ -332,10 +332,22 @@ class HPMSEngine:
         log_c = np.log(closes)
         n = min(self._norm_window, len(log_c))
         window = log_c[-n:]
-        mu  = np.mean(window)
-        std = np.std(window)
-        if std < 1e-12:
-            std = 1e-12
+
+        # Exponentially-weighted mean/std so the baseline tracks current price
+        # in trends.  Flat 120-bar mean lags by ~60 bars; during a $674 rally
+        # that pushes q to +5.5σ, making every bar look "extreme" and triggering
+        # a mean-reversion SHORT.  Half-life = window/4 gives ~4× weight to the
+        # newest bar vs the oldest, keeping μ close to current price.
+        half_life = max(n / 4.0, 1.0)
+        decay = np.exp(-np.log(2.0) / half_life)
+        # Geometric weights oldest→newest: decay^(n-1), …, decay^0
+        exp_weights = decay ** np.arange(n - 1, -1, -1, dtype=np.float64)
+        exp_weights /= exp_weights.sum()
+
+        mu  = float(np.dot(exp_weights, window))
+        var = float(np.dot(exp_weights, (window - mu) ** 2))
+        std = math.sqrt(var) if var > 1e-24 else 1e-12
+
         return (log_c - mu) / std
 
     def _compute_p(self, q_series: np.ndarray) -> np.ndarray:
@@ -421,6 +433,23 @@ class HPMSEngine:
                 v_sum = np.sum(v_lookback)
                 if v_sum > 0:
                     v_weights = v_lookback / v_sum
+
+            # ── Recency weights for KDE (Fix 2) ──────────────────────────────
+            # Without this, V(q) is centred on old price levels: the "valley"
+            # of high density sits far below current price, so every trajectory
+            # rolls back toward past prices → chronic SHORT bias in uptrends.
+            # Exponential decay (oldest weight ≈ exp(-2) ≈ 0.135, newest = 1.0)
+            # shifts the density peak to recent bars, centering V(q) on current
+            # price so the trajectory can predict continuation as well as reversal.
+            nk = len(q_lookback)
+            recency = np.exp(np.linspace(-2.0, 0.0, nk))
+            recency /= recency.sum()
+            if v_weights is not None:
+                combined = recency * v_weights
+                combined /= combined.sum()
+                v_weights = combined
+            else:
+                v_weights = recency
 
             if not self._landscape.build(q_lookback, weights=v_weights):
                 elog.log("ENGINE_SKIP", reason="KDE_BUILD_FAILED", samples=len(q_lookback))
@@ -563,13 +592,26 @@ class HPMSEngine:
         # Every gate is logged individually so you can see exactly which one
         # is blocking trades when the system stays flat.
 
+        # ── Adaptive delta_q threshold (Fix 3a) ──────────────────────────────
+        # A fixed 0.0006 threshold means ~0.06% move; on a quiet 1m bar that's
+        # fine, but on high-volatility bars it's trivially met by noise.  Scale
+        # with current realized volatility: require at least 0.3σ of log-return
+        # std, floored at half the config value so it never goes below the
+        # operator's intent.
+        effective_delta_q_threshold = max(
+            self._delta_q_threshold * 0.5,
+            std_log * 0.3,
+        )
+
         # (a) Magnitude of predicted move
-        delta_q_ok   = abs(predicted_pct_move) > self._delta_q_threshold
+        delta_q_ok   = abs(predicted_pct_move) > effective_delta_q_threshold
         delta_q_dir  = "LONG" if predicted_pct_move > 0 else "SHORT"
         elog.log("ENGINE_CRITERIA",
                  check="delta_q_magnitude",
                  predicted_pct=round(predicted_pct_move, 6),
-                 threshold=self._delta_q_threshold,
+                 threshold=effective_delta_q_threshold,
+                 config_threshold=self._delta_q_threshold,
+                 std_log=round(std_log, 8),
                  direction=delta_q_dir,
                  pass_=delta_q_ok)
 
@@ -640,14 +682,30 @@ class HPMSEngine:
                  momentum_short_ok=momentum_direction_short,
                  traj_consistent=traj_consistent)
 
-        long_criteria  = (predicted_pct_move > self._delta_q_threshold
+        # ── p_now trend-alignment gate (Fix 3b) ──────────────────────────────
+        # The trajectory can predict a LONG even when current momentum p_now is
+        # negative (i.e. price is actively falling NOW).  This happens when V(q)
+        # has a valley ahead: the particle will decelerate, reverse, and end up
+        # higher — but only after passing through a losing region first.
+        # Gate: current momentum must agree with signal direction.
+        p_now_long_ok  = p_now > 0
+        p_now_short_ok = p_now < 0
+        elog.log("ENGINE_CRITERIA",
+                 check="p_now_direction",
+                 p_now=round(p_now, 6),
+                 long_ok=p_now_long_ok,
+                 short_ok=p_now_short_ok)
+
+        long_criteria  = (predicted_pct_move > effective_delta_q_threshold
                           and energy_conserved
                           and momentum_direction_long   # SIGN check, not just magnitude
+                          and p_now_long_ok             # current bar momentum agrees
                           and traj_consistent
                           and accel_long)
-        short_criteria = (predicted_pct_move < -self._delta_q_threshold
+        short_criteria = (predicted_pct_move < -effective_delta_q_threshold
                           and energy_conserved
                           and momentum_direction_short  # SIGN check, not just magnitude
+                          and p_now_short_ok            # current bar momentum agrees
                           and traj_consistent
                           and accel_short)
 
@@ -677,12 +735,23 @@ class HPMSEngine:
             if not delta_q_ok:
                 blockers.append(
                     "delta_q=" + str(round(abs(predicted_pct_move), 5)) +
-                    "<" + str(self._delta_q_threshold)
+                    "<" + str(round(effective_delta_q_threshold, 6))
                 )
             if not energy_conserved:
                 blockers.append(
                     "dH_dt=" + str(round(abs(dH_dt), 5)) +
                     ">" + str(self._dH_dt_max)
+                )
+            # p_now direction gate
+            if predicted_pct_move > 0 and not p_now_long_ok:
+                blockers.append(
+                    "p_now=" + str(round(p_now, 5)) +
+                    " contradicts LONG (current momentum is DOWN)"
+                )
+            elif predicted_pct_move < 0 and not p_now_short_ok:
+                blockers.append(
+                    "p_now=" + str(round(p_now, 5)) +
+                    " contradicts SHORT (current momentum is UP)"
                 )
             # Momentum direction check — the most common blocker for bad signals
             if predicted_pct_move > 0 and not momentum_direction_long:
@@ -803,7 +872,7 @@ class HPMSEngine:
                 f"TP=${tp_price:,.1f}  SL=${sl_price:,.1f}  [{compute_us:.0f}µs]"
             )
         else:
-            dq_pct  = abs(predicted_pct_move) / self._delta_q_threshold * 100 if self._delta_q_threshold else 0
+            dq_pct  = abs(predicted_pct_move) / effective_delta_q_threshold * 100 if effective_delta_q_threshold else 0
             dh_pct  = abs(dH_dt) / self._dH_dt_max * 100 if self._dH_dt_max else 0
             mom_pct = abs(p_pred) / self._min_momentum * 100 if self._min_momentum else 0
             g = lambda ok: "✓" if ok else "✗"  # noqa: E731
@@ -812,6 +881,11 @@ class HPMSEngine:
                 blockers.append(f"{g(False)}Δq={pct(predicted_pct_move)}({dq_pct:.0f}%/thr)")
             if not energy_conserved:
                 blockers.append(f"{g(False)}dH={abs(dH_dt):.5f}({dh_pct:.0f}%/max)")
+            # p_now direction
+            if predicted_pct_move > 0 and not p_now_long_ok:
+                blockers.append(f"{g(False)}p_now={p_now:+.5f}(↓,need↑)")
+            elif predicted_pct_move < 0 and not p_now_short_ok:
+                blockers.append(f"{g(False)}p_now={p_now:+.5f}(↑,need↓)")
             # Momentum direction check
             if predicted_pct_move > 0 and not momentum_direction_long:
                 blockers.append(f"{g(False)}p_dir={p_pred:+.5f}(need>0)")

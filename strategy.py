@@ -293,7 +293,7 @@ class HPMSStrategy:
                 logger.info(
                     f"TRADE OPEN ▶ {side.upper()} {size}c @ ${current_price:,.1f} "
                     f"TP=${signal.tp_price:,.1f} SL=${signal.sl_price:,.1f} "
-                    f"margin=${margin_used:.2f} fee=${entry_fee:.4f} "
+                    f"margin=${margin_used:.2f} fee=$-{entry_fee:.4f} "
                     f"conf={signal.confidence:.1%} id={result.get('order_id', '')}"
                 )
                 self._push(
@@ -303,7 +303,7 @@ class HPMSStrategy:
                     f"TP: `${signal.tp_price:,.1f}` (`${abs(signal.tp_price - current_price):.1f}`)\n"
                     f"SL: `${signal.sl_price:,.1f}` (`${abs(signal.sl_price - current_price):.1f}`)\n"
                     f"Margin: `${margin_used:.2f}` @ `{leverage}x`\n"
-                    f"Entry fee: `${entry_fee:.4f}`\n"
+                    f"Entry fee: `$-{entry_fee:.4f}`\n"
                     f"Conf: `{signal.confidence:.1%}` | Δq: `{signal.predicted_delta_q:+.5f}`"
                 )
                 self._block_count = 0
@@ -361,7 +361,7 @@ class HPMSStrategy:
 
         if len(candles_1m) >= 10:
             recent  = candles_1m[-10:]
-            atr     = sum(c["h"] - c["l"] for c in recent) / len(recent)
+            atr     = sum(c.get("h", c.get("c", 0)) - c.get("l", c.get("c", 0)) for c in recent) / len(recent)
             mid     = candles_1m[-1]["c"]
             if mid > 0:
                 atr_pct = atr / mid * 100
@@ -390,7 +390,7 @@ class HPMSStrategy:
 
         logger.info(
             f"TRADE CLOSE ■ reason={reason} exit=${exit_price:,.1f} "
-            f"gross=${gross_pnl:+.4f} fees=${fees:.4f} net=${net_pnl:+.4f} "
+            f"gross=${gross_pnl:+.4f} fees=$-{fees:.4f} net=${net_pnl:+.4f} "
             f"ROE={roe_pct:+.2f}% bars={bars_held} "
             f"daily_net=${daily['daily_pnl']:+.4f} "
             f"trades={daily['trades_today']} consec_loss={daily['consecutive_losses']}"
@@ -398,12 +398,12 @@ class HPMSStrategy:
         self._push(
             f"{emoji} *EXIT: {reason}*\n"
             f"Exit: `${exit_price:,.1f}`\n"
-            f"Gross: `${gross_pnl:+.4f}` | Fees: `${fees:.4f}`\n"
+            f"Gross: `${gross_pnl:+.4f}` | Fees: `$-{fees:.4f}`\n"
             f"*Net: `${net_pnl:+.4f}`* | ROE: `{roe_pct:+.2f}%`\n"
             f"Held: `{bars_held}` bars\n"
             f"Daily: gross `${daily.get('daily_gross_pnl', 0):+.4f}` "
             f"net `${daily['daily_pnl']:+.4f}` "
-            f"fees `${daily.get('daily_fees', 0):.4f}`\n"
+            f"fees `$-{daily.get('daily_fees', 0):.4f}`\n"
             f"Trades: `{daily['trades_today']}`"
         )
 
