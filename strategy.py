@@ -70,6 +70,14 @@ class HPMSStrategy:
         # Energy spike exit confirmation: require 2 consecutive bars above threshold
         self._consecutive_energy_spikes = 0
 
+        # Dynamic hold: TP distance stored at entry for max_hold computation
+        self._current_tp_distance: float = 0.0
+
+        # Entry tracking for ROE% computation
+        self._last_entry_size:  int   = 0
+        self._last_entry_price: float = 0.0
+        self._last_margin_used: float = 0.0
+
         # Throttle "blocked" console log lines so they don't spam
         self._last_block_log_bar = 0
         self._last_block_reason  = ""
@@ -144,11 +152,16 @@ class HPMSStrategy:
                     config_spike = getattr(self._config, "TRADE_DH_DT_EXIT_SPIKE", 0.15)
                     exit_spike = max(adaptive_spike, config_spike)
 
+                    # Dynamic max hold based on ATR and TP distance
+                    dynamic_max_hold = self._engine.get_dynamic_max_hold(
+                        self._current_tp_distance, current_price
+                    )
+
                     exit_reason = self._risk.check_exit_conditions(
                         dH_dt=signal.dH_dt,
                         dH_dt_spike=exit_spike,
                         bars_held=self._orders.bars_held,
-                        max_hold=getattr(self._config, "TRADE_MAX_HOLD_BARS", 5),
+                        max_hold=dynamic_max_hold,
                     )
                     if exit_reason:
                         # MAX_HOLD always exits immediately
@@ -260,22 +273,39 @@ class HPMSStrategy:
             )
 
             if result.get("success"):
-                self._risk.on_trade_open(side, current_price, size)
+                # Compute margin used for ROE% tracking
+                contract_value = getattr(self._config, "TRADE_CONTRACT_VALUE", 0.001)
+                leverage = getattr(self._config, "RISK_LEVERAGE", 10)
+                margin_used = (current_price * contract_value * size) / max(leverage, 1)
+                notional = current_price * contract_value * size
+
+                # Compute entry fee
+                taker_fee_pct = getattr(self._config, "TRADE_TAKER_FEE_PCT", 0.05)
+                entry_fee = notional * taker_fee_pct / 100.0
+
+                self._risk.on_trade_open(side, current_price, size, margin_used)
+                self._current_tp_distance = abs(signal.tp_price - current_price)
+                self._consecutive_energy_spikes = 0
+                self._last_entry_size  = size
+                self._last_entry_price = current_price
+                self._last_margin_used = margin_used
+
                 logger.info(
                     f"TRADE OPEN ▶ {side.upper()} {size}c @ ${current_price:,.1f} "
                     f"TP=${signal.tp_price:,.1f} SL=${signal.sl_price:,.1f} "
+                    f"margin=${margin_used:.2f} fee=${entry_fee:.4f} "
                     f"conf={signal.confidence:.1%} id={result.get('order_id', '')}"
                 )
                 self._push(
                     f"🚀 *ENTRY {side.upper()}*\n"
-                    f"Size: `{size}` contracts\n"
+                    f"Size: `{size}c` | Notional: `${notional:.2f}`\n"
                     f"Entry: `${current_price:,.1f}`\n"
-                    f"TP: `${signal.tp_price:,.1f}` | SL: `${signal.sl_price:,.1f}`\n"
-                    f"Confidence: `{signal.confidence:.1%}`\n"
-                    f"Δq: `{signal.predicted_delta_q:+.5f}` | |dH/dt|: `{abs(signal.dH_dt):.5f}`\n"
-                    f"Compute: `{signal.compute_time_us:.0f}µs`"
+                    f"TP: `${signal.tp_price:,.1f}` (`${abs(signal.tp_price - current_price):.1f}`)\n"
+                    f"SL: `${signal.sl_price:,.1f}` (`${abs(signal.sl_price - current_price):.1f}`)\n"
+                    f"Margin: `${margin_used:.2f}` @ `{leverage}x`\n"
+                    f"Entry fee: `${entry_fee:.4f}`\n"
+                    f"Conf: `{signal.confidence:.1%}` | Δq: `{signal.predicted_delta_q:+.5f}`"
                 )
-                # Reset block counter after a successful trade
                 self._block_count = 0
             else:
                 err = result.get("error", "unknown")
@@ -346,23 +376,34 @@ class HPMSStrategy:
 
     # ─── TRADE CLOSE CALLBACK ─────────────────────────────────────────────────
 
-    def _on_trade_closed(self, exit_price: float, pnl_usd: float, bars_held: int, reason: str):
-        self._risk.on_trade_close(exit_price, pnl_usd, bars_held, reason)
+    def _on_trade_closed(self, exit_price: float, gross_pnl: float,
+                         fees: float, net_pnl: float,
+                         bars_held: int, reason: str):
+        self._risk.on_trade_close(exit_price, gross_pnl, fees, net_pnl,
+                                   bars_held, reason)
 
         daily = self._risk.get_status()
-        emoji = "💰" if pnl_usd >= 0 else "🔻"
+        emoji = "💰" if net_pnl >= 0 else "🔻"
+
+        # ROE% = net_pnl / margin_used
+        roe_pct = (net_pnl / self._last_margin_used * 100) if self._last_margin_used > 0 else 0.0
 
         logger.info(
             f"TRADE CLOSE ■ reason={reason} exit=${exit_price:,.1f} "
-            f"pnl=${pnl_usd:+.4f} bars={bars_held} "
-            f"daily_pnl=${daily['daily_pnl']:+.2f} "
+            f"gross=${gross_pnl:+.4f} fees=${fees:.4f} net=${net_pnl:+.4f} "
+            f"ROE={roe_pct:+.2f}% bars={bars_held} "
+            f"daily_net=${daily['daily_pnl']:+.4f} "
             f"trades={daily['trades_today']} consec_loss={daily['consecutive_losses']}"
         )
         self._push(
             f"{emoji} *EXIT: {reason}*\n"
             f"Exit: `${exit_price:,.1f}`\n"
-            f"PnL: `${pnl_usd:+.2f}` | Held: `{bars_held}` bars\n"
-            f"Daily PnL: `${daily['daily_pnl']:+.2f}` | "
+            f"Gross: `${gross_pnl:+.4f}` | Fees: `${fees:.4f}`\n"
+            f"*Net: `${net_pnl:+.4f}`* | ROE: `{roe_pct:+.2f}%`\n"
+            f"Held: `{bars_held}` bars\n"
+            f"Daily: gross `${daily.get('daily_gross_pnl', 0):+.4f}` "
+            f"net `${daily['daily_pnl']:+.4f}` "
+            f"fees `${daily.get('daily_fees', 0):.4f}`\n"
             f"Trades: `{daily['trades_today']}`"
         )
 

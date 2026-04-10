@@ -24,11 +24,16 @@ class OrderManager:
     - Reconciliation: poll position state to detect fills
     """
 
-    def __init__(self, api, symbol: str = "BTCUSD", contract_value: float = 0.001):
+    def __init__(self, api, symbol: str = "BTCUSD", contract_value: float = 0.001,
+                 taker_fee_pct: float = 0.05, maker_fee_pct: float = 0.02):
         self._api    = api
         self._symbol = symbol
         self._lock   = threading.RLock()
         self._contract_value = contract_value  # BTC per contract (Delta BTCUSD = 0.001)
+
+        # Fee rates (percentage, e.g. 0.05 = 0.05%)
+        self._taker_fee_pct = taker_fee_pct
+        self._maker_fee_pct = maker_fee_pct
 
         # Active state
         self._position_side:    Optional[str] = None   # "long" | "short" | None
@@ -36,6 +41,7 @@ class OrderManager:
         self._entry_price:      float = 0.0
         self._entry_bar:        int   = 0
         self._entry_time:       float = 0.0
+        self._entry_fee_usd:    float = 0.0   # fee paid at entry
         self._sl_order_id:      Optional[str] = None
         self._tp_order_id:      Optional[str] = None
         self._entry_order_id:   Optional[str] = None
@@ -139,6 +145,9 @@ class OrderManager:
                 self._entry_price    = price
                 self._entry_time     = time.time()
                 self._entry_bar      = 0
+                self._entry_fee_usd  = self._compute_fee(
+                    price, size, is_taker=(order_type == "market")
+                )
 
                 # For bracket orders Delta returns the leg IDs directly in the result.
                 # Capture them now so _cancel_sl_tp() can cancel them on a force-exit.
@@ -244,29 +253,31 @@ class OrderManager:
                     if self._product_id:
                         resp = self._api.close_position(self._product_id)
 
-                # Compute PnL
-                # Delta linear perpetual: PnL = (exit - entry) * contract_value * contracts
-                # contract_value is in base asset units (e.g. 0.001 BTC for BTCUSD)
+                # Compute PnL with fees
                 if current_price > 0:
-                    price_diff = current_price - self._entry_price
-                    if self._position_side == "short":
-                        price_diff = -price_diff
-                    pnl_usd = price_diff * self._contract_value * self._position_size
+                    gross_pnl, total_fees, net_pnl = self._compute_pnl_full(
+                        current_price, exit_is_taker=True  # market exit = taker
+                    )
                 else:
-                    pnl_usd = 0.0
+                    gross_pnl = total_fees = net_pnl = 0.0
 
                 bars_held = self._entry_bar
 
                 logger.info(
                     f"🔻 EXIT {self._position_side.upper()} {self._position_size} "
-                    f"@ ~{current_price:.1f} PnL=${pnl_usd:.2f} bars={bars_held} reason={reason}"
+                    f"@ ~{current_price:.1f} gross=${gross_pnl:+.4f} "
+                    f"fees=${total_fees:.4f} net=${net_pnl:+.4f} "
+                    f"bars={bars_held} reason={reason}"
                 )
 
                 if self._on_close_cb:
-                    self._on_close_cb(current_price, pnl_usd, bars_held, reason)
+                    self._on_close_cb(current_price, gross_pnl, total_fees,
+                                      net_pnl, bars_held, reason)
 
                 self._reset_position()
-                return {"success": True, "pnl_usd": pnl_usd, "reason": reason}
+                return {"success": True, "gross_pnl": gross_pnl,
+                        "fees": total_fees, "net_pnl": net_pnl,
+                        "reason": reason}
 
             except Exception as e:
                 logger.error(f"Close exception: {e}", exc_info=True)
@@ -289,6 +300,7 @@ class OrderManager:
         self._entry_price    = 0.0
         self._entry_bar      = 0
         self._entry_time     = 0.0
+        self._entry_fee_usd  = 0.0
         self._sl_order_id    = None
         self._tp_order_id    = None
         self._entry_order_id = None
@@ -336,15 +348,20 @@ class OrderManager:
 
                 # Determine TP vs SL from price
                 reason = self._classify_exit(fill_price)
-                pnl    = self._compute_pnl(fill_price)
+                is_taker = (role == "taker") if role else True
+                gross_pnl, total_fees, net_pnl = self._compute_pnl_full(
+                    fill_price, exit_is_taker=is_taker
+                )
 
                 logger.info(
                     f"🔔 WS FILL detected: {reason} {self._position_side.upper()} "
-                    f"fill_price={fill_price:.1f} pnl=${pnl:.2f}"
+                    f"fill_price={fill_price:.1f} gross=${gross_pnl:+.4f} "
+                    f"fees=${total_fees:.4f} net=${net_pnl:+.4f}"
                 )
 
                 if self._on_close_cb:
-                    self._on_close_cb(fill_price, pnl, self._entry_bar, reason)
+                    self._on_close_cb(fill_price, gross_pnl, total_fees,
+                                      net_pnl, self._entry_bar, reason)
                 self._reset_position()
 
             except Exception as e:
@@ -365,14 +382,31 @@ class OrderManager:
 
     # ─── PNL HELPERS ──────────────────────────────────────────────────────────
 
+    def _compute_fee(self, price: float, size: int, is_taker: bool = True) -> float:
+        """Compute fee in USD for a fill at given price and size."""
+        notional = price * self._contract_value * size
+        rate = self._taker_fee_pct if is_taker else self._maker_fee_pct
+        return notional * rate / 100.0
+
     def _compute_pnl(self, exit_price: float) -> float:
-        """Compute USD PnL for the current open position at the given exit price."""
+        """Compute gross USD PnL (no fees) for current open position."""
         if exit_price <= 0 or self._entry_price <= 0:
             return 0.0
         diff = exit_price - self._entry_price
         if self._position_side == "short":
             diff = -diff
         return diff * self._contract_value * self._position_size
+
+    def _compute_pnl_full(self, exit_price: float, exit_is_taker: bool = True):
+        """
+        Compute full PnL breakdown: gross, entry_fee, exit_fee, net.
+        Returns (gross_pnl, total_fees, net_pnl).
+        """
+        gross = self._compute_pnl(exit_price)
+        entry_fee = self._entry_fee_usd
+        exit_fee = self._compute_fee(exit_price, self._position_size, exit_is_taker)
+        total_fees = entry_fee + exit_fee
+        return gross, total_fees, gross - total_fees
 
     def _classify_exit(self, exit_price: float) -> str:
         """Return 'TP_HIT', 'SL_HIT', or 'EXCHANGE_CLOSE' based on price vs entry."""
@@ -422,14 +456,19 @@ class OrderManager:
                     if size == 0 or result.get("side") is None:
                         # Position closed on exchange (SL/TP hit) — get real exit price
                         exit_price, reason = self._get_exit_price_from_fills()
-                        pnl_usd = self._compute_pnl(exit_price)
+                        # SL/TP fills are typically taker on Delta
+                        gross_pnl, total_fees, net_pnl = self._compute_pnl_full(
+                            exit_price, exit_is_taker=True
+                        )
 
                         logger.info(
                             f"Position closed on exchange ({reason}) "
-                            f"exit_price={exit_price:.1f} pnl=${pnl_usd:.2f}"
+                            f"exit_price={exit_price:.1f} gross=${gross_pnl:+.4f} "
+                            f"fees=${total_fees:.4f} net=${net_pnl:+.4f}"
                         )
                         if self._on_close_cb:
-                            self._on_close_cb(exit_price, pnl_usd, self._entry_bar, reason)
+                            self._on_close_cb(exit_price, gross_pnl, total_fees,
+                                              net_pnl, self._entry_bar, reason)
                         self._reset_position()
                         return reason
             except Exception as e:

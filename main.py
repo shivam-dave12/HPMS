@@ -265,6 +265,8 @@ class HPMSRunner:
             api=self._api,
             symbol=config.DELTA_SYMBOL,
             contract_value=getattr(config, "TRADE_CONTRACT_VALUE", 0.001),
+            taker_fee_pct=getattr(config, "TRADE_TAKER_FEE_PCT", 0.05),
+            maker_fee_pct=getattr(config, "TRADE_MAKER_FEE_PCT", 0.02),
         )
         # Wire real-time fill/order events from WebSocket into OrderManager
         self._orders.register_with_data_manager(self._data_mgr)

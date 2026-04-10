@@ -84,13 +84,8 @@ def _gate(ok: bool) -> str:
 
 
 def _mk(text: str) -> str:
-    """Escape Markdown v1 special chars in dynamic text fragments.
-
-    Telegram Markdown v1 only treats _, *, `, [ as special.
-    Over-escaping (MarkdownV2 set) with parse_mode='Markdown' produces
-    literal backslashes in the rendered output.
-    """
-    for ch in r"_*`[":
+    """Escape Markdown special chars in dynamic text fragments."""
+    for ch in r"\_*[]()~`>#+=|{}.!-":
         text = text.replace(ch, f"\\{ch}")
     return text
 
@@ -193,9 +188,8 @@ class TelegramBot:
         # ── Register command handlers ─────────────────────────────────────────
         cmds = {
             # Info
-            "start":         self._cmd_start_trading,   # /start → enable trading
-            "stop":          self._cmd_stop_trading,    # /stop  → disable trading
-            "help":          self._cmd_help,
+            "start":         self._cmd_start,
+            "help":          self._cmd_start,
             "ping":          self._cmd_ping,
             "status":        self._cmd_status,
             "thinking":      self._cmd_thinking,
@@ -258,15 +252,14 @@ class TelegramBot:
 
         self._app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _fallback))
 
-        # ── Bot command menu ───────────────────────────────────────────────────
-        # Wrapped in asyncio.wait_for so a network timeout cannot crash the bot
-        # thread before _ready.set() is called.  A failure here is non-fatal —
-        # all commands still work; the Telegram UI menu simply won't update.
+        # ── Initialize and start FIRST (required before set_my_commands) ────────
+        await self._app.initialize()
+        await self._app.start()
+
+        # ── Bot command menu (AFTER initialize — bot must be set up first) ────
         try:
             await asyncio.wait_for(
                 self._app.bot.set_my_commands([
-                    BotCommand("start",         "▶ Start trading"),
-                    BotCommand("stop",          "⏹ Stop trading (positions remain)"),
                     BotCommand("status",        "Full system dashboard"),
                     BotCommand("thinking",      "HPMS decision stack — why we trade or not"),
                     BotCommand("phase",         "Phase-space state (q, p, H, dH/dt)"),
@@ -279,10 +272,12 @@ class TelegramBot:
                     BotCommand("risk",          "Risk gate status"),
                     BotCommand("balance",       "Exchange wallet balance"),
                     BotCommand("price",         "Current price + spread"),
-                    BotCommand("halt",          "⛔ Emergency halt + flatten"),
-                    BotCommand("resume",        "✅ Resume from halt"),
-                    BotCommand("resetrisk",     "🔄 Clear lockout (no flatten)"),
-                    BotCommand("flatten",       "🔨 Close all positions + cancel orders"),
+                    BotCommand("start_trading", "Enable trading"),
+                    BotCommand("stop_trading",  "Disable trading (positions remain)"),
+                    BotCommand("halt",          "Emergency halt + flatten"),
+                    BotCommand("resume",        "Resume from halt"),
+                    BotCommand("resetrisk",     "Clear lockout (no flatten)"),
+                    BotCommand("flatten",       "Close all positions + cancel orders"),
                     BotCommand("params",        "All tunable parameters"),
                     BotCommand("set",           "Set a parameter live"),
                     BotCommand("leverage",      "View / set exchange leverage"),
@@ -293,14 +288,14 @@ class TelegramBot:
         except Exception as e:
             logger.warning(f"set_my_commands failed (non-fatal, commands still work): {e}")
 
-        await self._app.initialize()
-        await self._app.start()
+        # ── Start polling (v20+: updater.start_polling is non-blocking) ───────
         await self._app.updater.start_polling(drop_pending_updates=True)
 
         self._running = True
         logger.info("Telegram bot online")
         self._ready.set()  # unblock TelegramBot.start()
 
+        # Keep alive until stop() is called
         while self._running:
             await asyncio.sleep(1)
 
@@ -410,7 +405,7 @@ class TelegramBot:
     # COMMANDS: /help
     # ──────────────────────────────────────────────────────────────────────────
 
-    async def _cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    async def _cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             await update.message.reply_text(
                 "🔬 *HPMS — Hamiltonian Phase-Space Micro-Scalping*\n\n"
@@ -429,8 +424,8 @@ class TelegramBot:
                 "/diag — Engine diagnostics\n"
                 "/engine — Engine parameters\n\n"
                 "⚡ *Controls*\n"
-                "/start — Enable strategy\n"
-                "/stop — Disable (positions remain)\n"
+                "/start_trading — Enable strategy\n"
+                "/stop_trading — Disable (positions remain)\n"
                 "/halt — Emergency stop + flatten\n"
                 "/resume — Resume from halt\n"
                 "/resetrisk — Clear lockout only (no flatten)\n"
@@ -447,12 +442,14 @@ class TelegramBot:
                 parse_mode="Markdown",
             )
         except Exception as e:
+            # Fallback to plain text if Markdown fails
             logger.warning(f"Help command Markdown failed: {e}")
             await update.message.reply_text(
                 "HPMS — Hamiltonian Phase-Space Micro-Scalping\n\n"
                 "Info: /status /thinking /phase /signal /market /filter "
                 "/risk /pnl /trades /position /balance /diag /engine\n\n"
-                "Controls: /start /stop /halt /resume /resetrisk /flatten /close\n\n"
+                "Controls: /start_trading /stop_trading /halt /resume "
+                "/resetrisk /flatten /close\n\n"
                 "Config: /params /set /get /leverage /cooldown /maxloss /maxsize"
             )
 
@@ -525,8 +522,10 @@ class TelegramBot:
                 f"Position:  {pos_txt}\n"
                 f"Bars:      `{s.get('bar_count', 0)}`\n\n"
                 f"💰 *Today*\n"
-                f"PnL:    `${risk.get('daily_pnl', 0):+.2f}` "
-                f"(high `${risk.get('session_high_pnl', 0):+.2f}`)\n"
+                f"Gross:  `${risk.get('daily_gross_pnl', 0):+.4f}`\n"
+                f"Fees:   `${risk.get('daily_fees', 0):.4f}`\n"
+                f"*Net:   `${risk.get('daily_pnl', 0):+.4f}`* "
+                f"(high `${risk.get('session_high_pnl', 0):+.4f}`)\n"
                 f"Trades: `{risk.get('trades_today', 0)}`/"
                 f"`{risk.get('params', {}).get('max_daily_trades', '?')}`\n"
                 f"Losses: `{risk.get('consecutive_losses', 0)}` consecutive\n"
@@ -1052,31 +1051,48 @@ class TelegramBot:
             await update.message.reply_text("📋 No trades today yet")
             return
         lines = ["📋 *Recent Trades*\n"]
-        total = 0.0
+        total_gross = total_fees = total_net = 0.0
         for t in trades:
-            emoji = "💰" if t["pnl"] >= 0 else "🔻"
+            emoji = "💰" if t["net_pnl"] >= 0 else "🔻"
             lines.append(
-                f"{emoji} `{t['time']}` {t['side'].upper()} "
-                f"`${t['pnl']:+.2f}` ({t['bars']}b) _{t['reason']}_"
+                f"{emoji} `{t['time']}` {t['side'].upper()} {t.get('size', 1)}c "
+                f"gross `${t['gross_pnl']:+.4f}` "
+                f"fee `${t['fees']:.4f}` "
+                f"*net `${t['net_pnl']:+.4f}`* "
+                f"ROE `{t.get('roe_pct', 0):+.1f}%` "
+                f"({t['bars']}b) _{t['reason']}_"
             )
-            total += t["pnl"]
-        lines.append(f"\n_Total: `${total:+.2f}`_")
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+            total_gross += t["gross_pnl"]
+            total_fees += t["fees"]
+            total_net += t["net_pnl"]
+        lines.append(
+            f"\nGross: `${total_gross:+.4f}` | Fees: `${total_fees:.4f}`\n"
+            f"*Net: `${total_net:+.4f}`*"
+        )
+        try:
+            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        except Exception:
+            plain = "\n".join(lines).replace("`", "").replace("*", "").replace("_", "")
+            await update.message.reply_text(plain)
 
     async def _cmd_pnl(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not await self._guard(update):
             return
         r = self._risk.get_status() if self._risk else {}
         p = r.get("params", {})
-        pnl     = r.get("daily_pnl", 0)
-        pnl_max = p.get("max_daily_loss", 200)
-        pnl_bar = _pct_bar(abs(pnl), 0, pnl_max)
-        pnl_icon = "💰" if pnl >= 0 else "🔻"
+        net_pnl  = r.get("daily_pnl", 0)
+        gross_pnl = r.get("daily_gross_pnl", 0)
+        fees     = r.get("daily_fees", 0)
+        pnl_max  = p.get("max_daily_loss", 200)
+        pnl_bar  = _pct_bar(abs(net_pnl), 0, pnl_max)
+        pnl_icon = "💰" if net_pnl >= 0 else "🔻"
         await update.message.reply_text(
             f"{pnl_icon} *Daily P&L*\n\n"
-            f"PnL:          `${pnl:+.2f}` / limit `$-{pnl_max}`\n"
+            f"Gross PnL:    `${gross_pnl:+.4f}`\n"
+            f"Total fees:   `${fees:.4f}`\n"
+            f"*Net PnL:     `${net_pnl:+.4f}`* / limit `$-{pnl_max}`\n"
             f"              [{pnl_bar}]\n"
-            f"Session high: `${r.get('session_high_pnl', 0):+.2f}`\n"
+            f"Session high: `${r.get('session_high_pnl', 0):+.4f}`\n"
             f"Trades:       `{r.get('trades_today', 0)}` / `{p.get('max_daily_trades', '?')}`\n"
             f"Consec losses:`{r.get('consecutive_losses', 0)}` / `{p.get('max_consec_losses', '?')}`\n"
             f"Halted:       `{'Yes — ' + r.get('halt_reason', '') if r.get('is_halted') else 'No'}`",
@@ -1102,22 +1118,45 @@ class TelegramBot:
         if not p.get("in_position"):
             await update.message.reply_text("⬜ No open position")
             return
-        price      = self._data.get_last_price() if self._data else 0
-        unrealised = ""
+        price = self._data.get_last_price() if self._data else 0
+        cfg   = self._config
+
+        pnl_block = ""
         if price and p.get("entry_price"):
             diff = price - p["entry_price"]
             if p["side"] == "short":
                 diff = -diff
-            cv  = getattr(self._config, "TRADE_CONTRACT_VALUE", 0.001) if self._config else 0.001
-            pnl = diff * cv * p["size"]
-            unrealised = f"\nUnrealised: `${pnl:+.2f}`"
+            cv  = getattr(cfg, "TRADE_CONTRACT_VALUE", 0.001) if cfg else 0.001
+            lev = getattr(cfg, "RISK_LEVERAGE", 10) if cfg else 10
+            taker_fee = getattr(cfg, "TRADE_TAKER_FEE_PCT", 0.05) if cfg else 0.05
+            size = p["size"]
+
+            notional = p["entry_price"] * cv * size
+            margin = notional / max(lev, 1)
+            gross_pnl = diff * cv * size
+            # Entry fee already paid; estimate exit fee at current price
+            entry_fee = notional * taker_fee / 100.0
+            exit_fee = price * cv * size * taker_fee / 100.0
+            total_fees = entry_fee + exit_fee
+            net_pnl = gross_pnl - total_fees
+            roe_pct = (net_pnl / margin * 100) if margin > 0 else 0.0
+
+            pnl_block = (
+                f"\n*Unrealised P&L:*\n"
+                f"  Gross: `${gross_pnl:+.4f}`\n"
+                f"  Fees (est): `${total_fees:.4f}` (entry `${entry_fee:.4f}` + exit `${exit_fee:.4f}`)\n"
+                f"  *Net: `${net_pnl:+.4f}`*\n"
+                f"  ROE: `{roe_pct:+.2f}%` on `${margin:.2f}` margin"
+            )
+
         side_icon = "🟢" if p.get("side") == "long" else "🔴"
         await update.message.reply_text(
             f"{side_icon} *Open Position*\n\n"
             f"Side:  `{p['side'].upper()}`\n"
             f"Size:  `{p['size']}` contracts\n"
             f"Entry: `${p['entry_price']:,.1f}`\n"
-            f"Price: `${price:,.1f}`{unrealised}\n"
+            f"Price: `${price:,.1f}`"
+            f"{pnl_block}\n"
             f"Bars:  `{p['bars_held']}`\n"
             f"SL order: `{p.get('sl_order') or 'N/A'}`\n"
             f"TP order: `{p.get('tp_order') or 'N/A'}`",
@@ -1163,7 +1202,7 @@ class TelegramBot:
             if rs.get("is_halted"):
                 await update.message.reply_text(
                     f"⚠️ Risk manager is HALTED (`{rs['halt_reason']}`)\n"
-                    f"Use /resume first to clear the halt, then /start",
+                    f"Use /resume first to clear the halt, then /start\\_trading",
                     parse_mode="Markdown",
                 )
                 return
@@ -1212,7 +1251,7 @@ class TelegramBot:
             f"⛔ *EMERGENCY HALT*\n\n"
             f"Actions taken:\n" +
             "\n".join(f"• {a}" for a in actions) +
-            f"\n\n_Use /resume then /start to re-enable._",
+            f"\n\n_Use /resume then /start\\_trading to re-enable._",
             parse_mode="Markdown",
         )
 
@@ -1226,7 +1265,7 @@ class TelegramBot:
         await update.message.reply_text(
             f"✅ *Risk resumed* (was: `{was}`)\n"
             f"Consecutive losses reset to 0.\n\n"
-            f"_Use /start to re-enable the strategy._",
+            f"_Use /start\\_trading to re-enable the strategy._",
             parse_mode="Markdown",
         )
 

@@ -25,11 +25,14 @@ class TradeRecord:
     side:        str
     entry_price: float
     exit_price:  float = 0.0
-    pnl_usd:     float = 0.0
+    gross_pnl:   float = 0.0
+    fees_usd:    float = 0.0
+    net_pnl:     float = 0.0
     size:        int   = 0
     hold_bars:   int   = 0
     reason:      str   = ""
     closed:      bool  = False
+    margin_used: float = 0.0  # for ROE% calculation
 
 
 class RiskManager:
@@ -61,6 +64,7 @@ class RiskManager:
         self._lock               = threading.RLock()
         self._trades_today:      List[TradeRecord] = []
         self._daily_pnl:         float = 0.0
+        self._total_fees:        float = 0.0
         self._session_high_pnl:  float = 0.0
         self._consecutive_losses: int  = 0
         self._last_trade_time:   float = 0.0
@@ -109,6 +113,7 @@ class RiskManager:
             self._day_start          = today
             self._trades_today       = []
             self._daily_pnl          = 0.0
+            self._total_fees         = 0.0
             self._session_high_pnl   = 0.0
             self._consecutive_losses = 0
             # Clear ALL halts on new day — not just DAILY ones.
@@ -246,46 +251,47 @@ class RiskManager:
 
     # ─── TRADE LIFECYCLE ──────────────────────────────────────────────────────
 
-    def on_trade_open(self, side: str, entry_price: float, size: int):
+    def on_trade_open(self, side: str, entry_price: float, size: int,
+                      margin_used: float = 0.0):
         with self._lock:
             self._open_trade = TradeRecord(
-                timestamp=time.time(), side=side, entry_price=entry_price, size=size,
+                timestamp=time.time(), side=side, entry_price=entry_price,
+                size=size, margin_used=margin_used,
             )
             self._last_trade_time = time.time()
 
-    def on_trade_close(self, exit_price: float, pnl_usd: float, hold_bars: int, reason: str):
+    def on_trade_close(self, exit_price: float, gross_pnl: float,
+                       fees: float, net_pnl: float,
+                       hold_bars: int, reason: str):
         with self._lock:
             if self._open_trade:
                 self._open_trade.exit_price = exit_price
-                self._open_trade.pnl_usd    = pnl_usd
-                self._open_trade.hold_bars   = hold_bars
-                self._open_trade.reason      = reason
-                self._open_trade.closed      = True
+                self._open_trade.gross_pnl  = gross_pnl
+                self._open_trade.fees_usd   = fees
+                self._open_trade.net_pnl    = net_pnl
+                self._open_trade.hold_bars  = hold_bars
+                self._open_trade.reason     = reason
+                self._open_trade.closed     = True
                 self._trades_today.append(self._open_trade)
                 self._open_trade = None
 
-            self._daily_pnl        += pnl_usd
+            # Track daily PnL using NET (after fees) — this is real money
+            self._daily_pnl        += net_pnl
+            self._total_fees       += fees
             self._session_high_pnl  = max(self._session_high_pnl, self._daily_pnl)
 
-            if pnl_usd < 0:
-                # Forced exits (ENERGY_SPIKE, MAX_HOLD) are often not signal
-                # failures — they're system-driven. Don't let them burn through
-                # the consecutive loss limit as fast as real signal failures.
+            if net_pnl < 0:
                 is_forced = any(tag in reason for tag in (
                     "ENERGY_SPIKE", "MAX_HOLD", "SHUTDOWN", "TELEGRAM",
                 ))
                 if is_forced:
-                    # Soft loss: only increment by weight (0.5 default)
-                    # Uses a float accumulator that floors to int for comparison
                     self._consecutive_losses += self._soft_loss_weight
-                    # Floor to int for threshold comparison
                     self._consecutive_losses = round(self._consecutive_losses, 1)
                     logger.info(
                         f"Soft loss ({reason}): consec_losses={self._consecutive_losses} "
                         f"(weighted +{self._soft_loss_weight})"
                     )
                 else:
-                    # Real signal failure: full increment
                     self._consecutive_losses = int(self._consecutive_losses) + 1
             else:
                 self._consecutive_losses = 0
@@ -369,11 +375,16 @@ class RiskManager:
                         0.0, self._auto_resume_seconds - elapsed_halt
                     )
 
+            # Compute daily gross PnL (before fees)
+            daily_gross = sum(t.gross_pnl for t in self._trades_today)
+
             return {
                 "is_halted":          self._is_halted,
                 "halt_reason":        self._halt_reason,
-                "daily_pnl":          round(self._daily_pnl, 2),
-                "session_high_pnl":   round(self._session_high_pnl, 2),
+                "daily_pnl":          round(self._daily_pnl, 4),      # net (after fees)
+                "daily_gross_pnl":    round(daily_gross, 4),
+                "daily_fees":         round(self._total_fees, 4),
+                "session_high_pnl":   round(self._session_high_pnl, 4),
                 "trades_today":       len(self._trades_today),
                 "consecutive_losses": self._consecutive_losses,
                 "last_trade_time":    self._last_trade_time,
@@ -400,13 +411,17 @@ class RiskManager:
         with self._lock:
             return [
                 {
-                    "time":   datetime.fromtimestamp(t.timestamp, tz=timezone.utc).strftime("%H:%M:%S"),
-                    "side":   t.side,
-                    "entry":  t.entry_price,
-                    "exit":   t.exit_price,
-                    "pnl":    round(t.pnl_usd, 2),
-                    "bars":   t.hold_bars,
-                    "reason": t.reason,
+                    "time":      datetime.fromtimestamp(t.timestamp, tz=timezone.utc).strftime("%H:%M:%S"),
+                    "side":      t.side,
+                    "entry":     t.entry_price,
+                    "exit":      t.exit_price,
+                    "gross_pnl": round(t.gross_pnl, 4),
+                    "fees":      round(t.fees_usd, 4),
+                    "net_pnl":   round(t.net_pnl, 4),
+                    "roe_pct":   round(t.net_pnl / t.margin_used * 100, 2) if t.margin_used > 0 else 0.0,
+                    "bars":      t.hold_bars,
+                    "size":      t.size,
+                    "reason":    t.reason,
                 }
                 for t in self._trades_today[-last_n:]
             ]

@@ -608,10 +608,48 @@ class HPMSEngine:
         signal_type   = SignalType.FLAT
         reason        = "NO_SIGNAL"
 
+        # CRITICAL FIX: Momentum SIGN must agree with predicted direction.
+        # Previously only abs(p_pred) was checked, ignoring sign.
+        # This caused 56% of signals to have contradictory momentum:
+        #   e.g. SHORT signal with p_pred=+2.55 (momentum heading UP).
+        # Such signals trade INTO a reversal — the trajectory overshoots
+        # through a potential well and bounces back. Net displacement is
+        # negative but the particle is heading back up at horizon end.
+        # That's the worst possible entry for a short.
+        momentum_direction_long  = p_pred > self._min_momentum
+        momentum_direction_short = p_pred < -self._min_momentum
+
+        # Trajectory quality: check if the trajectory is monotonic
+        # in the predicted direction over the second half of the horizon.
+        # If the trajectory reverses in the final bars, the signal is unreliable.
+        traj_consistent = True
+        if len(trajectory) >= 3:
+            mid = len(trajectory) // 2
+            second_half_dq = trajectory[-1].q - trajectory[mid].q
+            # For a LONG, second half should move UP (dq > 0)
+            # For a SHORT, second half should move DOWN (dq < 0)
+            if predicted_pct_move > 0 and second_half_dq < 0:
+                traj_consistent = False
+            elif predicted_pct_move < 0 and second_half_dq > 0:
+                traj_consistent = False
+
+        elog.log("ENGINE_CRITERIA",
+                 check="momentum_direction",
+                 p_pred=round(p_pred, 6),
+                 momentum_long_ok=momentum_direction_long,
+                 momentum_short_ok=momentum_direction_short,
+                 traj_consistent=traj_consistent)
+
         long_criteria  = (predicted_pct_move > self._delta_q_threshold
-                          and energy_conserved and momentum_ok and accel_long)
+                          and energy_conserved
+                          and momentum_direction_long   # SIGN check, not just magnitude
+                          and traj_consistent
+                          and accel_long)
         short_criteria = (predicted_pct_move < -self._delta_q_threshold
-                          and energy_conserved and momentum_ok and accel_short)
+                          and energy_conserved
+                          and momentum_direction_short  # SIGN check, not just magnitude
+                          and traj_consistent
+                          and accel_short)
 
         if long_criteria:
             signal_type = SignalType.LONG
@@ -646,10 +684,20 @@ class HPMSEngine:
                     "dH_dt=" + str(round(abs(dH_dt), 5)) +
                     ">" + str(self._dH_dt_max)
                 )
-            if not momentum_ok:
+            # Momentum direction check — the most common blocker for bad signals
+            if predicted_pct_move > 0 and not momentum_direction_long:
                 blockers.append(
-                    "p_pred=" + str(round(abs(p_pred), 5)) +
-                    "<" + str(self._min_momentum)
+                    "p_pred=" + str(round(p_pred, 5)) +
+                    " contradicts LONG (need >0)"
+                )
+            elif predicted_pct_move < 0 and not momentum_direction_short:
+                blockers.append(
+                    "p_pred=" + str(round(p_pred, 5)) +
+                    " contradicts SHORT (need <0)"
+                )
+            if not traj_consistent:
+                blockers.append(
+                    "trajectory_reversal (2nd half contradicts direction)"
                 )
             if self._acceleration_check:
                 if predicted_pct_move > 0 and not accel_long:
@@ -679,25 +727,51 @@ class HPMSEngine:
                      predicted_pct=round(predicted_pct_move, 6),
                      delta_q_ok=delta_q_ok,
                      energy_ok=energy_conserved,
-                     momentum_ok=momentum_ok,
+                     momentum_dir_long=momentum_direction_long,
+                     momentum_dir_short=momentum_direction_short,
+                     traj_consistent=traj_consistent,
                      accel_long_ok=accel_long,
                      accel_short_ok=accel_short)
 
-        # ── Step 8: TP / SL prices ────────────────────────────────────────────
-        if signal_type == SignalType.LONG:
-            tp_price = current_price * (1.0 + self._tp_pct)
-            sl_price = current_price * (1.0 - self._sl_pct)
-            pred_target = current_price * math.exp(predicted_pct_move)
-            # Only move TP further out (better), never closer (worse)
-            if pred_target > tp_price:
-                tp_price = pred_target
-        elif signal_type == SignalType.SHORT:
-            tp_price = current_price * (1.0 - self._tp_pct)
-            sl_price = current_price * (1.0 + self._sl_pct)
-            pred_target = current_price * math.exp(predicted_pct_move)
-            # Only move TP further out (lower for short), never closer
-            if pred_target < tp_price:
-                tp_price = pred_target
+        # ── Step 8: TP / SL prices (ATR-based) ────────────────────────────────
+        # Fixed % TP/SL was unreachable: 0.35% = $252 at $72k, but 8-bar
+        # range is only ~$46. Use actual recent volatility instead.
+        if signal_type != SignalType.FLAT and len(closes_arr) >= 15:
+            # Compute ATR from last 14 bars (actual high-low would be better
+            # but we only have closes — use close-to-close range as proxy)
+            recent = closes_arr[-15:]
+            bar_ranges = np.abs(np.diff(recent))
+            atr_1bar = float(np.mean(bar_ranges)) if len(bar_ranges) > 0 else current_price * 0.0005
+
+            # TP = 2.0 × ATR × prediction_horizon bars — achievable target
+            # SL = 1.2 × ATR × sqrt(prediction_horizon) — tighter risk
+            tp_atr_mult = 2.0
+            sl_atr_mult = 1.2
+            tp_distance = atr_1bar * tp_atr_mult * self._horizon
+            sl_distance = atr_1bar * sl_atr_mult * math.sqrt(self._horizon)
+
+            # Floor: at least 0.01% of price
+            tp_distance = max(tp_distance, current_price * 0.0001)
+            sl_distance = max(sl_distance, current_price * 0.0001)
+
+            # Cap: respect config max TP/SL %
+            tp_distance = min(tp_distance, current_price * self._tp_pct)
+            sl_distance = min(sl_distance, current_price * self._sl_pct)
+
+            if signal_type == SignalType.LONG:
+                tp_price = current_price + tp_distance
+                sl_price = current_price - sl_distance
+            else:
+                tp_price = current_price - tp_distance
+                sl_price = current_price + sl_distance
+        elif signal_type != SignalType.FLAT:
+            # Fallback if not enough data for ATR
+            if signal_type == SignalType.LONG:
+                tp_price = current_price * (1.0 + self._tp_pct)
+                sl_price = current_price * (1.0 - self._sl_pct)
+            else:
+                tp_price = current_price * (1.0 - self._tp_pct)
+                sl_price = current_price * (1.0 + self._sl_pct)
         else:
             tp_price = 0.0
             sl_price = 0.0
@@ -738,8 +812,13 @@ class HPMSEngine:
                 blockers.append(f"{g(False)}Δq={pct(predicted_pct_move)}({dq_pct:.0f}%/thr)")
             if not energy_conserved:
                 blockers.append(f"{g(False)}dH={abs(dH_dt):.5f}({dh_pct:.0f}%/max)")
-            if not momentum_ok:
-                blockers.append(f"{g(False)}|p|={abs(p_pred):.6f}({mom_pct:.0f}%/min)")
+            # Momentum direction check
+            if predicted_pct_move > 0 and not momentum_direction_long:
+                blockers.append(f"{g(False)}p_dir={p_pred:+.5f}(need>0)")
+            elif predicted_pct_move < 0 and not momentum_direction_short:
+                blockers.append(f"{g(False)}p_dir={p_pred:+.5f}(need<0)")
+            if not traj_consistent:
+                blockers.append(f"{g(False)}traj_reversal")
             if self._acceleration_check:
                 if predicted_pct_move > 0 and not accel_long:
                     blockers.append(f"✗accel_L(dVdq={dV_at_q:+.5f},p={p_pred:+.5f})")
@@ -849,6 +928,26 @@ class HPMSEngine:
         arr = np.array(dH_series)
         threshold = float(np.mean(arr) + multiplier * np.std(arr))
         return max(threshold, 0.10)  # floor at 0.10
+
+    def get_dynamic_max_hold(self, tp_distance: float, current_price: float) -> int:
+        """
+        Compute how many bars the trade should be allowed to live based
+        on recent volatility and the TP distance.
+
+        Logic: estimate bars needed to reach TP given recent 1-bar ATR.
+        max_hold = ceil(tp_distance / atr_per_bar) + buffer
+        Clamped to [3, 30] bars.
+        """
+        if not self._state.close_history or len(self._state.close_history) < 5:
+            return 8  # default
+        closes = np.array(self._state.close_history[-20:])
+        atr_per_bar = float(np.mean(np.abs(np.diff(closes))))
+        if atr_per_bar <= 0:
+            return 8
+        bars_to_tp = tp_distance / atr_per_bar
+        # Add 50% buffer for non-directional drift
+        max_hold = int(math.ceil(bars_to_tp * 1.5))
+        return max(3, min(max_hold, 30))
 
     def reset(self):
         self._state = EngineState()
