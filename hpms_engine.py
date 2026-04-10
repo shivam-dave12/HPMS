@@ -653,62 +653,87 @@ class HPMSEngine:
         signal_type   = SignalType.FLAT
         reason        = "NO_SIGNAL"
 
-        # CRITICAL FIX: Momentum SIGN must agree with predicted direction.
-        # Previously only abs(p_pred) was checked, ignoring sign.
-        # This caused 56% of signals to have contradictory momentum:
-        #   e.g. SHORT signal with p_pred=+2.55 (momentum heading UP).
-        # Such signals trade INTO a reversal — the trajectory overshoots
-        # through a potential well and bounces back. Net displacement is
-        # negative but the particle is heading back up at horizon end.
-        # That's the worst possible entry for a short.
+        # ── Adaptive p_now tolerance ──────────────────────────────────────────
+        # p values live in z-score × (1/tau) units — typically ±0.05 to ±0.5.
+        # A fixed tolerance of min_momentum (≈0.00005) is 3-4 orders of magnitude
+        # too small; p_now is *always* outside it, permanently blocking trades.
+        # Instead, derive tolerance from the recent empirical p distribution:
+        # require only that current momentum is not strongly opposing the signal
+        # (allow up to 1.5σ of p against the direction).
+        if len(self._state.p_history) >= 10:
+            p_arr         = np.array(self._state.p_history[-min(60, len(self._state.p_history)):])
+            p_std_recent  = float(np.std(p_arr)) if len(p_arr) > 1 else 0.1
+            p_now_tol     = max(p_std_recent * 1.5, abs(p_now) * 0.5)
+        else:
+            p_now_tol = 0.30  # conservative boot-strap before enough history
+
+        p_now_long_ok  = p_now > -p_now_tol   # current bar not strongly downward
+        p_now_short_ok = p_now <  p_now_tol   # current bar not strongly upward
+
+        elog.log("ENGINE_CRITERIA",
+                 check="p_now_direction",
+                 p_now=round(p_now, 6),
+                 p_now_tol=round(p_now_tol, 6),
+                 long_ok=p_now_long_ok,
+                 short_ok=p_now_short_ok)
+
+        # ── Momentum direction at horizon (soft signal quality metric) ────────
+        # In a Hamiltonian system predicting net LONG (delta_q > 0) does NOT
+        # guarantee p_pred > 0: the particle can climb a potential hill, decelerate,
+        # and end with negative momentum even though net displacement was positive.
+        # Using p_pred SIGN as a hard gate eliminates all valid oscillatory entries.
+        # Convert to a signed confidence weight: 1.0 if sign agrees, 0.5 if opposed.
         momentum_direction_long  = p_pred > self._min_momentum
         momentum_direction_short = p_pred < -self._min_momentum
-
-        # Trajectory quality: check if the trajectory is monotonic
-        # in the predicted direction over the second half of the horizon.
-        # If the trajectory reverses in the final bars, the signal is unreliable.
-        traj_consistent = True
-        if len(trajectory) >= 3:
-            mid = len(trajectory) // 2
-            second_half_dq = trajectory[-1].q - trajectory[mid].q
-            # For a LONG, second half should move UP (dq > 0)
-            # For a SHORT, second half should move DOWN (dq < 0)
-            if predicted_pct_move > 0 and second_half_dq < 0:
-                traj_consistent = False
-            elif predicted_pct_move < 0 and second_half_dq > 0:
-                traj_consistent = False
+        # Sign agreement factor (0.5–1.0) fed into confidence — NOT a hard gate
+        if predicted_pct_move > 0:
+            p_sign_factor = 1.0 if momentum_direction_long  else 0.5
+        elif predicted_pct_move < 0:
+            p_sign_factor = 1.0 if momentum_direction_short else 0.5
+        else:
+            p_sign_factor = 0.5
 
         elog.log("ENGINE_CRITERIA",
                  check="momentum_direction",
                  p_pred=round(p_pred, 6),
                  momentum_long_ok=momentum_direction_long,
                  momentum_short_ok=momentum_direction_short,
-                 traj_consistent=traj_consistent)
+                 p_sign_factor=round(p_sign_factor, 3),
+                 note="soft_confidence_weight_not_hard_gate")
 
-        # ── p_now trend-alignment gate (Fix 3b / Bug 4 soft gate) ───────────
-        # A hard zero threshold blocks valid reversal entries when p_now is
-        # marginally negative (e.g. -0.00005) on a bar that has just turned.
-        # Allow a tolerance of one min_momentum unit so the gate only fires
-        # when current momentum clearly opposes the signal direction.
-        p_now_long_ok  = p_now > -self._min_momentum
-        p_now_short_ok = p_now < self._min_momentum
+        # ── Trajectory consistency (soft signal quality metric) ───────────────
+        # Hamiltonian trajectories naturally oscillate: second-half reversal is
+        # normal on short horizons, not evidence of a bad signal.
+        # Track it for confidence scoring; do NOT block the trade on it.
+        traj_consistent = True
+        if len(trajectory) >= 3:
+            mid = len(trajectory) // 2
+            second_half_dq = trajectory[-1].q - trajectory[mid].q
+            if predicted_pct_move > 0 and second_half_dq < 0:
+                traj_consistent = False
+            elif predicted_pct_move < 0 and second_half_dq > 0:
+                traj_consistent = False
+        traj_factor = 1.0 if traj_consistent else 0.70  # penalty, not a veto
+
         elog.log("ENGINE_CRITERIA",
-                 check="p_now_direction",
-                 p_now=round(p_now, 6),
-                 long_ok=p_now_long_ok,
-                 short_ok=p_now_short_ok)
+                 check="trajectory_consistency",
+                 traj_consistent=traj_consistent,
+                 traj_factor=traj_factor,
+                 note="soft_confidence_weight_not_hard_gate")
 
+        # ── Hard gates: only the two that are physically meaningful ──────────
+        #   1. delta_q magnitude   — need a real predicted move, not noise
+        #   2. energy conservation — chaotic regime is unforecastable
+        # Everything else degrades confidence but cannot veto the trade.
         long_criteria  = (predicted_pct_move > effective_delta_q_threshold
                           and energy_conserved
-                          and momentum_direction_long   # SIGN check, not just magnitude
-                          and p_now_long_ok             # current bar momentum agrees
-                          and traj_consistent
+                          and momentum_ok     # abs(p_pred) > min_momentum
+                          and p_now_long_ok   # not strongly opposing
                           and accel_long)
         short_criteria = (predicted_pct_move < -effective_delta_q_threshold
                           and energy_conserved
-                          and momentum_direction_short  # SIGN check, not just magnitude
-                          and p_now_short_ok            # current bar momentum agrees
-                          and traj_consistent
+                          and momentum_ok     # abs(p_pred) > min_momentum
+                          and p_now_short_ok  # not strongly opposing
                           and accel_short)
 
         if long_criteria:
@@ -744,31 +769,21 @@ class HPMSEngine:
                     "dH_dt=" + str(round(abs(dH_dt), 5)) +
                     ">" + str(self._dH_dt_max)
                 )
+            if not momentum_ok:
+                blockers.append(
+                    "|p_pred|=" + str(round(abs(p_pred), 5)) +
+                    "<min_momentum=" + str(self._min_momentum)
+                )
             # p_now direction gate
             if predicted_pct_move > 0 and not p_now_long_ok:
                 blockers.append(
                     "p_now=" + str(round(p_now, 5)) +
-                    " contradicts LONG (current momentum is DOWN)"
+                    " strongly opposes LONG (tol=" + str(round(p_now_tol, 4)) + ")"
                 )
             elif predicted_pct_move < 0 and not p_now_short_ok:
                 blockers.append(
                     "p_now=" + str(round(p_now, 5)) +
-                    " contradicts SHORT (current momentum is UP)"
-                )
-            # Momentum direction check — the most common blocker for bad signals
-            if predicted_pct_move > 0 and not momentum_direction_long:
-                blockers.append(
-                    "p_pred=" + str(round(p_pred, 5)) +
-                    " contradicts LONG (need >0)"
-                )
-            elif predicted_pct_move < 0 and not momentum_direction_short:
-                blockers.append(
-                    "p_pred=" + str(round(p_pred, 5)) +
-                    " contradicts SHORT (need <0)"
-                )
-            if not traj_consistent:
-                blockers.append(
-                    "trajectory_reversal (2nd half contradicts direction)"
+                    " strongly opposes SHORT (tol=" + str(round(p_now_tol, 4)) + ")"
                 )
             if self._acceleration_check:
                 if predicted_pct_move > 0 and not accel_long:
@@ -781,7 +796,15 @@ class HPMSEngine:
                         "accel_SHORT_fail: dV/dq=" + str(round(dV_at_q, 5)) +
                         " p_f=" + str(round(p_pred, 5))
                     )
+            # Soft quality notes (not blockers)
+            soft_notes = []
+            if not traj_consistent:
+                soft_notes.append("traj_reversal(conf-" + str(round((1.0 - traj_factor) * 100, 0)) + "%)")
+            if p_sign_factor < 1.0:
+                soft_notes.append("p_sign_opposed(conf-50%)")
             reason = "FLAT: " + (", ".join(blockers) if blockers else "no criteria met")
+            if soft_notes:
+                reason += " | soft: " + ", ".join(soft_notes)
 
         # ── LOG: Final decision ───────────────────────────────────────────────
         if signal_type != SignalType.FLAT:
@@ -798,9 +821,11 @@ class HPMSEngine:
                      predicted_pct=round(predicted_pct_move, 6),
                      delta_q_ok=delta_q_ok,
                      energy_ok=energy_conserved,
-                     momentum_dir_long=momentum_direction_long,
-                     momentum_dir_short=momentum_direction_short,
-                     traj_consistent=traj_consistent,
+                     momentum_mag_ok=momentum_ok,
+                     p_now_long_ok=p_now_long_ok,
+                     p_now_short_ok=p_now_short_ok,
+                     p_sign_factor=round(p_sign_factor, 3),
+                     traj_factor=round(traj_factor, 3),
                      accel_long_ok=accel_long,
                      accel_short_ok=accel_short)
 
@@ -848,11 +873,19 @@ class HPMSEngine:
             sl_price = 0.0
 
         # ── Confidence score ──────────────────────────────────────────────────
+        # Four orthogonal components — all continuous, no hard cliffs:
+        #   c1: predicted move magnitude vs threshold        (35%)
+        #   c2: energy stability (low dH/dt is more forecastable)  (25%)
+        #   c3: final momentum magnitude at horizon          (20%)
+        #   c4: trajectory monotonicity in predicted direction (10%)
+        #   c5: p_pred sign agreement with delta_q direction  (10%)
         if signal_type != SignalType.FLAT:
-            c1 = min(1.0, abs(predicted_pct_move) / (self._delta_q_threshold * 3))
+            c1 = min(1.0, abs(predicted_pct_move) / (effective_delta_q_threshold * 3))
             c2 = max(0.0, 1.0 - abs(dH_dt) / self._dH_dt_max)
             c3 = min(1.0, abs(p_pred) / (self._min_momentum * 10))
-            confidence = c1 * 0.4 + c2 * 0.35 + c3 * 0.25
+            c4 = traj_factor      # 1.0 if consistent, 0.70 if reversed
+            c5 = p_sign_factor    # 1.0 if sign agrees, 0.50 if opposed
+            confidence = c1 * 0.35 + c2 * 0.25 + c3 * 0.20 + c4 * 0.10 + c5 * 0.10
         else:
             confidence = 0.0
 
@@ -880,26 +913,25 @@ class HPMSEngine:
             g = lambda ok: "✓" if ok else "✗"  # noqa: E731
             blockers = []
             if not delta_q_ok:
-                blockers.append(f"{g(False)}Δq={pct(predicted_pct_move)}({dq_pct:.0f}%/thr)")
+                blockers.append(f"{g(False)}Δq={abs(predicted_pct_move)*100:+.4f}%({dq_pct:.0f}%/thr)")
             if not energy_conserved:
                 blockers.append(f"{g(False)}dH={abs(dH_dt):.5f}({dh_pct:.0f}%/max)")
-            # p_now direction
+            if not momentum_ok:
+                blockers.append(f"{g(False)}|p_pred|={abs(p_pred):.5f}({mom_pct:.0f}%/min)")
             if predicted_pct_move > 0 and not p_now_long_ok:
-                blockers.append(f"{g(False)}p_now={p_now:+.5f}(↓,need↑)")
+                blockers.append(f"{g(False)}p_now={p_now:+.5f}(opposes↑ tol={p_now_tol:.3f})")
             elif predicted_pct_move < 0 and not p_now_short_ok:
-                blockers.append(f"{g(False)}p_now={p_now:+.5f}(↑,need↓)")
-            # Momentum direction check
-            if predicted_pct_move > 0 and not momentum_direction_long:
-                blockers.append(f"{g(False)}p_dir={p_pred:+.5f}(need>0)")
-            elif predicted_pct_move < 0 and not momentum_direction_short:
-                blockers.append(f"{g(False)}p_dir={p_pred:+.5f}(need<0)")
-            if not traj_consistent:
-                blockers.append(f"{g(False)}traj_reversal")
+                blockers.append(f"{g(False)}p_now={p_now:+.5f}(opposes↓ tol={p_now_tol:.3f})")
             if self._acceleration_check:
                 if predicted_pct_move > 0 and not accel_long:
                     blockers.append(f"✗accel_L(dVdq={dV_at_q:+.5f},p={p_pred:+.5f})")
                 elif predicted_pct_move < 0 and not accel_short:
                     blockers.append(f"✗accel_S(dVdq={dV_at_q:+.5f},p={p_pred:+.5f})")
+            # Soft quality annotations
+            if not traj_consistent:
+                blockers.append(f"~traj_reversal(conf×{traj_factor:.2f})")
+            if p_sign_factor < 1.0:
+                blockers.append(f"~p_sign_opposed(conf×{p_sign_factor:.2f})")
             blocking_str = "  ".join(blockers) if blockers else "no criteria met"
             logger.info(
                 f"  bar#{bar_n:4d}  ${current_price:,.1f}  "
