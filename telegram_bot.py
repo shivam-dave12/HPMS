@@ -84,8 +84,13 @@ def _gate(ok: bool) -> str:
 
 
 def _mk(text: str) -> str:
-    """Escape Markdown special chars in dynamic text fragments."""
-    for ch in r"\_*[]()~`>#+=|{}.!-":
+    """Escape Markdown v1 special chars in dynamic text fragments.
+
+    Telegram Markdown v1 only treats _, *, `, [ as special.
+    Over-escaping (MarkdownV2 set) with parse_mode='Markdown' produces
+    literal backslashes in the rendered output.
+    """
+    for ch in r"_*`[":
         text = text.replace(ch, f"\\{ch}")
     return text
 
@@ -188,8 +193,9 @@ class TelegramBot:
         # ── Register command handlers ─────────────────────────────────────────
         cmds = {
             # Info
-            "start":         self._cmd_start,
-            "help":          self._cmd_start,
+            "start":         self._cmd_start_trading,   # /start → enable trading
+            "stop":          self._cmd_stop_trading,    # /stop  → disable trading
+            "help":          self._cmd_help,
             "ping":          self._cmd_ping,
             "status":        self._cmd_status,
             "thinking":      self._cmd_thinking,
@@ -259,6 +265,8 @@ class TelegramBot:
         try:
             await asyncio.wait_for(
                 self._app.bot.set_my_commands([
+                    BotCommand("start",         "▶ Start trading"),
+                    BotCommand("stop",          "⏹ Stop trading (positions remain)"),
                     BotCommand("status",        "Full system dashboard"),
                     BotCommand("thinking",      "HPMS decision stack — why we trade or not"),
                     BotCommand("phase",         "Phase-space state (q, p, H, dH/dt)"),
@@ -271,8 +279,6 @@ class TelegramBot:
                     BotCommand("risk",          "Risk gate status"),
                     BotCommand("balance",       "Exchange wallet balance"),
                     BotCommand("price",         "Current price + spread"),
-                    BotCommand("start_trading", "▶ Enable trading"),
-                    BotCommand("stop_trading",  "⏸ Disable trading (positions remain)"),
                     BotCommand("halt",          "⛔ Emergency halt + flatten"),
                     BotCommand("resume",        "✅ Resume from halt"),
                     BotCommand("resetrisk",     "🔄 Clear lockout (no flatten)"),
@@ -404,7 +410,7 @@ class TelegramBot:
     # COMMANDS: /help
     # ──────────────────────────────────────────────────────────────────────────
 
-    async def _cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    async def _cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             await update.message.reply_text(
                 "🔬 *HPMS — Hamiltonian Phase-Space Micro-Scalping*\n\n"
@@ -423,8 +429,8 @@ class TelegramBot:
                 "/diag — Engine diagnostics\n"
                 "/engine — Engine parameters\n\n"
                 "⚡ *Controls*\n"
-                "/start_trading — Enable strategy\n"
-                "/stop_trading — Disable (positions remain)\n"
+                "/start — Enable strategy\n"
+                "/stop — Disable (positions remain)\n"
                 "/halt — Emergency stop + flatten\n"
                 "/resume — Resume from halt\n"
                 "/resetrisk — Clear lockout only (no flatten)\n"
@@ -441,14 +447,12 @@ class TelegramBot:
                 parse_mode="Markdown",
             )
         except Exception as e:
-            # Fallback to plain text if Markdown fails
             logger.warning(f"Help command Markdown failed: {e}")
             await update.message.reply_text(
                 "HPMS — Hamiltonian Phase-Space Micro-Scalping\n\n"
                 "Info: /status /thinking /phase /signal /market /filter "
                 "/risk /pnl /trades /position /balance /diag /engine\n\n"
-                "Controls: /start_trading /stop_trading /halt /resume "
-                "/resetrisk /flatten /close\n\n"
+                "Controls: /start /stop /halt /resume /resetrisk /flatten /close\n\n"
                 "Config: /params /set /get /leverage /cooldown /maxloss /maxsize"
             )
 
@@ -1159,7 +1163,7 @@ class TelegramBot:
             if rs.get("is_halted"):
                 await update.message.reply_text(
                     f"⚠️ Risk manager is HALTED (`{rs['halt_reason']}`)\n"
-                    f"Use /resume first to clear the halt, then /start\\_trading",
+                    f"Use /resume first to clear the halt, then /start",
                     parse_mode="Markdown",
                 )
                 return
@@ -1208,7 +1212,7 @@ class TelegramBot:
             f"⛔ *EMERGENCY HALT*\n\n"
             f"Actions taken:\n" +
             "\n".join(f"• {a}" for a in actions) +
-            f"\n\n_Use /resume then /start\\_trading to re-enable._",
+            f"\n\n_Use /resume then /start to re-enable._",
             parse_mode="Markdown",
         )
 
@@ -1222,7 +1226,7 @@ class TelegramBot:
         await update.message.reply_text(
             f"✅ *Risk resumed* (was: `{was}`)\n"
             f"Consecutive losses reset to 0.\n\n"
-            f"_Use /start\\_trading to re-enable the strategy._",
+            f"_Use /start to re-enable the strategy._",
             parse_mode="Markdown",
         )
 
