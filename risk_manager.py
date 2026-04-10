@@ -233,33 +233,51 @@ class RiskManager:
 
     def compute_size(self, price: float, equity_usd: float,
                      contract_value: float = 0.001,
-                     sl_pct: float = 0.0) -> int:
+                     sl_pct: float = 0.0,
+                     confidence: float = 1.0,
+                     norm_vol: float = 0.0) -> int:
         """
-        Compute position size in contracts using true risk-based sizing.
+        Compute position size — institutional: confidence-weighted, volatility-normalized.
 
-        When sl_pct is provided (> 0), sizes the position so that if SL is hit
-        the loss equals exactly equity × equity_pct%.  This is the correct
-        interpretation of "% of equity risked per trade":
-            size = (equity × risk_pct) / (price × sl_pct × contract_value)
+        Size = base_risk_size × confidence_scale × vol_scale
 
-        Without sl_pct (fallback), uses the old notional-scaling approach
-        so existing behaviour is preserved for callers that don't supply it.
+        confidence_scale: higher confidence → larger position (0.5x to 1.5x)
+        vol_scale: higher volatility → smaller position (inverse vol targeting)
+
+        sl_pct: if > 0, uses true risk-based sizing (Kelly-style).
         """
         with self._lock:
             risk_usd = equity_usd * (self._equity_pct / 100.0)
 
+            # ── Confidence scaling (0.5x at 40% conf, 1.0x at 70%, 1.5x at 100%) ──
+            conf_scale = max(0.5, min(1.5, confidence / 0.70))
+
+            # ── Volatility normalization ──────────────────────────────────────
+            # Target: normalize risk across vol regimes.
+            # norm_vol = ATR% (e.g. 0.001 = 0.1% per bar)
+            # vol_target = 0.001 (baseline 1m ATR%)
+            vol_scale = 1.0
+            if norm_vol > 0:
+                vol_target = 0.001  # baseline: 0.1% per bar
+                vol_scale = min(2.0, max(0.3, vol_target / norm_vol))
+
+            adjusted_risk = risk_usd * conf_scale * vol_scale
+
             if sl_pct > 0 and price > 0:
-                # True risk-based: risk_usd lost when price moves sl_pct against us
                 per_contract_sl_loss = price * sl_pct * contract_value
-                contracts = int(risk_usd / per_contract_sl_loss) if per_contract_sl_loss > 0 else 0
+                contracts = int(adjusted_risk / per_contract_sl_loss) if per_contract_sl_loss > 0 else 0
             else:
-                # Legacy fallback: notional scaling (kept for callers without sl_pct)
-                notional = min(risk_usd * self._leverage, self._max_pos_usd)
+                notional = min(adjusted_risk * self._leverage, self._max_pos_usd)
                 per_contract = contract_value * price if price > 0 else 1.0
                 contracts = int(notional / per_contract) if per_contract > 0 else 0
 
             contracts = min(contracts, self._max_pos_contracts)
             contracts = max(contracts, 1)
+
+            logger.debug(
+                f"Size: base_risk=${risk_usd:.2f} conf_scale={conf_scale:.2f} "
+                f"vol_scale={vol_scale:.2f} → {contracts}c"
+            )
             return contracts
 
     # ─── TRADE LIFECYCLE ──────────────────────────────────────────────────────

@@ -43,44 +43,43 @@ HPMS_KDE_REBUILD_INTERVAL = 3      # rebuild V(q) every N bars (1 = every bar)
 HPMS_TRAJECTORY_LOG_DEPTH = 20     # keep last N trajectories for diagnostics
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SIGNAL THRESHOLDS
+# SIGNAL THRESHOLDS (v2 — Institutional)
 # ═══════════════════════════════════════════════════════════════════════════════
 # delta_q_threshold: predicted log-price move required for entry.
-#   predicted_pct_move = delta_q_zscored * std(log_prices_120bar)
-#   On 1m BTC, std_log ≈ 0.001–0.003, so 0.0022 required delta_q>0.73–2.2σ
-#   — almost never fires.  0.0006 = ~0.06% predicted move, ~$43 at $71k. 
-SIGNAL_DELTA_Q_THRESHOLD  = 0.0006  # was 0.0022 — lowered to fire on 1m BTC
-SIGNAL_DH_DT_MAX          = 0.08    # was 0.05 — slightly relaxed
-SIGNAL_H_PERCENTILE       = 99.0    # skip if |H| above this percentile (chaotic)
-SIGNAL_MIN_MOMENTUM       = 0.00005 # was 0.0001 — lowered to match scaled units
-SIGNAL_ACCELERATION_CHECK = False   # was True — disable until signal rate confirmed
+#   Adaptive: actual threshold = max(config * 0.5, std_log * 0.3)
+#   This value is the floor — volatility scaling handles the rest.
+SIGNAL_DELTA_Q_THRESHOLD  = 0.0006  # floor for adaptive threshold
+SIGNAL_DH_DT_MAX          = 0.08    # soft confidence factor reference (NOT a hard gate)
+SIGNAL_H_PERCENTILE       = 99.5    # relaxed from 99.0 — allows breakout regimes
+SIGNAL_MIN_MOMENTUM       = 0.00005 # minimum |p_pred| at horizon
+SIGNAL_ACCELERATION_CHECK = True    # ALWAYS ON — second derivative confirmation required
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TRADE EXECUTION
+# TRADE EXECUTION (v2 — Dynamic TP/SL)
 # ═══════════════════════════════════════════════════════════════════════════════
-TRADE_TP_PCT              = 0.0035  # 0.35% fixed TP
-TRADE_SL_PCT              = 0.0018  # 0.18% fixed SL
-TRADE_MAX_HOLD_BARS       = 8       # forced flat after N bars (~N minutes) — was 5, too short
-TRADE_DH_DT_EXIT_SPIKE    = 0.25    # exit if |dH/dt| spikes above this — was 0.15, caused premature exits
+TRADE_TP_PCT              = 0.0035  # MAX TP cap (actual TP proportional to predicted move)
+TRADE_SL_PCT              = 0.0018  # MAX SL cap (actual SL based on ATR)
+TRADE_MAX_HOLD_BARS       = 8       # base max hold — dynamically adjusted by ATR
+TRADE_DH_DT_EXIT_SPIKE    = 0.25    # exit if |dH/dt| spikes above this (adaptive)
 TRADE_USE_BRACKET_ORDERS  = True    # use Delta bracket orders for atomic SL/TP
 TRADE_ORDER_TYPE           = "market"  # "market" | "limit"
 TRADE_LIMIT_OFFSET_TICKS  = 1       # ticks away from mid for limit entries
 TRADE_CONTRACT_VALUE      = 0.001   # base asset units per contract (Delta BTCUSD = 0.001 BTC)
-TRADE_TAKER_FEE_PCT       = 0.05    # Delta taker fee % (0.05% = 0.0005)
-TRADE_MAKER_FEE_PCT       = 0.02    # Delta maker fee % (0.02% = 0.0002)
+TRADE_TAKER_FEE_PCT       = 0.05    # Delta taker fee % (0.05% = 0.0005) — used only as last-resort fallback
+TRADE_MAKER_FEE_PCT       = 0.02    # Delta maker fee % (0.02% = 0.0002) — used only as last-resort fallback
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# POSITION SIZING & RISK
+# POSITION SIZING & RISK (v2 — Confidence-weighted, Vol-normalized)
 # ═══════════════════════════════════════════════════════════════════════════════
 RISK_MAX_POSITION_USD     = 500.0   # max notional per trade
 RISK_MAX_POSITION_CONTRACTS = 100   # max contracts per trade
-RISK_LEVERAGE             = 50      # exchange leverage setting  ← raised from 10 so 1 contract (~$72 notional) needs only ~$1.44 margin
+RISK_LEVERAGE             = 50      # exchange leverage setting
 RISK_MAX_DAILY_LOSS_USD   = 200.0   # daily loss circuit breaker
 RISK_MAX_DAILY_TRADES     = 50      # max trades per day
 RISK_MAX_CONSECUTIVE_LOSSES = 5     # pause after N consecutive losses
-RISK_COOLDOWN_SECONDS     = 10.0    # cooldown between trades — was 30s, too long for 1m scalping
+RISK_COOLDOWN_SECONDS     = 10.0    # base cooldown (scales with consec losses)
 RISK_MAX_DRAWDOWN_PCT     = 5.0     # max drawdown % from session high
-RISK_EQUITY_PCT_PER_TRADE = 2.0     # % of equity risked per trade
+RISK_EQUITY_PCT_PER_TRADE = 2.0     # base % of equity risked (scaled by confidence × vol)
 RISK_AUTO_RESUME_SECONDS  = 300.0   # auto-resume from CONSECUTIVE_LOSSES after 5 min
 RISK_SOFT_LOSS_WEIGHT     = 0.5     # forced exits count as 0.5 toward consecutive losses
 

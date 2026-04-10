@@ -228,7 +228,17 @@ class HPMSStrategy:
                 self._log_blocked(f"FILTER: {filter_reason}", signal)
                 return signal
 
-            # ── Position sizing ───────────────────────────────────────────────
+            # ── Regime filter ─────────────────────────────────────────────────
+            # In CHOPPY regime with low confidence, skip — edge is insufficient
+            from hpms_engine import RegimeType
+            signal_regime = getattr(signal, "regime", RegimeType.UNKNOWN)
+            if signal_regime == RegimeType.CHOPPY and signal.confidence < 0.55:
+                self._log_blocked(
+                    f"REGIME: CHOPPY + low conf ({signal.confidence:.1%})", signal
+                )
+                return signal
+
+            # ── Position sizing (confidence-weighted, vol-normalized) ─────────
             balance = self._api.get_balance("USD")
             equity  = balance.get("available", 0.0)
             if equity <= 0:
@@ -236,10 +246,23 @@ class HPMSStrategy:
                 self._push("⚠️ *No equity available* — cannot open position")
                 return signal
 
+            # Compute normalized volatility for vol-adjusted sizing
+            norm_vol = 0.0
+            if len(candles_1m) >= 15:
+                recent_closes = [c["c"] for c in candles_1m[-15:] if c.get("c", 0) > 0]
+                if len(recent_closes) >= 2:
+                    import numpy as _np
+                    _rc = _np.array(recent_closes)
+                    _atr = float(_np.mean(_np.abs(_np.diff(_rc))))
+                    _mid = float(_np.mean(_rc))
+                    norm_vol = _atr / _mid if _mid > 0 else 0.0
+
             size = self._risk.compute_size(
                 current_price, equity,
                 contract_value=getattr(self._config, "TRADE_CONTRACT_VALUE", 0.001),
                 sl_pct=abs(current_price - signal.sl_price) / current_price if signal.sl_price > 0 else 0.0,
+                confidence=signal.confidence,
+                norm_vol=norm_vol,
             )
             side = "long" if signal.signal_type == SignalType.LONG else "short"
 
@@ -295,7 +318,8 @@ class HPMSStrategy:
                     f"TRADE OPEN ▶ {side.upper()} {size}c @ ${actual_entry:,.1f} "
                     f"TP=${signal.tp_price:,.1f} SL=${signal.sl_price:,.1f} "
                     f"margin=${margin_used:.2f} fee=$-{entry_fee:.4f} "
-                    f"conf={signal.confidence:.1%} id={result.get('order_id', '')}"
+                    f"conf={signal.confidence:.1%} regime={signal_regime.name} "
+                    f"id={result.get('order_id', '')}"
                 )
                 self._push(
                     f"🚀 *ENTRY {side.upper()}*\n"
@@ -305,7 +329,8 @@ class HPMSStrategy:
                     f"SL: `${signal.sl_price:,.1f}` (`${abs(signal.sl_price - actual_entry):.1f}`)\n"
                     f"Margin: `${margin_used:.2f}` @ `{leverage}x`\n"
                     f"Entry fee: `$-{entry_fee:.4f}` _(exact)_\n"
-                    f"Conf: `{signal.confidence:.1%}` | Δq: `{signal.predicted_delta_q:+.5f}`"
+                    f"Conf: `{signal.confidence:.1%}` | Regime: `{signal_regime.name}`\n"
+                    f"Δq: `{signal.predicted_delta_q:+.5f}`"
                 )
                 self._block_count = 0
             else:
