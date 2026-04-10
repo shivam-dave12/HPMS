@@ -163,6 +163,11 @@ class HPMSRunner:
         self._testnet  = testnet or config.DELTA_TESTNET
         self._shutdown = threading.Event()
 
+        # Update global state singleton
+        STATE.dry_run = dry_run
+        STATE.testnet = self._testnet
+        STATE.mode = "DRY-RUN" if dry_run else "LIVE"
+
         self._api      = None
         self._data_mgr = None
         self._engine   = None
@@ -251,6 +256,8 @@ class HPMSRunner:
             cooldown_seconds=config.RISK_COOLDOWN_SECONDS,
             max_drawdown_pct=config.RISK_MAX_DRAWDOWN_PCT,
             equity_pct_per_trade=config.RISK_EQUITY_PCT_PER_TRADE,
+            auto_resume_seconds=getattr(config, "RISK_AUTO_RESUME_SECONDS", 300.0),
+            soft_loss_weight=getattr(config, "RISK_SOFT_LOSS_WEIGHT", 0.5),
         )
 
         # ── 5. Order Manager ─────────────────────────────────────────────────

@@ -88,6 +88,7 @@ class HPMSSignal:
     reason:            str
     compute_time_us:   float
     bar_timestamp:     float
+    bars_since_kde:    int = 0
 
 
 @dataclass
@@ -527,6 +528,7 @@ class HPMSEngine:
                 tp_price=0.0, sl_price=0.0, reason=reason,
                 compute_time_us=(t_end - t_start) / 1000.0,
                 bar_timestamp=timestamp,
+                bars_since_kde=self._bars_since_kde_build,
             )
 
         # ── Step 5: Forward integration ───────────────────────────────────────
@@ -686,13 +688,15 @@ class HPMSEngine:
             tp_price = current_price * (1.0 + self._tp_pct)
             sl_price = current_price * (1.0 - self._sl_pct)
             pred_target = current_price * math.exp(predicted_pct_move)
-            if pred_target < tp_price:
+            # Only move TP further out (better), never closer (worse)
+            if pred_target > tp_price:
                 tp_price = pred_target
         elif signal_type == SignalType.SHORT:
             tp_price = current_price * (1.0 - self._tp_pct)
             sl_price = current_price * (1.0 + self._sl_pct)
             pred_target = current_price * math.exp(predicted_pct_move)
-            if pred_target > tp_price:
+            # Only move TP further out (lower for short), never closer
+            if pred_target < tp_price:
                 tp_price = pred_target
         else:
             tp_price = 0.0
@@ -763,6 +767,7 @@ class HPMSEngine:
             reason=reason,
             compute_time_us=compute_us,
             bar_timestamp=timestamp,
+            bars_since_kde=self._bars_since_kde_build,
         )
 
     # ─── DIAGNOSTICS ──────────────────────────────────────────────────────────
@@ -825,6 +830,25 @@ class HPMSEngine:
             "last_trajectory":      traj_summary,
             "params":               self.get_params(),
         }
+
+    def get_adaptive_dH_spike_threshold(self, multiplier: float = 3.0) -> float:
+        """
+        Compute an adaptive exit spike threshold based on recent dH/dt history.
+
+        Returns multiplier * std(dH/dt) over the last normalization_window bars,
+        floored at a minimum of 0.10 to avoid exiting on noise.
+        """
+        if len(self._state.H_ema_history) < 10:
+            return 0.15  # fallback default
+        dH_series = []
+        ema_hist = self._state.H_ema_history
+        for i in range(1, min(len(ema_hist), self._norm_window)):
+            dH_series.append(abs(ema_hist[-i] - ema_hist[-i - 1]))
+        if not dH_series:
+            return 0.15
+        arr = np.array(dH_series)
+        threshold = float(np.mean(arr) + multiplier * np.std(arr))
+        return max(threshold, 0.10)  # floor at 0.10
 
     def reset(self):
         self._state = EngineState()

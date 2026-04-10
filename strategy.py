@@ -23,6 +23,7 @@ from typing import Callable, Dict, List, Optional
 from hpms_engine import HPMSEngine, HPMSSignal, SignalType
 from risk_manager import RiskManager, TradeRecord
 from order_manager import OrderManager
+from state import STATE
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,9 @@ class HPMSStrategy:
         self._bar_count          = 0
         self._last_signal:       Optional[HPMSSignal] = None
 
+        # Energy spike exit confirmation: require 2 consecutive bars above threshold
+        self._consecutive_energy_spikes = 0
+
         # Throttle "blocked" console log lines so they don't spam
         self._last_block_log_bar = 0
         self._last_block_reason  = ""
@@ -78,12 +82,14 @@ class HPMSStrategy:
 
     def start(self):
         self._enabled = True
+        STATE.trading_enabled = True
         logger.info("HPMSStrategy STARTED")
         self._push("⚡ *Strategy STARTED* — looking for signals on "
                    f"`{getattr(self._config, 'DELTA_SYMBOL', 'BTCUSD')}`")
 
     def stop(self):
         self._enabled = False
+        STATE.trading_enabled = False
         logger.info("HPMSStrategy STOPPED")
         self._push("⏹ *Strategy STOPPED* — no new entries (open positions remain)")
 
@@ -127,17 +133,54 @@ class HPMSStrategy:
 
                 signal = self._engine.on_bar_close(closes, volumes, timestamp)
                 if signal:
+                    # KDE grace period: skip energy spike check for 2 bars after
+                    # a KDE rebuild, as dH/dt spikes artificially on rebuild bars.
+                    kde_grace = getattr(self._config, "HPMS_KDE_REBUILD_INTERVAL", 3)
+                    bars_since_kde = getattr(signal, "bars_since_kde", kde_grace)
+                    in_kde_grace = bars_since_kde < 2
+
+                    # Use adaptive threshold if available, else config
+                    adaptive_spike = self._engine.get_adaptive_dH_spike_threshold()
+                    config_spike = getattr(self._config, "TRADE_DH_DT_EXIT_SPIKE", 0.15)
+                    exit_spike = max(adaptive_spike, config_spike)
+
                     exit_reason = self._risk.check_exit_conditions(
                         dH_dt=signal.dH_dt,
-                        dH_dt_spike=getattr(self._config, "TRADE_DH_DT_EXIT_SPIKE", 0.15),
+                        dH_dt_spike=exit_spike,
                         bars_held=self._orders.bars_held,
                         max_hold=getattr(self._config, "TRADE_MAX_HOLD_BARS", 5),
                     )
                     if exit_reason:
-                        logger.info(f"Force-exit triggered: {exit_reason}")
-                        self._orders.close_position(
-                            reason=exit_reason, current_price=current_price
-                        )
+                        # MAX_HOLD always exits immediately
+                        if exit_reason.startswith("MAX_HOLD"):
+                            self._consecutive_energy_spikes = 0
+                            logger.info(f"Force-exit triggered: {exit_reason}")
+                            self._orders.close_position(
+                                reason=exit_reason, current_price=current_price
+                            )
+                        elif in_kde_grace:
+                            # Skip energy spike during KDE grace period
+                            logger.debug(
+                                f"Energy spike suppressed (KDE grace, "
+                                f"bars_since_kde={bars_since_kde}): {exit_reason}"
+                            )
+                            self._consecutive_energy_spikes = 0
+                        else:
+                            # Require 2 consecutive energy spikes to confirm exit
+                            self._consecutive_energy_spikes += 1
+                            if self._consecutive_energy_spikes >= 2:
+                                logger.info(f"Force-exit triggered (confirmed): {exit_reason}")
+                                self._orders.close_position(
+                                    reason=exit_reason, current_price=current_price
+                                )
+                                self._consecutive_energy_spikes = 0
+                            else:
+                                logger.info(
+                                    f"Energy spike detected ({self._consecutive_energy_spikes}/2 "
+                                    f"for confirmation): {exit_reason}"
+                                )
+                    else:
+                        self._consecutive_energy_spikes = 0
                 return None
 
             # ── Run HPMS engine ───────────────────────────────────────────────
@@ -180,7 +223,10 @@ class HPMSStrategy:
                 self._push("⚠️ *No equity available* — cannot open position")
                 return signal
 
-            size = self._risk.compute_size(current_price, equity)
+            size = self._risk.compute_size(
+                current_price, equity,
+                contract_value=getattr(self._config, "TRADE_CONTRACT_VALUE", 0.001),
+            )
             side = "long" if signal.signal_type == SignalType.LONG else "short"
 
             # ── Pre-flight margin check ───────────────────────────────────────

@@ -60,8 +60,8 @@ SIGNAL_ACCELERATION_CHECK = False   # was True — disable until signal rate con
 # ═══════════════════════════════════════════════════════════════════════════════
 TRADE_TP_PCT              = 0.0035  # 0.35% fixed TP
 TRADE_SL_PCT              = 0.0018  # 0.18% fixed SL
-TRADE_MAX_HOLD_BARS       = 5       # forced flat after N bars (~N minutes)
-TRADE_DH_DT_EXIT_SPIKE    = 0.15    # exit if |dH/dt| spikes above this
+TRADE_MAX_HOLD_BARS       = 8       # forced flat after N bars (~N minutes) — was 5, too short
+TRADE_DH_DT_EXIT_SPIKE    = 0.25    # exit if |dH/dt| spikes above this — was 0.15, caused premature exits
 TRADE_USE_BRACKET_ORDERS  = True    # use Delta bracket orders for atomic SL/TP
 TRADE_ORDER_TYPE           = "market"  # "market" | "limit"
 TRADE_LIMIT_OFFSET_TICKS  = 1       # ticks away from mid for limit entries
@@ -76,9 +76,11 @@ RISK_LEVERAGE             = 50      # exchange leverage setting  ← raised from
 RISK_MAX_DAILY_LOSS_USD   = 200.0   # daily loss circuit breaker
 RISK_MAX_DAILY_TRADES     = 50      # max trades per day
 RISK_MAX_CONSECUTIVE_LOSSES = 5     # pause after N consecutive losses
-RISK_COOLDOWN_SECONDS     = 30.0    # cooldown between trades
+RISK_COOLDOWN_SECONDS     = 10.0    # cooldown between trades — was 30s, too long for 1m scalping
 RISK_MAX_DRAWDOWN_PCT     = 5.0     # max drawdown % from session high
 RISK_EQUITY_PCT_PER_TRADE = 2.0     # % of equity risked per trade
+RISK_AUTO_RESUME_SECONDS  = 300.0   # auto-resume from CONSECUTIVE_LOSSES after 5 min
+RISK_SOFT_LOSS_WEIGHT     = 0.5     # forced exits count as 0.5 toward consecutive losses
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATA MANAGER — MINIMUM CANDLES FOR READINESS

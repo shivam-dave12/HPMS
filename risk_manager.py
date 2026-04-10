@@ -46,6 +46,8 @@ class RiskManager:
         cooldown_seconds:        float = 30.0,
         max_drawdown_pct:        float = 5.0,
         equity_pct_per_trade:    float = 2.0,
+        auto_resume_seconds:     float = 300.0,
+        soft_loss_weight:        float = 0.5,
     ):
         self._max_pos_usd       = max_position_usd
         self._max_pos_contracts = max_position_contracts
@@ -53,7 +55,6 @@ class RiskManager:
         self._max_daily_loss    = max_daily_loss_usd
         self._max_daily_trades  = max_daily_trades
         self._max_consec_losses = max_consecutive_losses
-        self._cooldown          = cooldown_seconds
         self._max_dd_pct        = max_drawdown_pct
         self._equity_pct        = equity_pct_per_trade
 
@@ -65,8 +66,22 @@ class RiskManager:
         self._last_trade_time:   float = 0.0
         self._is_halted:         bool  = False
         self._halt_reason:       str   = ""
+        self._halt_time:         float = 0.0   # when halt was triggered
         self._day_start:         str   = ""
         self._open_trade:        Optional[TradeRecord] = None
+
+        # Auto-resume: CONSECUTIVE_LOSSES halts auto-clear after this many seconds.
+        # Prevents the bot from staying dead for hours over tiny losses.
+        self._auto_resume_seconds: float = auto_resume_seconds
+
+        # Graduated cooldown: cooldown increases after consecutive losses.
+        # Base cooldown is self._base_cooldown; actual = base * (1 + consec_losses * 0.5)
+        # So after 3 consecutive losses: cooldown = 10 * (1 + 1.5) = 25s
+        self._base_cooldown:     float = cooldown_seconds
+
+        # Loss classification: forced exits (ENERGY_SPIKE, MAX_HOLD) count as
+        # "soft" losses — only half-weight toward consecutive loss counter.
+        self._soft_loss_weight:  float = soft_loss_weight
 
         # Optional push-notification callback (set by main after Telegram is ready)
         self._notify_fn: Optional[Callable[[str], None]] = None
@@ -96,12 +111,18 @@ class RiskManager:
             self._daily_pnl          = 0.0
             self._session_high_pnl   = 0.0
             self._consecutive_losses = 0
-            if self._is_halted and "DAILY" in self._halt_reason:
+            # Clear ALL halts on new day — not just DAILY ones.
+            # CONSECUTIVE_LOSSES halts were surviving midnight and blocking
+            # the bot for 7+ hours even after the conditions that caused
+            # the losses (e.g. ENERGY_SPIKE bug) were long gone.
+            if self._is_halted:
+                old_reason = self._halt_reason
                 self._is_halted   = False
                 self._halt_reason = ""
+                logger.info(f"Daily reset cleared halt: {old_reason}")
             logger.info(f"RiskManager daily reset → {today} (was {prev_day})")
             if prev_day:  # don't notify on first init
-                self._notify(f"🗓 *Daily Reset* — new trading day: `{today}`")
+                self._notify(f"🗓 *Daily Reset* — new trading day: `{today}` (all halts cleared)")
 
     # ─── PRE-TRADE CHECKS ────────────────────────────────────────────────────
 
@@ -109,15 +130,55 @@ class RiskManager:
         with self._lock:
             self._reset_if_new_day()
 
+            # ── Auto-resume from timed halts ──────────────────────────────────
+            # CONSECUTIVE_LOSSES and MAX_DRAWDOWN halts auto-clear after a pause.
+            # DAILY_LOSS_LIMIT and DAILY_TRADE_LIMIT remain until new day.
+            # MANUAL/TELEGRAM halts remain until explicit /resume.
             if self._is_halted:
-                return False, f"HALTED: {self._halt_reason}"
+                auto_resumable = self._halt_reason in (
+                    "CONSECUTIVE_LOSSES", "MAX_DRAWDOWN",
+                )
+                if auto_resumable and self._halt_time > 0:
+                    elapsed_halt = time.time() - self._halt_time
+                    if elapsed_halt >= self._auto_resume_seconds:
+                        old_reason = self._halt_reason
+                        self._is_halted          = False
+                        self._halt_reason        = ""
+                        self._consecutive_losses = 0
+                        logger.info(
+                            f"⏰ Auto-resumed from {old_reason} after "
+                            f"{elapsed_halt:.0f}s pause"
+                        )
+                        self._notify(
+                            f"⏰ *Auto-resumed* from `{old_reason}` "
+                            f"after {elapsed_halt/60:.1f} min pause\n"
+                            f"Consecutive losses reset. Trading resumes."
+                        )
+                    else:
+                        remaining = self._auto_resume_seconds - elapsed_halt
+                        return False, (
+                            f"HALTED: {self._halt_reason} "
+                            f"(auto-resume in {remaining:.0f}s)"
+                        )
+                else:
+                    return False, f"HALTED: {self._halt_reason}"
 
             if self._open_trade and not self._open_trade.closed:
                 return False, "POSITION_OPEN"
 
+            # ── Graduated cooldown ────────────────────────────────────────────
+            # Cooldown increases with consecutive losses to slow down during
+            # losing streaks without hard-halting.
+            effective_cooldown = self._base_cooldown * (
+                1.0 + self._consecutive_losses * 0.5
+            )
             elapsed = time.time() - self._last_trade_time
-            if elapsed < self._cooldown:
-                return False, f"COOLDOWN: {self._cooldown - elapsed:.1f}s"
+            if elapsed < effective_cooldown:
+                return False, (
+                    f"COOLDOWN: {effective_cooldown - elapsed:.1f}s "
+                    f"(base {self._base_cooldown:.0f}s × "
+                    f"{1.0 + self._consecutive_losses * 0.5:.1f})"
+                )
 
             if len(self._trades_today) >= self._max_daily_trades:
                 self._halt("DAILY_TRADE_LIMIT")
@@ -131,7 +192,11 @@ class RiskManager:
                 self._halt("CONSECUTIVE_LOSSES")
                 return False, f"CONSEC_LOSSES: {self._consecutive_losses}"
 
-            if self._session_high_pnl > 0:
+            # ── Drawdown check (equity-relative) ──────────────────────────────
+            # Old bug: drawdown was calculated as % of session_high_pnl.
+            # A $0.50 high followed by $0.49 drop = 98% "drawdown".
+            # Fix: only trigger if session_high_pnl is meaningful (> $1).
+            if self._session_high_pnl > 1.0:
                 dd = (self._session_high_pnl - self._daily_pnl) / self._session_high_pnl * 100
                 if dd > self._max_dd_pct:
                     self._halt("MAX_DRAWDOWN")
@@ -142,22 +207,39 @@ class RiskManager:
     def _halt(self, reason: str):
         self._is_halted   = True
         self._halt_reason = reason
+        self._halt_time   = time.time()
         logger.warning(f"⛔ RiskManager HALTED: {reason}")
+
+        auto_resumable = reason in ("CONSECUTIVE_LOSSES", "MAX_DRAWDOWN")
+        resume_note = (
+            f"\n⏰ Auto-resume in {self._auto_resume_seconds/60:.0f} min"
+            if auto_resumable else
+            "\nUse /resume to reset or /halt for emergency flatten"
+        )
         self._notify(
             f"⛔ *RISK HALT: {reason}*\n"
             f"Daily PnL: `${self._daily_pnl:+.2f}`\n"
             f"Trades today: `{len(self._trades_today)}`\n"
-            f"Consec losses: `{self._consecutive_losses}`\n"
-            f"Use /resume to reset or /halt for emergency flatten"
+            f"Consec losses: `{self._consecutive_losses}`"
+            f"{resume_note}"
         )
 
     # ─── POSITION SIZING ─────────────────────────────────────────────────────
 
-    def compute_size(self, price: float, equity_usd: float) -> int:
+    def compute_size(self, price: float, equity_usd: float,
+                     contract_value: float = 0.001) -> int:
+        """
+        Compute position size in contracts.
+
+        Each contract = contract_value * price in USD notional.
+        E.g. BTCUSD: 1 contract = 0.001 BTC = $72 at BTC=$72000.
+        """
         with self._lock:
             risk_usd  = equity_usd * (self._equity_pct / 100.0)
             notional  = min(risk_usd * self._leverage, self._max_pos_usd)
-            contracts = int(notional / price) if price > 0 else 0
+            # Each contract is worth contract_value * price USD
+            per_contract = contract_value * price if price > 0 else 1.0
+            contracts = int(notional / per_contract) if per_contract > 0 else 0
             contracts = min(contracts, self._max_pos_contracts)
             contracts = max(contracts, 1)
             return contracts
@@ -186,7 +268,25 @@ class RiskManager:
             self._session_high_pnl  = max(self._session_high_pnl, self._daily_pnl)
 
             if pnl_usd < 0:
-                self._consecutive_losses += 1
+                # Forced exits (ENERGY_SPIKE, MAX_HOLD) are often not signal
+                # failures — they're system-driven. Don't let them burn through
+                # the consecutive loss limit as fast as real signal failures.
+                is_forced = any(tag in reason for tag in (
+                    "ENERGY_SPIKE", "MAX_HOLD", "SHUTDOWN", "TELEGRAM",
+                ))
+                if is_forced:
+                    # Soft loss: only increment by weight (0.5 default)
+                    # Uses a float accumulator that floors to int for comparison
+                    self._consecutive_losses += self._soft_loss_weight
+                    # Floor to int for threshold comparison
+                    self._consecutive_losses = round(self._consecutive_losses, 1)
+                    logger.info(
+                        f"Soft loss ({reason}): consec_losses={self._consecutive_losses} "
+                        f"(weighted +{self._soft_loss_weight})"
+                    )
+                else:
+                    # Real signal failure: full increment
+                    self._consecutive_losses = int(self._consecutive_losses) + 1
             else:
                 self._consecutive_losses = 0
 
@@ -216,6 +316,7 @@ class RiskManager:
             was = self._halt_reason
             self._is_halted          = False
             self._halt_reason        = ""
+            self._halt_time          = 0.0
             self._consecutive_losses = 0
             logger.info(f"RiskManager resumed (was halted: {was})")
             self._notify(f"✅ *Risk resumed* (was: `{was}`) — consecutive losses reset")
@@ -229,9 +330,11 @@ class RiskManager:
             "max_daily_loss_usd":     ("_max_daily_loss",     float),
             "max_daily_trades":       ("_max_daily_trades",   int),
             "max_consecutive_losses": ("_max_consec_losses",  int),
-            "cooldown_seconds":       ("_cooldown",           float),
+            "cooldown_seconds":       ("_base_cooldown",      float),
             "max_drawdown_pct":       ("_max_dd_pct",         float),
             "equity_pct_per_trade":   ("_equity_pct",         float),
+            "auto_resume_seconds":    ("_auto_resume_seconds", float),
+            "soft_loss_weight":       ("_soft_loss_weight",   float),
         }
         if key not in _MAP:
             return False
@@ -248,6 +351,24 @@ class RiskManager:
     def get_status(self) -> Dict:
         with self._lock:
             self._reset_if_new_day()
+
+            # Compute effective cooldown with graduated scaling
+            effective_cooldown = self._base_cooldown * (
+                1.0 + self._consecutive_losses * 0.5
+            )
+
+            # Auto-resume remaining time
+            auto_resume_remaining = 0.0
+            if self._is_halted and self._halt_time > 0:
+                auto_resumable = self._halt_reason in (
+                    "CONSECUTIVE_LOSSES", "MAX_DRAWDOWN",
+                )
+                if auto_resumable:
+                    elapsed_halt = time.time() - self._halt_time
+                    auto_resume_remaining = max(
+                        0.0, self._auto_resume_seconds - elapsed_halt
+                    )
+
             return {
                 "is_halted":          self._is_halted,
                 "halt_reason":        self._halt_reason,
@@ -257,7 +378,8 @@ class RiskManager:
                 "consecutive_losses": self._consecutive_losses,
                 "last_trade_time":    self._last_trade_time,
                 "open_trade":         bool(self._open_trade and not self._open_trade.closed),
-                "cooldown_remaining": max(0.0, self._cooldown - (time.time() - self._last_trade_time)),
+                "cooldown_remaining": max(0.0, effective_cooldown - (time.time() - self._last_trade_time)),
+                "auto_resume_remaining": round(auto_resume_remaining, 0),
                 "params": {
                     "max_pos_usd":       self._max_pos_usd,
                     "max_pos_contracts": self._max_pos_contracts,
@@ -265,9 +387,12 @@ class RiskManager:
                     "max_daily_loss":    self._max_daily_loss,
                     "max_daily_trades":  self._max_daily_trades,
                     "max_consec_losses": self._max_consec_losses,
-                    "cooldown":          self._cooldown,
+                    "cooldown":          self._base_cooldown,
+                    "effective_cooldown": effective_cooldown,
                     "max_dd_pct":        self._max_dd_pct,
                     "equity_pct":        self._equity_pct,
+                    "auto_resume_sec":   self._auto_resume_seconds,
+                    "soft_loss_weight":  self._soft_loss_weight,
                 },
             }
 

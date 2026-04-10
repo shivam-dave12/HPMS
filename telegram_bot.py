@@ -230,6 +230,28 @@ class TelegramBot:
         for name, handler in cmds.items():
             self._app.add_handler(CommandHandler(name, handler))
 
+        # ── Global error handler — surfaces exceptions instead of silent failure ──
+        async def _error_handler(update, context):
+            logger.error(f"Telegram handler error: {context.error}", exc_info=context.error)
+            if update and update.effective_message:
+                try:
+                    await update.effective_message.reply_text(
+                        f"❌ Command error: {context.error}"
+                    )
+                except Exception:
+                    pass
+
+        self._app.add_error_handler(_error_handler)
+
+        # ── Catch-all for non-command messages ────────────────────────────────────
+        async def _fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+            if update.message and update.message.text:
+                await update.message.reply_text(
+                    "Use /help to see available commands."
+                )
+
+        self._app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _fallback))
+
         # ── Bot command menu ───────────────────────────────────────────────────
         # Wrapped in asyncio.wait_for so a network timeout cannot crash the bot
         # thread before _ready.set() is called.  A failure here is non-fatal —
@@ -290,6 +312,7 @@ class TelegramBot:
         Thread-safe push to the configured chat.
         Blocks until the bot loop is ready (up to 20 s on first call at startup).
         Silently drops if the loop never started.
+        Falls back to plain text if Markdown parsing fails.
         """
         if not self._chat_id:
             return
@@ -297,16 +320,29 @@ class TelegramBot:
             return
         if not self._app or not self._loop:
             return
-        try:
-            asyncio.run_coroutine_threadsafe(
-                self._app.bot.send_message(
+
+        async def _send_with_fallback():
+            try:
+                await self._app.bot.send_message(
                     chat_id=self._chat_id,
                     text=text,
                     parse_mode="Markdown",
                     disable_web_page_preview=True,
-                ),
-                self._loop,
-            )
+                )
+            except Exception:
+                # Markdown parse failed — retry as plain text
+                try:
+                    plain = text.replace("`", "").replace("*", "").replace("_", "")
+                    await self._app.bot.send_message(
+                        chat_id=self._chat_id,
+                        text=plain,
+                        disable_web_page_preview=True,
+                    )
+                except Exception as e2:
+                    logger.debug(f"send_message fallback error: {e2}")
+
+        try:
+            asyncio.run_coroutine_threadsafe(_send_with_fallback(), self._loop)
         except Exception as e:
             logger.debug(f"send_message error: {e}")
 
@@ -369,40 +405,52 @@ class TelegramBot:
     # ──────────────────────────────────────────────────────────────────────────
 
     async def _cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "🔬 *HPMS — Hamiltonian Phase\\-Space Micro\\-Scalping*\n\n"
-            "📊 *Info*\n"
-            "/status — Full dashboard\n"
-            "/thinking — Decision stack \\(why we trade\\)\n"
-            "/phase — Phase\\-space \\(q, p, H, dH/dt\\)\n"
-            "/signal — Last signal detail\n"
-            "/market — Price, spread, ATR\n"
-            "/filter — Filter gate status\n"
-            "/risk — Risk gate status\n"
-            "/pnl — Daily P&L\n"
-            "/trades — Trade log\n"
-            "/position — Open position\n"
-            "/balance — Balance\n"
-            "/diag — Engine diagnostics\n"
-            "/engine — Engine parameters\n\n"
-            "⚡ *Controls*\n"
-            "/start\\_trading — Enable strategy\n"
-            "/stop\\_trading — Disable \\(positions remain\\)\n"
-            "/halt — Emergency stop \\+ flatten\n"
-            "/resume — Resume from halt \\+ flatten\n"
-            "/resetrisk — Clear lockout only \\(no flatten\\)\n"
-            "/flatten — Close all positions\n"
-            "/close — Close current position\n\n"
-            "⚙️ *Config*\n"
-            "/params — All parameters\n"
-            "/set \\<param\\> \\<value\\>\n"
-            "/get \\<param\\>\n"
-            "/leverage \\<N\\>\n"
-            "/cooldown \\<sec\\>\n"
-            "/maxloss \\<usd\\>\n"
-            "/maxsize \\<contracts\\>",
-            parse_mode="MarkdownV2",
-        )
+        try:
+            await update.message.reply_text(
+                "🔬 *HPMS — Hamiltonian Phase-Space Micro-Scalping*\n\n"
+                "📊 *Info*\n"
+                "/status — Full dashboard\n"
+                "/thinking — Decision stack (why we trade)\n"
+                "/phase — Phase-space (q, p, H, dH/dt)\n"
+                "/signal — Last signal detail\n"
+                "/market — Price, spread, ATR\n"
+                "/filter — Filter gate status\n"
+                "/risk — Risk gate status\n"
+                "/pnl — Daily P&L\n"
+                "/trades — Trade log\n"
+                "/position — Open position\n"
+                "/balance — Balance\n"
+                "/diag — Engine diagnostics\n"
+                "/engine — Engine parameters\n\n"
+                "⚡ *Controls*\n"
+                "/start_trading — Enable strategy\n"
+                "/stop_trading — Disable (positions remain)\n"
+                "/halt — Emergency stop + flatten\n"
+                "/resume — Resume from halt\n"
+                "/resetrisk — Clear lockout only (no flatten)\n"
+                "/flatten — Close all positions\n"
+                "/close — Close current position\n\n"
+                "⚙️ *Config*\n"
+                "/params — All parameters\n"
+                "/set <param> <value>\n"
+                "/get <param>\n"
+                "/leverage <N>\n"
+                "/cooldown <sec>\n"
+                "/maxloss <usd>\n"
+                "/maxsize <contracts>",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            # Fallback to plain text if Markdown fails
+            logger.warning(f"Help command Markdown failed: {e}")
+            await update.message.reply_text(
+                "HPMS — Hamiltonian Phase-Space Micro-Scalping\n\n"
+                "Info: /status /thinking /phase /signal /market /filter "
+                "/risk /pnl /trades /position /balance /diag /engine\n\n"
+                "Controls: /start_trading /stop_trading /halt /resume "
+                "/resetrisk /flatten /close\n\n"
+                "Config: /params /set /get /leverage /cooldown /maxloss /maxsize"
+            )
 
     # ──────────────────────────────────────────────────────────────────────────
     # COMMANDS: INFO
@@ -594,16 +642,26 @@ class TelegramBot:
                 rs = self._risk.get_status()
                 p  = rs.get("params", {})
                 cd = rs.get("cooldown_remaining", 0)
+                auto_rem = rs.get("auto_resume_remaining", 0)
+                eff_cd = p.get("effective_cooldown", p.get("cooldown", "?"))
+
+                halt_line = "No"
+                if rs.get("is_halted"):
+                    halt_line = "Yes — " + _md_safe(rs.get("halt_reason", ""))
+                    if auto_rem > 0:
+                        halt_line += f" (auto-resume {auto_rem:.0f}s)"
+
                 lines += [
                     f"  {_gate(can_trade)} Can trade: `{reason}`",
-                    f"  Halted:    `{'Yes — ' + _md_safe(rs.get('halt_reason','')) if rs.get('is_halted') else 'No'}`",
-                    f"  Cooldown:  `{cd:.0f}s` remaining",
+                    f"  Halted:    `{halt_line}`",
+                    f"  Cooldown:  `{cd:.0f}s` remaining (eff. `{eff_cd}s`)",
                     f"  Daily PnL: `${rs.get('daily_pnl', 0):+.2f}` "
                     f"/ limit `${p.get('max_daily_loss', '?')}`",
                     f"  Trades:    `{rs.get('trades_today', 0)}` "
                     f"/ max `{p.get('max_daily_trades', '?')}`",
                     f"  Consec ↓:  `{rs.get('consecutive_losses', 0)}` "
-                    f"/ max `{p.get('max_consec_losses', '?')}`",
+                    f"/ max `{p.get('max_consec_losses', '?')}` "
+                    f"(soft wt: `{p.get('soft_loss_weight', '?')}`)",
                 ]
             else:
                 lines.append("  ⚠️ Risk manager unavailable")
@@ -811,12 +869,21 @@ class TelegramBot:
                 rs.get("trades_today", 0), 0, p.get("max_daily_trades", 50)
             )
 
+            auto_resume = rs.get("auto_resume_remaining", 0)
+            halt_info = "No"
+            if rs.get("is_halted"):
+                halt_info = "Yes — " + rs.get("halt_reason", "")
+                if auto_resume > 0:
+                    halt_info += f" (auto-resume in {auto_resume:.0f}s)"
+
+            eff_cd = p.get("effective_cooldown", p.get("cooldown", "?"))
+
             await update.message.reply_text(
                 f"🛡 *Risk Gate Status*\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"{gate_icon} *Can trade: `{reason}`*\n\n"
-                f"Halted:     `{'Yes — ' + rs.get('halt_reason','') if rs.get('is_halted') else 'No'}`\n"
-                f"Cooldown:   `{cd:.0f}s` remaining\n\n"
+                f"Halted:     `{halt_info}`\n"
+                f"Cooldown:   `{cd:.0f}s` remaining (effective `{eff_cd}s`)\n\n"
                 f"Daily PnL:   `${rs.get('daily_pnl', 0):+.2f}` / limit `${p.get('max_daily_loss', '?')}`\n"
                 f"             [{pnl_bar}]\n"
                 f"Trades:      `{rs.get('trades_today', 0)}` / max `{p.get('max_daily_trades', '?')}`\n"
@@ -827,7 +894,9 @@ class TelegramBot:
                 f"  Max pos:   `${p.get('max_pos_usd','?')}` / `{p.get('max_pos_contracts','?')}c`\n"
                 f"  Leverage:  `{p.get('leverage','?')}x`\n"
                 f"  Max DD:    `{p.get('max_dd_pct','?')}%`\n"
-                f"  Equity%:   `{p.get('equity_pct','?')}%` per trade\n\n"
+                f"  Equity%:   `{p.get('equity_pct','?')}%` per trade\n"
+                f"  Auto-resume: `{p.get('auto_resume_sec','?')}s`\n"
+                f"  Soft loss wt: `{p.get('soft_loss_weight','?')}`\n\n"
                 f"_/resetrisk to clear lockout  /resume to resume from halt_",
                 parse_mode="Markdown",
             )
@@ -850,7 +919,7 @@ class TelegramBot:
             f"Type:       *{s.signal_type.name}*\n"
             f"Confidence: `{s.confidence:.1%}`\n"
             f"Predicted Δq: `{s.predicted_delta_q:+.6f}`\n"
-            f"p\\_final:    `{s.predicted_p_final:.6f}`\n"
+            f"p_final:    `{s.predicted_p_final:.6f}`\n"
             f"H (energy):  `{s.current_H:.6f}`\n"
             f"dH/dt:       `{s.dH_dt:.6f}`\n"
             f"Entry: `${s.entry_price:,.1f}`\n"
@@ -897,10 +966,10 @@ class TelegramBot:
             f"Traj. logged: `{d.get('trajectory_log_depth')}`\n\n"
             f"*Phase State:*\n"
             f"q=`{ps.get('q')}` p=`{ps.get('p')}`\n"
-            f"H=`{ps.get('H')}` dH/dt\\_ema=`{ps.get('dH_dt_ema')}`\n\n"
+            f"H=`{ps.get('H')}` dH/dt_ema=`{ps.get('dH_dt_ema')}`\n\n"
             f"*H Smoothing (span={hs.get('ema_span')}):*\n"
-            f"H\\_raw=`{hs.get('H_raw')}` H\\_ema=`{hs.get('H_ema')}`\n"
-            f"dH\\_raw=`{hs.get('dH_raw')}` dH\\_ema=`{hs.get('dH_ema')}`"
+            f"H_raw=`{hs.get('H_raw')}` H_ema=`{hs.get('H_ema')}`\n"
+            f"dH_raw=`{hs.get('dH_raw')}` dH_ema=`{hs.get('dH_ema')}`"
         )
         traj = d.get("last_trajectory")
         if traj:
