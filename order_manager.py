@@ -4,11 +4,15 @@ order_manager.py — Delta Exchange Order Execution Manager
 Handles atomic order placement (bracket or separate SL/TP), position tracking,
 forced exits, and order state reconciliation.
 
-** ALL fees and PnL are sourced from the Delta Exchange API — no estimates. **
-  - Entry fee: from order's `paid_commission` field
-  - Exit fee: from fill's `commission` field
-  - Gross PnL: from position's `realized_pnl` or computed from actual fill prices
-  - Entry/exit prices: from `average_fill_price` (orders) or `price` (fills)
+ALL fees and PnL are sourced exclusively from the Delta Exchange API — no
+estimates, no fallback calculations.
+  - Entry fee  : order's `paid_commission` field (or fills API if not in order)
+  - Exit fee   : fill's `commission` / `total_commission_in_settling_asset`
+  - Gross PnL  : position's `realized_pnl`, or computed from actual fill prices
+  - Prices     : `average_fill_price` (orders) or `price` (fills)
+
+If the API does not return a fee value, the fee is recorded as $0 and an error
+is logged.  No local fee estimation is ever performed.
 """
 
 from __future__ import annotations
@@ -45,17 +49,11 @@ class OrderManager:
     never from local estimation.
     """
 
-    def __init__(self, api, symbol: str = "BTCUSD", contract_value: float = 0.001,
-                 taker_fee_pct: float = 0.05, maker_fee_pct: float = 0.02):
+    def __init__(self, api, symbol: str = "BTCUSD", contract_value: float = 0.001):
         self._api    = api
         self._symbol = symbol
         self._lock   = threading.RLock()
         self._contract_value = contract_value  # BTC per contract (Delta BTCUSD = 0.001)
-
-        # Fee rates kept ONLY as last-resort fallback if API doesn't return commission.
-        # All normal paths use exact API data.
-        self._taker_fee_pct = taker_fee_pct
-        self._maker_fee_pct = maker_fee_pct
 
         # Active state
         self._position_side:    Optional[str] = None   # "long" | "short" | None
@@ -187,13 +185,9 @@ class OrderManager:
                     actual_entry_fee = self._fetch_order_fee(order_id)
 
                 if actual_entry_fee <= 0:
-                    # Last resort: estimate (should rarely happen for market orders)
-                    actual_entry_fee = self._estimate_fee(
-                        actual_entry_price, size, is_taker=(order_type == "market")
-                    )
-                    logger.warning(
-                        f"Could not get exact entry fee from API — "
-                        f"using estimate: ${actual_entry_fee:.6f}"
+                    logger.error(
+                        f"Could not retrieve actual entry fee from API for order {order_id} "
+                        f"— entry fee recorded as $0"
                     )
 
                 self._entry_order_id = order_id
@@ -338,12 +332,9 @@ class OrderManager:
                 if exit_fee <= 0:
                     exit_fee = self._fetch_latest_fill_commission()
                 if exit_fee <= 0:
-                    exit_fee = self._estimate_fee(
-                        exit_price, self._position_size, is_taker=True
-                    )
-                    logger.warning(
-                        f"Could not get exact exit fee from API — "
-                        f"using estimate: ${exit_fee:.6f}"
+                    logger.error(
+                        f"Could not retrieve actual exit fee from API — "
+                        f"exit fee recorded as $0"
                     )
 
                 total_fees = self._entry_fee_usd + exit_fee
@@ -443,11 +434,9 @@ class OrderManager:
                 if exit_fee <= 0:
                     exit_fee = self._fetch_latest_fill_commission()
                 if exit_fee <= 0:
-                    exit_fee = self._estimate_fee(
-                        fill_price, self._position_size, is_taker=True
-                    )
-                    logger.warning(
-                        f"WS fill missing commission — using estimate: ${exit_fee:.6f}"
+                    logger.error(
+                        f"WS fill missing commission and fills API returned nothing "
+                        f"— exit fee recorded as $0"
                     )
 
                 reason = self._classify_exit(fill_price)
@@ -581,15 +570,6 @@ class OrderManager:
             diff = -diff
         return diff * self._contract_value * self._position_size
 
-    def _estimate_fee(self, price: float, size: int, is_taker: bool = True) -> float:
-        """
-        FALLBACK ONLY: Estimate fee when API doesn't return commission.
-        This should rarely be needed — all normal paths use exact API data.
-        """
-        notional = price * self._contract_value * size
-        rate = self._taker_fee_pct if is_taker else self._maker_fee_pct
-        return notional * rate / 100.0
-
     def _classify_exit(self, exit_price: float) -> str:
         """Return 'TP_HIT', 'SL_HIT', or 'EXCHANGE_CLOSE' based on actual TP/SL levels."""
         if exit_price <= 0:
@@ -659,12 +639,9 @@ class OrderManager:
                             gross_pnl = self._compute_pnl_from_prices(exit_price)
 
                         if exit_fee <= 0:
-                            exit_fee = self._estimate_fee(
-                                exit_price, self._position_size, is_taker=True
-                            )
-                            logger.warning(
-                                f"Reconcile: no exact exit fee — "
-                                f"using estimate: ${exit_fee:.6f}"
+                            logger.error(
+                                f"Reconcile: no actual exit fee returned by API "
+                                f"— exit fee recorded as $0"
                             )
 
                         total_fees = self._entry_fee_usd + exit_fee

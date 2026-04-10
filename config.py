@@ -65,8 +65,6 @@ TRADE_USE_BRACKET_ORDERS  = True    # use Delta bracket orders for atomic SL/TP
 TRADE_ORDER_TYPE           = "market"  # "market" | "limit"
 TRADE_LIMIT_OFFSET_TICKS  = 1       # ticks away from mid for limit entries
 TRADE_CONTRACT_VALUE      = 0.001   # base asset units per contract (Delta BTCUSD = 0.001 BTC)
-TRADE_TAKER_FEE_PCT       = 0.05    # Delta taker fee % (0.05% = 0.0005) — used only as last-resort fallback
-TRADE_MAKER_FEE_PCT       = 0.02    # Delta maker fee % (0.02% = 0.0002) — used only as last-resort fallback
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # POSITION SIZING & RISK (v2 — Confidence-weighted, Vol-normalized)

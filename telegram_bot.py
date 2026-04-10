@@ -1126,26 +1126,26 @@ class TelegramBot:
             diff = price - p["entry_price"]
             if p["side"] == "short":
                 diff = -diff
-            cv  = getattr(cfg, "TRADE_CONTRACT_VALUE", 0.001) if cfg else 0.001
-            lev = getattr(cfg, "RISK_LEVERAGE", 10) if cfg else 10
-            taker_fee = getattr(cfg, "TRADE_TAKER_FEE_PCT", 0.05) if cfg else 0.05
+            cv   = getattr(cfg, "TRADE_CONTRACT_VALUE", 0.001) if cfg else 0.001
+            lev  = getattr(cfg, "RISK_LEVERAGE", 10) if cfg else 10
             size = p["size"]
 
-            notional = p["entry_price"] * cv * size
-            margin = notional / max(lev, 1)
+            notional  = p["entry_price"] * cv * size
+            margin    = notional / max(lev, 1)
             gross_pnl = diff * cv * size
-            # Entry fee already paid; estimate exit fee at current price
-            entry_fee = notional * taker_fee / 100.0
-            exit_fee = price * cv * size * taker_fee / 100.0
-            total_fees = entry_fee + exit_fee
-            net_pnl = gross_pnl - total_fees
-            roe_pct = (net_pnl / margin * 100) if margin > 0 else 0.0
+
+            # Use the ACTUAL entry fee already paid (recorded from API at entry)
+            entry_fee_paid = getattr(self._orders, "_entry_fee_usd", 0.0)
+            # Exit fee is not yet known — it will be settled by the exchange on close
+            net_pnl_so_far = gross_pnl - entry_fee_paid
+            roe_pct = (net_pnl_so_far / margin * 100) if margin > 0 else 0.0
 
             pnl_block = (
                 f"\n*Unrealised P&L:*\n"
                 f"  Gross: `${gross_pnl:+.4f}`\n"
-                f"  Fees (est): `$-{total_fees:.4f}` (entry `$-{entry_fee:.4f}` + exit `$-{exit_fee:.4f}`)\n"
-                f"  *Net: `${net_pnl:+.4f}`*\n"
+                f"  Entry fee paid: `$-{entry_fee_paid:.4f}` _(actual, from API)_\n"
+                f"  Exit fee: _(charged by exchange on close)_\n"
+                f"  *Net (excl. exit fee): `${net_pnl_so_far:+.4f}`*\n"
                 f"  ROE: `{roe_pct:+.2f}%` on `${margin:.2f}` margin"
             )
 
