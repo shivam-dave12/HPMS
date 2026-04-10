@@ -348,7 +348,7 @@ class HPMSEngine:
         var = float(np.dot(exp_weights, (window - mu) ** 2))
         std = math.sqrt(var) if var > 1e-24 else 1e-12
 
-        return (log_c - mu) / std
+        return (log_c - mu) / std, std
 
     def _compute_p(self, q_series: np.ndarray) -> np.ndarray:
         tau = self._tau
@@ -406,7 +406,7 @@ class HPMSEngine:
             return None
 
         # ── Step 1: Phase-space coordinates ───────────────────────────────────
-        q_series = self._compute_q(closes_arr)
+        q_series, ewma_std = self._compute_q(closes_arr)
         p_series = self._compute_p(q_series)
 
         q_now = float(q_series[-1])
@@ -571,9 +571,12 @@ class HPMSEngine:
         p_pred  = trajectory[-1].p
         delta_q = q_pred - q_now
 
-        # Convert z-score delta_q back to approximate % price move
-        log_closes = np.log(closes_arr[-self._norm_window:])
-        std_log    = float(np.std(log_closes))
+        # Convert z-score delta_q back to approximate % price move.
+        # Use the same EWMA std that was used to normalise q in _compute_q so
+        # the units are consistent.  The old code used a simple (unweighted)
+        # std here, which diverges from the EWMA std during trends and makes
+        # the SIGNAL_DELTA_Q_THRESHOLD comparison unreliable (Bug 1 fix).
+        std_log = ewma_std
         if std_log < 1e-12:
             std_log = 1e-12
         predicted_pct_move = delta_q * std_log
@@ -682,14 +685,13 @@ class HPMSEngine:
                  momentum_short_ok=momentum_direction_short,
                  traj_consistent=traj_consistent)
 
-        # ── p_now trend-alignment gate (Fix 3b) ──────────────────────────────
-        # The trajectory can predict a LONG even when current momentum p_now is
-        # negative (i.e. price is actively falling NOW).  This happens when V(q)
-        # has a valley ahead: the particle will decelerate, reverse, and end up
-        # higher — but only after passing through a losing region first.
-        # Gate: current momentum must agree with signal direction.
-        p_now_long_ok  = p_now > 0
-        p_now_short_ok = p_now < 0
+        # ── p_now trend-alignment gate (Fix 3b / Bug 4 soft gate) ───────────
+        # A hard zero threshold blocks valid reversal entries when p_now is
+        # marginally negative (e.g. -0.00005) on a bar that has just turned.
+        # Allow a tolerance of one min_momentum unit so the gate only fires
+        # when current momentum clearly opposes the signal direction.
+        p_now_long_ok  = p_now > -self._min_momentum
+        p_now_short_ok = p_now < self._min_momentum
         elog.log("ENGINE_CRITERIA",
                  check="p_now_direction",
                  p_now=round(p_now, 6),

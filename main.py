@@ -440,6 +440,13 @@ class HPMSRunner:
                     last_close     = candles[-1].get("c", 0)
 
                     if current_minute > last_bar_minute:
+                        # Brief pause to let the WebSocket is_closed=True event for
+                        # the just-finished bar arrive and finalize candles[-1] before
+                        # we snapshot the deque.  WS latency is <100ms; 200ms is a
+                        # safe margin that still leaves >99% of the minute available
+                        # for signal computation and order placement (Bug 6 fix).
+                        time.sleep(0.20)
+                        candles = self._data_mgr.get_candles("1m", limit=300)
                         logger.info(
                             "[LOOP] ▶ new 1m bar | minute=%d close=%.1f "
                             "candles=%d poll=#%d",

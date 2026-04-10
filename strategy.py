@@ -239,6 +239,7 @@ class HPMSStrategy:
             size = self._risk.compute_size(
                 current_price, equity,
                 contract_value=getattr(self._config, "TRADE_CONTRACT_VALUE", 0.001),
+                sl_pct=abs(current_price - signal.sl_price) / current_price if signal.sl_price > 0 else 0.0,
             )
             side = "long" if signal.signal_type == SignalType.LONG else "short"
 

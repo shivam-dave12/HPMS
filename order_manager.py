@@ -39,6 +39,8 @@ class OrderManager:
         self._position_side:    Optional[str] = None   # "long" | "short" | None
         self._position_size:    int   = 0
         self._entry_price:      float = 0.0
+        self._tp_price:         float = 0.0   # stored at entry for correct TP/SL classification
+        self._sl_price:         float = 0.0   # stored at entry for correct TP/SL classification
         self._entry_bar:        int   = 0
         self._entry_time:       float = 0.0
         self._entry_fee_usd:    float = 0.0   # fee paid at entry
@@ -143,6 +145,8 @@ class OrderManager:
                 self._position_side  = side
                 self._position_size  = size
                 self._entry_price    = price
+                self._tp_price       = tp_price
+                self._sl_price       = sl_price
                 self._entry_time     = time.time()
                 self._entry_bar      = 0
                 self._entry_fee_usd  = self._compute_fee(
@@ -298,6 +302,8 @@ class OrderManager:
         self._position_side  = None
         self._position_size  = 0
         self._entry_price    = 0.0
+        self._tp_price       = 0.0
+        self._sl_price       = 0.0
         self._entry_bar      = 0
         self._entry_time     = 0.0
         self._entry_fee_usd  = 0.0
@@ -409,9 +415,22 @@ class OrderManager:
         return gross, total_fees, gross - total_fees
 
     def _classify_exit(self, exit_price: float) -> str:
-        """Return 'TP_HIT', 'SL_HIT', or 'EXCHANGE_CLOSE' based on price vs entry."""
+        """Return 'TP_HIT', 'SL_HIT', or 'EXCHANGE_CLOSE' based on actual TP/SL levels."""
         if exit_price <= 0:
             return "EXCHANGE_CLOSE"
+        # Compare against the stored TP/SL prices set at entry, not just entry_price.
+        # Using entry_price as the boundary misclassifies a tiny bounce above entry as
+        # TP_HIT even when price never came close to the real TP level (Bug 2 fix).
+        if self._tp_price > 0 and self._sl_price > 0:
+            if self._position_side == "long":
+                tp_dist = abs(exit_price - self._tp_price)
+                sl_dist = abs(exit_price - self._sl_price)
+                return "TP_HIT" if tp_dist < sl_dist else "SL_HIT"
+            else:
+                tp_dist = abs(exit_price - self._tp_price)
+                sl_dist = abs(exit_price - self._sl_price)
+                return "TP_HIT" if tp_dist < sl_dist else "SL_HIT"
+        # Fallback if TP/SL prices were never recorded
         if self._position_side == "long":
             return "TP_HIT" if exit_price > self._entry_price else "SL_HIT"
         else:

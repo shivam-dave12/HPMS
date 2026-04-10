@@ -232,19 +232,32 @@ class RiskManager:
     # ─── POSITION SIZING ─────────────────────────────────────────────────────
 
     def compute_size(self, price: float, equity_usd: float,
-                     contract_value: float = 0.001) -> int:
+                     contract_value: float = 0.001,
+                     sl_pct: float = 0.0) -> int:
         """
-        Compute position size in contracts.
+        Compute position size in contracts using true risk-based sizing.
 
-        Each contract = contract_value * price in USD notional.
-        E.g. BTCUSD: 1 contract = 0.001 BTC = $72 at BTC=$72000.
+        When sl_pct is provided (> 0), sizes the position so that if SL is hit
+        the loss equals exactly equity × equity_pct%.  This is the correct
+        interpretation of "% of equity risked per trade":
+            size = (equity × risk_pct) / (price × sl_pct × contract_value)
+
+        Without sl_pct (fallback), uses the old notional-scaling approach
+        so existing behaviour is preserved for callers that don't supply it.
         """
         with self._lock:
-            risk_usd  = equity_usd * (self._equity_pct / 100.0)
-            notional  = min(risk_usd * self._leverage, self._max_pos_usd)
-            # Each contract is worth contract_value * price USD
-            per_contract = contract_value * price if price > 0 else 1.0
-            contracts = int(notional / per_contract) if per_contract > 0 else 0
+            risk_usd = equity_usd * (self._equity_pct / 100.0)
+
+            if sl_pct > 0 and price > 0:
+                # True risk-based: risk_usd lost when price moves sl_pct against us
+                per_contract_sl_loss = price * sl_pct * contract_value
+                contracts = int(risk_usd / per_contract_sl_loss) if per_contract_sl_loss > 0 else 0
+            else:
+                # Legacy fallback: notional scaling (kept for callers without sl_pct)
+                notional = min(risk_usd * self._leverage, self._max_pos_usd)
+                per_contract = contract_value * price if price > 0 else 1.0
+                contracts = int(notional / per_contract) if per_contract > 0 else 0
+
             contracts = min(contracts, self._max_pos_contracts)
             contracts = max(contracts, 1)
             return contracts

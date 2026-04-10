@@ -478,7 +478,7 @@ class DeltaDataManager:
             "5m":  getattr(config, "MIN_CANDLES_5M",   100),
             "15m": getattr(config, "MIN_CANDLES_15M",  100),
             "1h":  getattr(config, "MIN_CANDLES_1H",    20),
-            "4h":  max(getattr(config, "MIN_CANDLES_4H", 40), 29),
+            "4h":  getattr(config, "MIN_CANDLES_4H",   5),
             "1d":  getattr(config, "MIN_CANDLES_1D",     7),
         }
         missing = [f"{tf}({counts[tf]}<{mins[tf]})" for tf in mins if counts[tf] < mins[tf]]
