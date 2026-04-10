@@ -175,13 +175,14 @@ class OrderManager:
                     )
 
                 # ── Extract EXACT entry fee from API ──────────────────────────
-                # paid_commission is the actual fee charged by the exchange.
-                actual_entry_fee = _safe_float(
-                    raw.get("paid_commission",
-                            raw.get("commission")), 0.0
-                )
+                # ONLY use paid_commission — it is the ACTUAL fee charged after fill.
+                # Do NOT fall back to 'commission' — that is an exchange estimate
+                # computed before the fill and will not match the actual charge.
+                actual_entry_fee = _safe_float(raw.get("paid_commission"), 0.0)
                 if actual_entry_fee <= 0:
-                    # Order may not have fee yet — fetch from fills for this order.
+                    # Market orders fill almost instantly; give the exchange a moment
+                    # to record the fill before querying the fills API.
+                    time.sleep(0.5)
                     actual_entry_fee = self._fetch_order_fee(order_id)
 
                 if actual_entry_fee <= 0:
@@ -304,17 +305,19 @@ class OrderManager:
                         resp = self._api.close_position(self._product_id)
 
                 # ── Get EXACT exit data from the API ──────────────────────────
+                # ONLY use paid_commission — the actual fee charged after fill.
+                # 'commission' is an exchange pre-fill estimate; never use it.
                 exit_price, exit_fee = 0.0, 0.0
                 if resp.get("success"):
                     result_data = resp.get("result", {})
                     raw = result_data.get("_raw", result_data)
                     exit_price = _safe_float(raw.get("average_fill_price"), 0.0)
-                    exit_fee = _safe_float(
-                        raw.get("paid_commission", raw.get("commission")), 0.0
-                    )
+                    exit_fee = _safe_float(raw.get("paid_commission"), 0.0)
 
-                # Fetch from fills API for exact data if needed
+                # Fetch from fills API for exact data if needed.
+                # Brief sleep to allow the fill to propagate on the exchange side.
                 if exit_price <= 0 or exit_fee <= 0:
+                    time.sleep(0.5)
                     fill_price, fill_fee, _ = self._get_exit_from_fills()
                     if fill_price > 0 and exit_price <= 0:
                         exit_price = fill_price
@@ -428,8 +431,11 @@ class OrderManager:
                     return
 
                 # ── EXACT fee from WS fill data ──────────────────────────────
+                # WS fills carry the actual post-fill commission.
+                # Try paid_commission first, then commission (fill-record field),
+                # then c_val. Never use the order-level 'commission' estimate.
                 exit_fee = _safe_float(
-                    data.get("commission") or data.get("c_val"), 0.0
+                    data.get("paid_commission") or data.get("commission") or data.get("c_val"), 0.0
                 )
                 if exit_fee <= 0:
                     exit_fee = self._fetch_latest_fill_commission()
@@ -505,6 +511,10 @@ class OrderManager:
                         )
                         if total_comm > 0:
                             return total_comm
+                        # paid_commission in fill = actual charged; commission = estimate
+                        paid = _safe_float(f.get("paid_commission"), 0.0)
+                        if paid > 0:
+                            return paid
                         fee = _safe_float(f.get("commission"), 0.0)
                         if fee > 0:
                             return fee
@@ -514,7 +524,7 @@ class OrderManager:
         return 0.0
 
     def _fetch_latest_fill_commission(self) -> float:
-        """Fetch commission from the most recent fill for our product."""
+        """Fetch ACTUAL paid commission from the most recent fill for our product."""
         try:
             resp = self._api.get_fills(product_id=self._product_id, page_size=5)
             if resp.get("success"):
@@ -524,11 +534,16 @@ class OrderManager:
                 if isinstance(fills, list) and fills:
                     latest = fills[0]
                     meta = latest.get("meta_data", {}) or {}
+                    # Prefer total_commission_in_settling_asset (most complete),
+                    # then paid_commission, then commission — all from the fill record.
                     total_comm = _safe_float(
                         meta.get("total_commission_in_settling_asset"), 0.0
                     )
                     if total_comm > 0:
                         return total_comm
+                    paid = _safe_float(latest.get("paid_commission"), 0.0)
+                    if paid > 0:
+                        return paid
                     return _safe_float(latest.get("commission"), 0.0)
         except Exception as e:
             logger.debug(f"_fetch_latest_fill_commission error: {e}")
