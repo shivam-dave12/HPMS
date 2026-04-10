@@ -1066,9 +1066,7 @@ class TelegramBot:
             total_fees += t["fees"]
             total_net += t["net_pnl"]
         lines.append(
-            f"
-Gross: `${total_gross:+.4f}` | Fees: `$-{total_fees:.4f}`
-"
+            f"Gross: `${total_gross:+.4f}` | Fees: `$-{total_fees:.4f}`"
             f"*Net: `${total_net:+.4f}`*"
         )
         try:
