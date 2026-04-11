@@ -95,7 +95,7 @@ TRADE_LIMIT_OFFSET_TICKS  = 1
 # POSITION SIZING & RISK (v2 — Confidence-weighted, Vol-normalized)
 # ═══════════════════════════════════════════════════════════════════════════════
 RISK_MAX_POSITION_USD     = 500.0
-RISK_LEVERAGE             = 40
+RISK_LEVERAGE             = 50
 RISK_MAX_DAILY_LOSS_USD   = 200.0
 RISK_MAX_DAILY_TRADES     = 100
 RISK_MAX_CONSECUTIVE_LOSSES = 5
@@ -120,7 +120,8 @@ MIN_CANDLES_1D   = 3
 # ═══════════════════════════════════════════════════════════════════════════════
 FILTER_NEWS_BLACKOUT_SECONDS = 120
 FILTER_SPREAD_MAX_PCT        = 0.05
-FILTER_MIN_VOLUME_1M         = 10.0
+FILTER_MIN_VOLUME_1M         = 0.1     # HL volume is in BASE ASSET (e.g. BTC, not USD)
+                                        # 0.1 BTC ≈ $7k–$10k notional — filters dead markets
 FILTER_VOLATILITY_MIN_PCT    = 0.01
 FILTER_VOLATILITY_MAX_PCT    = 2.0
 

@@ -218,6 +218,10 @@ class HLDataManager:
                 seeded = 0
                 for c in raw:
                     try:
+                        close_ts = int(c.get("T", 0))
+                        # Skip the current forming candle (incomplete volume)
+                        if close_ts >= now_ms:
+                            continue
                         candle = Candle(
                             timestamp=int(c["t"]) / 1000.0,
                             open=float(c["o"]),
@@ -310,6 +314,17 @@ class HLDataManager:
         Fetch latest 1m candles (last 5 bars) and update the deque.
         Also refreshes price and orderbook.
         Called periodically from the main loop.
+
+        IMPORTANT: HL candleSnapshot returns the current FORMING candle as
+        the last entry. This candle has volume ≈ 0 because it just started.
+        We must NOT let it overwrite the completed candle in the deque,
+        otherwise the volume filter sees v=0.0 and blocks all entries.
+
+        HL candle fields:
+          t  = open time (ms)     — start of the bar
+          T  = close time (ms)    — end of the bar
+          v  = volume (base asset, e.g. BTC)
+        If T >= now, the candle is still forming.
         """
         try:
             now_ms = int(time.time() * 1000)
@@ -334,6 +349,7 @@ class HLDataManager:
                     for c in raw:
                         try:
                             ts = int(c["t"]) / 1000.0
+                            close_ts = int(c.get("T", 0))
                             candle = Candle(
                                 timestamp=ts,
                                 open=float(c["o"]),
@@ -344,13 +360,25 @@ class HLDataManager:
                             )
                             if candle.close <= 0:
                                 continue
-                            # Update or append
+
+                            # Always update price from latest data (even forming)
+                            self._last_price = candle.close
+                            self._last_price_update_time = time.time()
+
+                            # Detect forming candle: close_time >= now
+                            is_forming = close_ts >= now_ms
+
+                            if is_forming:
+                                # Don't write forming candle into the deque —
+                                # it has incomplete volume and would block filters.
+                                # Price update above is sufficient.
+                                continue
+
+                            # Completed candle — update or append
                             if self._candles_1m and abs(self._candles_1m[-1].timestamp - ts) < 30:
                                 self._candles_1m[-1] = candle
                             elif not self._candles_1m or ts > self._candles_1m[-1].timestamp:
                                 self._candles_1m.append(candle)
-                            self._last_price = candle.close
-                            self._last_price_update_time = time.time()
                         except Exception:
                             continue
 
