@@ -139,18 +139,16 @@ class SyncHLAPI:
     def get_clearinghouse_state(self, wallet: str) -> dict:
         return self._run(self._client.get_clearinghouse_state(wallet))
 
+    def get_spot_clearinghouse_state(self, wallet: str) -> dict:
+        """Spot account balance (funds not yet transferred to perp)."""
+        return self._run(self._client.get_spot_clearinghouse_state(wallet))
+
     def get_equity(self, wallet: str) -> float:
         """
         Full equity waterfall with spot USDC fallback.
-        Calls the canonical get_equity() on HyperliquidClient which checks:
-          1. marginSummary.accountValue   (total NAV — best number)
-          2. crossMarginSummary.accountValue
-          3. withdrawable                 (free cash only; 0 when locked in positions)
-          4. marginSummary.totalRawUsd    (deposited USDC, ignores unrealised PnL)
-          5. Spot USDC balance            (funds not yet transferred to perp account)
-          6. API wallet cross-check       (detects HL_WALLET_ADDRESS misconfiguration)
-
-        Use this everywhere instead of get_clearinghouse_state() + manual parsing.
+        Priority: marginSummary.accountValue → crossMarginSummary.accountValue
+                  → withdrawable → totalRawUsd → spot USDC → API wallet cross-check.
+        Always use this instead of get_clearinghouse_state() + manual parsing.
         """
         return self._run(self._client.get_equity(wallet))
 

@@ -1105,16 +1105,79 @@ class TelegramBot:
         try:
             import config as _cfg
             wallet = _cfg.get_settings().wallet_address
+
+            # ── Perp clearinghouse state ──────────────────────────────────────
             state = self._api.get_clearinghouse_state(wallet) if self._api else {}
-            ms = state.get("marginSummary", {})
-            available = float(ms.get("availableToTrade", 0))
-            total = float(ms.get("accountValue", 0))
-            locked = max(0.0, total - available)
+
+            def _sf(v):
+                try:
+                    return float(v) if v is not None else 0.0
+                except (TypeError, ValueError):
+                    return 0.0
+
+            ms  = state.get("marginSummary",      {}) or {}
+            cms = state.get("crossMarginSummary",  {}) or {}
+
+            # Correct Hyperliquid field names (NO "availableToTrade" field exists):
+            #   marginSummary.accountValue    = total NAV (cross + isolated + unrealisedPnl)
+            #   marginSummary.totalRawUsd     = deposited USDC (ignores unrealisedPnl)
+            #   marginSummary.totalMarginUsed = margin locked in ALL positions
+            #   crossMarginSummary.accountValue = cross-margin NAV only
+            #   withdrawable                  = free USDC (0 when locked in positions)
+            total_nav    = _sf(ms.get("accountValue"))
+            total_raw    = _sf(ms.get("totalRawUsd"))
+            margin_used  = _sf(ms.get("totalMarginUsed"))
+            cross_nav    = _sf(cms.get("accountValue"))
+            cross_margin = _sf(cms.get("totalMarginUsed"))
+            withdrawable = _sf(state.get("withdrawable"))
+
+            # Count open positions
+            positions = state.get("assetPositions", [])
+            n_pos = len([p for p in positions
+                         if abs(_sf((p.get("position") or p).get("szi", 0))) > 1e-12])
+
+            # ── Spot USDC check (funds not yet transferred to perp) ───────────
+            spot_usdc = 0.0
+            if self._api and hasattr(self._api, "get_spot_clearinghouse_state"):
+                try:
+                    spot = self._api.get_spot_clearinghouse_state(wallet)
+                    for b in (spot.get("balances", []) if isinstance(spot, dict) else []):
+                        if b.get("coin") == "USDC":
+                            spot_usdc = _sf(b.get("total"))
+                except Exception:
+                    pass
+
+            # Best single "available" figure:
+            # withdrawable = free cross margin (correct for trading)
+            # If 0 due to open positions, show cross_nav - cross_margin instead
+            free_margin = withdrawable
+            if free_margin <= 0 and cross_nav > 0:
+                free_margin = max(0.0, cross_nav - cross_margin)
+
+            lines = [
+                "💳 *Balance — Hyperliquid Perp*\n",
+                f"Total equity:   `${total_nav:.4f}`",
+                f"Raw USDC dep:   `${total_raw:.4f}`",
+                f"Margin locked:  `${margin_used:.4f}`",
+                f"Withdrawable:   `${withdrawable:.4f}`",
+                f"Free margin:    `${free_margin:.4f}`",
+                f"Cross NAV:      `${cross_nav:.4f}`",
+                f"Open positions: `{n_pos}`",
+            ]
+
+            if spot_usdc > 0:
+                lines.append(
+                    f"\n⚠️ Spot USDC: `${spot_usdc:.4f}` _(not in perp — transfer at app.hyperliquid.xyz)_"
+                )
+            elif total_nav <= 0 and total_raw <= 0:
+                lines.append(
+                    "\n❌ *All perp fields are zero.*\n"
+                    "Check: (1) HL\\_WALLET\\_ADDRESS is your master account, "
+                    "(2) USDC is deposited to the perp account at app.hyperliquid.xyz"
+                )
+
             await update.message.reply_text(
-                f"💳 *Balance (Hyperliquid)*\n\n"
-                f"Available: `${available:.2f}`\n"
-                f"In positions: `${locked:.2f}`\n"
-                f"Total equity: `${total:.2f}`",
+                "\n".join(lines),
                 parse_mode="Markdown",
             )
         except Exception as e:
