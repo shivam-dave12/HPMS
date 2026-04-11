@@ -437,20 +437,46 @@ class HPMSStrategy:
     def _get_equity(self) -> float:
         """
         Fetch available equity from Hyperliquid clearinghouse state.
-        Returns withdrawable balance (free margin for new positions).
+        Returns free margin available for new positions.
+
+        self._api is SyncHLAPI — its get_clearinghouse_state() is already a
+        sync method that internally dispatches to the HL-API-Loop thread.
+        Never wrap it in self._orders._run(): that expects a raw coroutine and
+        would raise "A coroutine object is required" if given a plain dict.
+
+        HL clearinghouseState field guide
+        ----------------------------------
+        withdrawable (top-level)          : best estimate of free margin;
+                                            accounts for cross + isolated PnL
+        crossMarginSummary.accountValue   : cross-margin equity only
+        crossMarginSummary.totalMarginUsed: margin locked in cross positions
+        marginSummary.accountValue        : whole-account equity (cross + isolated);
+                                            use only as last-resort fallback
         """
         try:
             wallet = config.get_settings().wallet_address
-            state = self._orders._run(
-                self._api.get_clearinghouse_state(wallet)
-            )
+            # Direct sync call — SyncHLAPI.get_clearinghouse_state returns dict
+            state = self._api.get_clearinghouse_state(wallet)
+            if not state:
+                return 0.0
+
+            # 1. Top-level withdrawable — most accurate free-margin figure on HL
+            top_withdrawable = float(state.get("withdrawable") or 0)
+            if top_withdrawable > 0:
+                return top_withdrawable
+
+            # 2. Cross-margin free equity (accountValue − marginUsed)
+            cross = state.get("crossMarginSummary", {})
+            cross_av = float(cross.get("accountValue") or 0)
+            cross_mu = float(cross.get("totalMarginUsed") or 0)
+            cross_free = cross_av - cross_mu
+            if cross_free > 0:
+                return cross_free
+
+            # 3. Whole-account equity as last resort (may include isolated margin)
             margin_summary = state.get("marginSummary", {})
-            # availableToTrade = equity minus margin used by open positions
-            available = float(margin_summary.get("availableToTrade", 0))
-            if available > 0:
-                return available
-            # Fallback to accountValue (total equity)
-            return float(margin_summary.get("accountValue", 0))
+            return float(margin_summary.get("accountValue") or 0)
+
         except Exception as e:
             logger.warning(f"Equity fetch error: {e}")
             return 0.0
