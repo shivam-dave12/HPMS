@@ -271,17 +271,35 @@ class HPMSStrategy:
             notional_est  = current_price * size
             margin_needed = notional_est / max(leverage, 1)
             if margin_needed > equity * 0.95:
-                logger.warning(
-                    "MARGIN_PREFLIGHT FAIL: need $%.2f for %.6f coins @ "
-                    "%.0fx but equity=$%.2f — skipping entry",
-                    margin_needed, size, leverage, equity,
-                )
-                self._push(
-                    f"⚠️ *Margin too low* — need `${margin_needed:.2f}` for `{size}` "
-                    f"@ `{leverage}x` lev, have `${equity:.2f}`\n"
-                    f"Use /leverage to raise leverage or deposit funds."
-                )
-                return signal
+                # compute_size already caps at 90% of leveraged equity, so this
+                # should rarely fire. When it does (e.g. rounding up), clamp the
+                # size down to the largest amount that fits before giving up.
+                import math as _math
+                max_notional  = equity * 0.90 * leverage
+                clamped_size  = _math.floor(
+                    (max_notional / current_price) * 1e5
+                ) / 1e5                              # floor at 5 dp (BTC default)
+                hl_min_notional = 10.0               # Hyperliquid $10 minimum order
+                if clamped_size * current_price >= hl_min_notional:
+                    logger.info(
+                        "MARGIN_PREFLIGHT: clamped size %.5f→%.5f "
+                        "(need $%.2f, have $%.2f equity @ %dx)",
+                        size, clamped_size, margin_needed, equity, leverage,
+                    )
+                    size          = clamped_size
+                    notional_est  = current_price * size
+                    margin_needed = notional_est / max(leverage, 1)
+                else:
+                    logger.warning(
+                        "MARGIN_PREFLIGHT FAIL: equity=$%.2f too small for "
+                        "HL $10 minimum even at %dx leverage — skipping entry",
+                        equity, leverage,
+                    )
+                    self._push(
+                        f"⚠️ *Margin too low* — equity `${equity:.2f}` cannot "
+                        f"meet HL's $10 minimum notional at `{leverage}x` leverage."
+                    )
+                    return signal
 
             # ── EXECUTE ENTRY ─────────────────────────────────────────────────
             result = self._orders.open_position(

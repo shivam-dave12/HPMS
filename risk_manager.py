@@ -273,6 +273,16 @@ class RiskManager:
                 notional = min(adjusted_risk * self._leverage, self._max_pos_usd)
                 coin_size = notional / price if price > 0 else 0.0
 
+            # ── Hard cap: notional must not exceed what equity+leverage can support ──
+            # The SL path above sizes purely by risk/SL-distance with no notional cap,
+            # so a tight SL on a small account can produce a notional that requires
+            # more margin than the account holds. Cap to 90% of max leveraged equity
+            # (10% headroom so the strategy preflight's 95% check always passes).
+            # Also bounded by RISK_MAX_POSITION_USD as a secondary ceiling.
+            if equity_usd > 0 and price > 0:
+                max_notional = min(equity_usd * self._leverage * 0.90, self._max_pos_usd)
+                coin_size = min(coin_size, max_notional / price)
+
             # Round to exchange precision
             coin_size = round(coin_size, sz_decimals)
 
