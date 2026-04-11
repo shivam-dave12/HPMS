@@ -60,6 +60,19 @@ SIGNAL_ACCELERATION_CHECK = True    # ALWAYS ON — second derivative confirmati
 TRADE_TP_PCT              = 0.0035  # MAX TP cap (actual TP proportional to predicted move)
 TRADE_SL_PCT              = 0.0018  # MAX SL cap (actual SL based on ATR)
 TRADE_MAX_HOLD_BARS       = 8       # base max hold — dynamically adjusted by ATR
+
+# ── Adaptive Hold Manager ────────────────────────────────────────────────
+# Replaces the naive bar-countdown with a multi-factor context-aware system.
+# The hold manager scores the position each bar and only forces exit when
+# continuing is net-negative across ALL factors.
+HOLD_ABSOLUTE_MAX_BARS       = 60      # hard ceiling — no trade ever exceeds this
+HOLD_MIN_BARS                = 3       # minimum hold before any evaluation
+HOLD_PROFIT_EXTEND_FACTOR    = 2.5     # multiply base hold when trade is profitable & trending
+HOLD_DRAWDOWN_FROM_PEAK_PCT  = 0.35    # exit if unrealized PnL retraces >35% from peak
+HOLD_FAVORABLE_MOMENTUM_BARS = 3       # lookback for momentum alignment check
+HOLD_TP_PROXIMITY_PCT        = 0.25    # within 25% of TP distance → never time-exit
+HOLD_SCORE_EXIT_THRESHOLD    = -0.50   # composite score below this → force exit
+HOLD_TRAILING_ACTIVATION_PCT = 0.40    # trailing logic activates after reaching 40% of TP
 TRADE_DH_DT_EXIT_SPIKE    = 0.25    # exit if |dH/dt| spikes above this (adaptive)
 TRADE_USE_BRACKET_ORDERS  = True    # use Delta bracket orders for atomic SL/TP
 TRADE_ORDER_TYPE           = "market"  # "market" | "limit"

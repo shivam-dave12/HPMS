@@ -334,10 +334,26 @@ class RiskManager:
     # ─── EXIT CONDITIONS ──────────────────────────────────────────────────────
 
     def check_exit_conditions(
-        self, dH_dt: float, dH_dt_spike: float, bars_held: int, max_hold: int
+        self, dH_dt: float, dH_dt_spike: float, bars_held: int, max_hold: int,
+        adaptive_hold_result: Optional[Dict] = None,
     ) -> Optional[str]:
-        if bars_held >= max_hold:
-            return f"MAX_HOLD: {bars_held} bars"
+        """
+        Check exit conditions.
+
+        If adaptive_hold_result is provided (from engine.evaluate_adaptive_hold),
+        use its multi-factor verdict instead of the naive bar countdown.
+        Falls back to legacy max_hold check if no adaptive result is given.
+        """
+        # ── Adaptive hold evaluation (preferred) ─────────────────────────
+        if adaptive_hold_result is not None:
+            if adaptive_hold_result.get("should_exit"):
+                return adaptive_hold_result.get("reason", "ADAPTIVE_HOLD_EXIT")
+        else:
+            # Legacy fallback
+            if bars_held >= max_hold:
+                return f"MAX_HOLD: {bars_held} bars"
+
+        # ── Energy spike (unchanged) ─────────────────────────────────────
         if abs(dH_dt) > dH_dt_spike:
             return f"ENERGY_SPIKE: |dH/dt|={abs(dH_dt):.4f} > {dH_dt_spike}"
         return None

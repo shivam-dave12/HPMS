@@ -73,6 +73,9 @@ class HPMSStrategy:
         # Dynamic hold: TP distance stored at entry for max_hold computation
         self._current_tp_distance: float = 0.0
 
+        # Adaptive hold: track unrealized best price for trailing peak logic
+        self._unrealized_peak_price: float = 0.0
+
         # Entry tracking for ROE% computation
         self._last_entry_size:  int   = 0
         self._last_entry_price: float = 0.0
@@ -139,6 +142,14 @@ class HPMSStrategy:
                 if close_reason:
                     return None
 
+                # Track unrealized peak price for trailing logic
+                if self._orders._position_side == "long":
+                    self._unrealized_peak_price = max(self._unrealized_peak_price, current_price)
+                else:
+                    if self._unrealized_peak_price == 0:
+                        self._unrealized_peak_price = current_price
+                    self._unrealized_peak_price = min(self._unrealized_peak_price, current_price)
+
                 signal = self._engine.on_bar_close(closes, volumes, timestamp)
                 if signal:
                     # KDE grace period: skip energy spike check for 2 bars after
@@ -152,22 +163,37 @@ class HPMSStrategy:
                     config_spike = getattr(self._config, "TRADE_DH_DT_EXIT_SPIKE", 0.15)
                     exit_spike = max(adaptive_spike, config_spike)
 
-                    # Dynamic max hold based on ATR and TP distance
-                    dynamic_max_hold = self._engine.get_dynamic_max_hold(
-                        self._current_tp_distance, current_price
+                    # ── Adaptive hold evaluation ─────────────────────────────
+                    adaptive_hold = self._engine.evaluate_adaptive_hold(
+                        side=self._orders._position_side,
+                        entry_price=self._orders.entry_price,
+                        current_price=current_price,
+                        tp_price=self._orders._tp_price,
+                        sl_price=self._orders._sl_price,
+                        bars_held=self._orders.bars_held,
+                        unrealized_peak_price=self._unrealized_peak_price,
+                        config=self._config,
                     )
 
                     exit_reason = self._risk.check_exit_conditions(
                         dH_dt=signal.dH_dt,
                         dH_dt_spike=exit_spike,
                         bars_held=self._orders.bars_held,
-                        max_hold=dynamic_max_hold,
+                        max_hold=0,  # unused when adaptive_hold_result is provided
+                        adaptive_hold_result=adaptive_hold,
                     )
                     if exit_reason:
-                        # MAX_HOLD always exits immediately
-                        if exit_reason.startswith("MAX_HOLD"):
+                        # Adaptive hold exits and legacy MAX_HOLD exit immediately
+                        if any(tag in exit_reason for tag in (
+                            "ADAPTIVE_MAX_HOLD", "HOLD_SCORE_EXIT",
+                            "TRAILING_PEAK_DD", "ABSOLUTE_MAX", "LEGACY_MAX_HOLD",
+                            "MAX_HOLD",
+                        )):
                             self._consecutive_energy_spikes = 0
-                            logger.info(f"Force-exit triggered: {exit_reason}")
+                            logger.info(
+                                f"Adaptive exit triggered: {exit_reason} "
+                                f"(score={adaptive_hold.get('score', 'N/A')})"
+                            )
                             self._orders.close_position(
                                 reason=exit_reason, current_price=current_price
                             )
@@ -310,6 +336,7 @@ class HPMSStrategy:
                 self._risk.on_trade_open(side, actual_entry, size, margin_used)
                 self._current_tp_distance = abs(signal.tp_price - actual_entry)
                 self._consecutive_energy_spikes = 0
+                self._unrealized_peak_price = actual_entry  # reset peak tracker
                 self._last_entry_size  = size
                 self._last_entry_price = actual_entry
                 self._last_margin_used = margin_used
