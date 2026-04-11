@@ -381,7 +381,7 @@ class TelegramBot:
             halt_icon = "🔴" if risk.get("is_halted") else "🟢"
             pnl_icon  = "💰" if risk.get("daily_pnl", 0) >= 0 else "🔻"
 
-            pos_txt = (f"📈 {pos['side'].upper()} {pos['size']} @ ${pos['entry_price']:,.1f}"
+            pos_txt = (f"📈 {pos['side'].upper()} {pos['size']}c @ ${pos['entry_price']:,.1f}"
                        if pos.get("in_position") else "⬜ Flat")
 
             return (
@@ -496,7 +496,7 @@ class TelegramBot:
             dm_ok = self._data.is_ready if self._data else False
 
             pos_txt = (
-                f"📈 {pos['side'].upper()} {pos['size']} @ `${pos['entry_price']:,.1f}` "
+                f"📈 {pos['side'].upper()} {pos['size']}c @ `${pos['entry_price']:,.1f}` "
                 f"({pos['bars_held']} bars)"
                 if pos.get("in_position") else "⬜ Flat"
             )
@@ -678,7 +678,7 @@ class TelegramBot:
             if self._orders and self._orders.is_in_position:
                 pos = self._orders.get_status()
                 lines.append(
-                    f"  📍 In position: {pos['side'].upper()} {pos['size']} "
+                    f"  📍 In position: {pos['side'].upper()} {pos['size']}c "
                     f"@ `${pos['entry_price']:,.1f}` ({pos['bars_held']} bars)"
                 )
             elif sig and sig.signal_type.name != "FLAT":
@@ -1102,86 +1102,14 @@ class TelegramBot:
     async def _cmd_balance(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not await self._guard(update):
             return
-        try:
-            import config as _cfg
-            wallet = _cfg.get_settings().wallet_address
-
-            # ── Perp clearinghouse state ──────────────────────────────────────
-            state = self._api.get_clearinghouse_state(wallet) if self._api else {}
-
-            def _sf(v):
-                try:
-                    return float(v) if v is not None else 0.0
-                except (TypeError, ValueError):
-                    return 0.0
-
-            ms  = state.get("marginSummary",      {}) or {}
-            cms = state.get("crossMarginSummary",  {}) or {}
-
-            # Correct Hyperliquid field names (NO "availableToTrade" field exists):
-            #   marginSummary.accountValue    = total NAV (cross + isolated + unrealisedPnl)
-            #   marginSummary.totalRawUsd     = deposited USDC (ignores unrealisedPnl)
-            #   marginSummary.totalMarginUsed = margin locked in ALL positions
-            #   crossMarginSummary.accountValue = cross-margin NAV only
-            #   withdrawable                  = free USDC (0 when locked in positions)
-            total_nav    = _sf(ms.get("accountValue"))
-            total_raw    = _sf(ms.get("totalRawUsd"))
-            margin_used  = _sf(ms.get("totalMarginUsed"))
-            cross_nav    = _sf(cms.get("accountValue"))
-            cross_margin = _sf(cms.get("totalMarginUsed"))
-            withdrawable = _sf(state.get("withdrawable"))
-
-            # Count open positions
-            positions = state.get("assetPositions", [])
-            n_pos = len([p for p in positions
-                         if abs(_sf((p.get("position") or p).get("szi", 0))) > 1e-12])
-
-            # ── Spot USDC check (funds not yet transferred to perp) ───────────
-            spot_usdc = 0.0
-            if self._api and hasattr(self._api, "get_spot_clearinghouse_state"):
-                try:
-                    spot = self._api.get_spot_clearinghouse_state(wallet)
-                    for b in (spot.get("balances", []) if isinstance(spot, dict) else []):
-                        if b.get("coin") == "USDC":
-                            spot_usdc = _sf(b.get("total"))
-                except Exception:
-                    pass
-
-            # Best single "available" figure:
-            # withdrawable = free cross margin (correct for trading)
-            # If 0 due to open positions, show cross_nav - cross_margin instead
-            free_margin = withdrawable
-            if free_margin <= 0 and cross_nav > 0:
-                free_margin = max(0.0, cross_nav - cross_margin)
-
-            lines = [
-                "💳 *Balance — Hyperliquid Perp*\n",
-                f"Total equity:   `${total_nav:.4f}`",
-                f"Raw USDC dep:   `${total_raw:.4f}`",
-                f"Margin locked:  `${margin_used:.4f}`",
-                f"Withdrawable:   `${withdrawable:.4f}`",
-                f"Free margin:    `${free_margin:.4f}`",
-                f"Cross NAV:      `${cross_nav:.4f}`",
-                f"Open positions: `{n_pos}`",
-            ]
-
-            if spot_usdc > 0:
-                lines.append(
-                    f"\n⚠️ Spot USDC: `${spot_usdc:.4f}` _(not in perp — transfer at app.hyperliquid.xyz)_"
-                )
-            elif total_nav <= 0 and total_raw <= 0:
-                lines.append(
-                    "\n❌ *All perp fields are zero.*\n"
-                    "Check: (1) HL\\_WALLET\\_ADDRESS is your master account, "
-                    "(2) USDC is deposited to the perp account at app.hyperliquid.xyz"
-                )
-
-            await update.message.reply_text(
-                "\n".join(lines),
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            await update.message.reply_text(f"❌ Balance error: {e}")
+        b = self._api.get_balance("USD") if self._api else {}
+        await update.message.reply_text(
+            f"💳 *Balance*\n\n"
+            f"Available: `${b.get('available', 0):.2f}`\n"
+            f"Locked:    `${b.get('locked', 0):.2f}`\n"
+            f"Total:     `${(b.get('available', 0) + b.get('locked', 0)):.2f}`",
+            parse_mode="Markdown",
+        )
 
     async def _cmd_position(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not await self._guard(update):
@@ -1198,23 +1126,25 @@ class TelegramBot:
             diff = price - p["entry_price"]
             if p["side"] == "short":
                 diff = -diff
-            lev  = getattr(cfg, "RISK_LEVERAGE", 50) if cfg else 50
+            cv   = getattr(cfg, "TRADE_CONTRACT_VALUE", 0.001) if cfg else 0.001
+            lev  = getattr(cfg, "RISK_LEVERAGE", 10) if cfg else 10
             size = p["size"]
 
-            notional  = p["entry_price"] * size
+            notional  = p["entry_price"] * cv * size
             margin    = notional / max(lev, 1)
-            gross_pnl = diff * size
+            gross_pnl = diff * cv * size
 
             # Use the ACTUAL entry fee already paid (recorded from API at entry)
             entry_fee_paid = getattr(self._orders, "_entry_fee_usd", 0.0)
+            # Exit fee is not yet known — it will be settled by the exchange on close
             net_pnl_so_far = gross_pnl - entry_fee_paid
             roe_pct = (net_pnl_so_far / margin * 100) if margin > 0 else 0.0
 
             pnl_block = (
                 f"\n*Unrealised P&L:*\n"
                 f"  Gross: `${gross_pnl:+.4f}`\n"
-                f"  Entry fee paid: `$-{entry_fee_paid:.4f}` _(from exchange)_\n"
-                f"  Exit fee: _(charged on close)_\n"
+                f"  Entry fee paid: `$-{entry_fee_paid:.4f}` _(actual, from API)_\n"
+                f"  Exit fee: _(charged by exchange on close)_\n"
                 f"  *Net (excl. exit fee): `${net_pnl_so_far:+.4f}`*\n"
                 f"  ROE: `{roe_pct:+.2f}%` on `${margin:.2f}` margin"
             )
@@ -1296,7 +1226,7 @@ class TelegramBot:
         pos = self._orders.get_status() if self._orders else {}
         pos_note = (
             f"\n⚠️ Open position remains: {pos['side'].upper()} "
-            f"{pos['size']} @ `${pos['entry_price']:,.1f}`"
+            f"{pos['size']}c @ `${pos['entry_price']:,.1f}`"
             if pos.get("in_position") else "\nNo open positions."
         )
         await update.message.reply_text(
@@ -1350,7 +1280,7 @@ class TelegramBot:
         rs  = self._risk.get_status()
         pos = self._orders.get_status() if self._orders else {}
         pos_note = (
-            f"\n⚠️ Open position: {pos['side'].upper()} {pos['size']} "
+            f"\n⚠️ Open position: {pos['side'].upper()} {pos['size']}c "
             f"@ `${pos['entry_price']:,.1f}` ({pos['bars_held']} bars)"
             if pos.get("in_position") else "\nNo open position."
         )
@@ -1665,10 +1595,15 @@ class TelegramBot:
         lines = [f"⚙️ Setting leverage to *{val}x*…"]
 
         if self._api:
-            symbol = getattr(self._config, "HL_SYMBOL", "BTC") if self._config else "BTC"
+            symbol = getattr(self._config, "DELTA_SYMBOL", "BTCUSD") if self._config else "BTCUSD"
             try:
-                self._api.set_leverage(coin=symbol, leverage=val)
-                lines.append(f"✅ Exchange confirmed `{val}x`")
+                result = self._api.set_leverage(symbol=symbol, leverage=val)
+                if result.get("success"):
+                    lines.append(f"✅ Exchange confirmed `{val}x`")
+                else:
+                    lines.append(f"❌ Exchange rejected: `{result.get('error', 'unknown')}`")
+                    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+                    return False
             except Exception as e:
                 lines.append(f"❌ Exchange call failed: `{e}`")
                 await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -1695,9 +1630,13 @@ class TelegramBot:
                         if self._risk else "?")
             cfg_lev  = getattr(self._config, "RISK_LEVERAGE", "?") if self._config else "?"
             exch_lev = "?"
-            # HL doesn't have a get_leverage endpoint — leverage is per-position
-            # Show config value as the effective leverage
-            exch_lev = cfg_lev
+            if self._api and self._orders and self._orders._product_id:
+                try:
+                    r = self._api.get_leverage(self._orders._product_id)
+                    if r.get("success"):
+                        exch_lev = r.get("result", {}).get("leverage", "?")
+                except Exception:
+                    pass
             await update.message.reply_text(
                 f"📊 *Current Leverage*\n\n"
                 f"Exchange:    `{exch_lev}x`\n"

@@ -1,19 +1,22 @@
 """
-main.py — HPMS System Orchestrator (Hyperliquid)
-===================================================
+main.py — HPMS System Orchestrator
+=====================================
 Initializes all components and runs the main loop:
-  HLDataManager -> HPMSEngine -> Strategy -> OrderManager -> TelegramBot
+  DataManager -> HPMSEngine -> Strategy -> OrderManager -> TelegramBot
 
 Usage:
-  python main.py              # live mode (mainnet)
+  python main.py              # live mode
   python main.py --testnet    # testnet mode
   python main.py --dry-run    # signal-only mode (no orders)
+
+NOTE: All conditional strings are pre-computed OUTSIDE f-strings to maintain
+compatibility with Python 3.6 - 3.11 (f-string expressions cannot include
+backslashes in those versions).
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import logging
 import signal
 import sys
@@ -32,8 +35,8 @@ from telegram_bot import TelegramBot
 from logger_core import elog
 from state import STATE
 
-from core.api_client import HyperliquidClient
-from hl_data_manager import HLDataManager
+from exchanges.delta.api import DeltaAPI
+from exchanges.delta.data_manager import DeltaDataManager
 
 logger = logging.getLogger("hpms")
 
@@ -43,27 +46,32 @@ logger = logging.getLogger("hpms")
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class _ColoredFormatter(logging.Formatter):
-    _RESET = "\033[0m"
-    _BOLD  = "\033[1m"
-    _DIM   = "\033[2m"
+    """
+    Pretty, color-coded terminal formatter.
+    Strips the package prefix from logger names so the column stays narrow.
+    """
+    _RESET  = "\033[0m"
+    _BOLD   = "\033[1m"
+    _DIM    = "\033[2m"
     _LEVELS = {
-        logging.DEBUG:    ("\033[36m",  "DBG"),
-        logging.INFO:     ("\033[32m",  "INF"),
-        logging.WARNING:  ("\033[33m",  "WRN"),
-        logging.ERROR:    ("\033[31m",  "ERR"),
-        logging.CRITICAL: ("\033[35m",  "CRT"),
+        logging.DEBUG:    ("\033[36m",  "DBG"),   # cyan
+        logging.INFO:     ("\033[32m",  "INF"),   # green
+        logging.WARNING:  ("\033[33m",  "WRN"),   # yellow
+        logging.ERROR:    ("\033[31m",  "ERR"),   # red
+        logging.CRITICAL: ("\033[35m",  "CRT"),   # magenta
     }
+    # Short display names for known loggers
     _NAME_MAP = {
-        "hpms":            "HPMS",
-        "strategy":        "STRAT",
-        "hpms_engine":     "ENGINE",
-        "risk_manager":    "RISK",
-        "order_manager":   "ORDER",
-        "telegram_bot":    "TG",
-        "logger_core":     "ELOG",
-        "hl_data_manager": "DATA",
-        "core.api_client": "HLAPI",
-        "core.ws_client":  "HLWS",
+        "hpms":                       "HPMS",
+        "strategy":                   "STRAT",
+        "hpms_engine":                "ENGINE",
+        "risk_manager":               "RISK",
+        "order_manager":              "ORDER",
+        "telegram_bot":               "TG",
+        "logger_core":                "ELOG",
+        "exchanges.delta.api":        "DAPI",
+        "exchanges.delta.data_manager": "DATA",
+        "exchanges.delta.websocket":  "WS",
     }
 
     def format(self, record: logging.LogRecord) -> str:
@@ -77,6 +85,7 @@ class _ColoredFormatter(logging.Formatter):
             f"{self._DIM}{short_name:<8}{self._RESET} "
         )
         msg = record.getMessage()
+        # Indent continuation lines
         msg_indented = msg.replace("\n", "\n" + " " * 24)
         if record.exc_info:
             msg_indented += "\n" + self.formatException(record.exc_info)
@@ -89,81 +98,25 @@ def setup_logging():
 
     ch = logging.StreamHandler()
     ch.setFormatter(_ColoredFormatter())
-    ch.setLevel(logging.DEBUG)
+    ch.setLevel(logging.DEBUG)          # handler must not re-filter below root
     root.addHandler(ch)
 
+    # ── hpms.elog: ALWAYS at DEBUG regardless of LOG_LEVEL ───────────────────
+    # elog emits structured JSON for every engine calculation (ENGINE_PHASE_STATE,
+    # ENGINE_CRITERIA, ENGINE_TRAJECTORY, ENGINE_KDE_REBUILD, ENGINE_SIGNAL,
+    # ENGINE_SKIP).  Without an explicit DEBUG level on this logger the
+    # isEnabledFor(DEBUG) guard inside _ELog.log() evaluates False at INFO,
+    # silently dropping all per-bar diagnostics.
     logging.getLogger("hpms.elog").setLevel(logging.DEBUG)
 
-    # Silence noisy third-party loggers
-    for name in ("httpx", "httpcore", "telegram", "telegram.ext",
-                 "apscheduler", "websocket", "websockets"):
-        logging.getLogger(name).setLevel(logging.WARNING)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SYNC API WRAPPER
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class SyncHLAPI:
-    """
-    Thin sync wrapper around the async HyperliquidClient.
-    Runs an asyncio event loop in a background thread.
-    Exposes sync methods that strategy.py and telegram_bot.py can call.
-    """
-
-    def __init__(self):
-        self._loop = asyncio.new_event_loop()
-        self._thread = threading.Thread(
-            target=self._loop.run_forever, daemon=True, name="HL-API-Loop"
-        )
-        self._thread.start()
-        time.sleep(0.2)
-        self._client: HyperliquidClient = self._run(self._create())
-
-    async def _create(self):
-        return HyperliquidClient()
-
-    def _run(self, coro, timeout=30):
-        return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout=timeout)
-
-    @property
-    def loop(self) -> asyncio.AbstractEventLoop:
-        return self._loop
-
-    @property
-    def client(self) -> HyperliquidClient:
-        return self._client
-
-    # ── Convenience sync methods (used by telegram_bot, strategy) ─────────
-
-    def get_clearinghouse_state(self, wallet: str) -> dict:
-        return self._run(self._client.get_clearinghouse_state(wallet))
-
-    def get_spot_clearinghouse_state(self, wallet: str) -> dict:
-        """Spot account balance (funds not yet transferred to perp)."""
-        return self._run(self._client.get_spot_clearinghouse_state(wallet))
-
-    def get_equity(self, wallet: str) -> float:
-        """
-        Full equity waterfall with spot USDC fallback.
-        Priority: marginSummary.accountValue → crossMarginSummary.accountValue
-                  → withdrawable → totalRawUsd → spot USDC → API wallet cross-check.
-        Always use this instead of get_clearinghouse_state() + manual parsing.
-        """
-        return self._run(self._client.get_equity(wallet))
-
-    def get_all_mids(self) -> dict:
-        return self._run(self._client.get_all_mids())
-
-    def get_open_orders(self, wallet: str) -> list:
-        return self._run(self._client.get_open_orders(wallet))
-
-    def set_leverage(self, coin: str, leverage: int, **kwargs) -> None:
-        self._run(self._client.set_leverage(coin, leverage))
-
-    def close(self):
-        self._run(self._client.close(), timeout=5)
-        self._loop.call_soon_threadsafe(self._loop.stop)
+    # ── Silence noisy third-party loggers ────────────────────────────────────
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("telegram").setLevel(logging.WARNING)
+    logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+    logging.getLogger("apscheduler").setLevel(logging.WARNING)
+    logging.getLogger("websocket").setLevel(logging.WARNING)
+    logging.getLogger("websockets").setLevel(logging.WARNING)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -171,24 +124,30 @@ class SyncHLAPI:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class DryRunAPI:
-    """Simulates write calls without touching the exchange. Reads pass through."""
+    """Simulates API calls without touching the exchange."""
 
-    def __init__(self, real_api: SyncHLAPI):
+    def __init__(self, real_api):
         self._real = real_api
 
     def __getattr__(self, name):
         _READ_METHODS = {
-            "get_clearinghouse_state", "get_all_mids", "get_open_orders",
-            "get_meta", "loop", "client",
+            "get_ticker", "get_tickers", "get_orderbook", "get_candles",
+            "get_balance", "get_positions", "get_position", "get_open_orders",
+            "get_product_id", "prefetch_product_ids", "get_server_time",
+            "get_wallet_balances", "get_products", "get_product",
+            "get_recent_trades", "get_funding_rate", "get_mark_price",
+            "self_test", "_symbol_to_product_id",
         }
         if name in _READ_METHODS:
             return getattr(self._real, name)
 
         def fake(*args, **kwargs):
             elog.log("SYSTEM_START", component="DryRunAPI", call=name)
-            return {"status": "ok", "response": {"type": "order", "data": {
-                "statuses": [{"filled": {"avgPx": "0", "oid": 0, "totalFee": "0"}}]
-            }}}
+            return {
+                "success": True,
+                "result":  {"order_id": "dry_" + str(int(time.time() * 1000)), "status": "simulated"},
+                "error":   None,
+            }
         return fake
 
 
@@ -197,11 +156,14 @@ class DryRunAPI:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class HPMSRunner:
+    """Main application runner."""
+
     def __init__(self, dry_run=False, testnet=False):
         self._dry_run  = dry_run
-        self._testnet  = testnet or not config.HL_MAINNET
+        self._testnet  = testnet or config.DELTA_TESTNET
         self._shutdown = threading.Event()
 
+        # Update global state singleton
         STATE.dry_run = dry_run
         STATE.testnet = self._testnet
         STATE.mode = "DRY-RUN" if dry_run else "LIVE"
@@ -215,41 +177,50 @@ class HPMSRunner:
         self._telegram = None
 
     def start(self):
+        # Pre-compute all display strings OUTSIDE f-strings.
+        # This eliminates the "f-string expression part cannot include a backslash"
+        # SyntaxError that occurs on Python 3.6 - 3.11 when ternary operators
+        # or string literals containing backslashes appear inside {}.
         mode_str = "DRY-RUN" if self._dry_run else "LIVE"
         net_str  = "TESTNET" if self._testnet  else "MAINNET"
-        symbol   = config.HL_SYMBOL
 
         elog.log("SYSTEM_START", component="HPMSRunner",
-                 mode=mode_str, network=net_str, symbol=symbol)
+                 mode=mode_str, network=net_str, symbol=config.DELTA_SYMBOL)
 
         logger.info("=" * 60)
         logger.info("  HPMS - Hamiltonian Phase-Space Micro-Scalping")
-        logger.info("  Exchange: Hyperliquid")
         logger.info("  Mode:    " + mode_str)
         logger.info("  Network: " + net_str)
-        logger.info("  Symbol:  " + symbol)
+        logger.info("  Symbol:  " + config.DELTA_SYMBOL)
         logger.info("=" * 60)
 
-        # ── 0. Validate config ────────────────────────────────────────────────
-        if not config.HL_PRIVATE_KEY:
-            logger.error("HL_PRIVATE_KEY is empty — cannot sign orders")
-        if not config.HL_WALLET_ADDRESS:
-            logger.error("HL_WALLET_ADDRESS is empty — cannot query balance")
+        # ── 0. Validate critical config ───────────────────────────────────────
         if not config.TELEGRAM_BOT_TOKEN:
-            logger.error("TELEGRAM_BOT_TOKEN is empty")
+            elog.error("SYSTEM_START", error="TELEGRAM_BOT_TOKEN missing", component="config")
+            logger.error("TELEGRAM NOT CONFIGURED: TELEGRAM_BOT_TOKEN is empty")
+        if not config.TELEGRAM_CHAT_ID:
+            elog.error("SYSTEM_START", error="TELEGRAM_CHAT_ID missing", component="config")
+            logger.error("TELEGRAM NOT CONFIGURED: TELEGRAM_CHAT_ID is empty")
 
         # ── 1. Exchange API ───────────────────────────────────────────────────
-        real_api = SyncHLAPI()
+        if self._testnet:
+            config.DELTA_TESTNET = True
+
+        real_api = DeltaAPI(
+            api_key=config.DELTA_API_KEY,
+            secret_key=config.DELTA_SECRET_KEY,
+            testnet=config.DELTA_TESTNET,
+        )
         self._api = DryRunAPI(real_api) if self._dry_run else real_api
-        elog.log("SYSTEM_START", component="HyperliquidAPI",
-                 testnet=self._testnet, dry_run=self._dry_run)
+        elog.log("SYSTEM_START", component="DeltaAPI",
+                 testnet=config.DELTA_TESTNET, dry_run=self._dry_run)
 
         # ── 2. Data Manager ──────────────────────────────────────────────────
-        self._data_mgr = HLDataManager()
+        self._data_mgr = DeltaDataManager()
         if not self._data_mgr.start():
             elog.error("SYSTEM_START", error="DataManager failed to start")
             return False
-        elog.log("SYSTEM_START", component="HLDataManager", status="ready")
+        elog.log("SYSTEM_START", component="DeltaDataManager", status="ready")
 
         # ── 3. HPMS Engine ────────────────────────────────────────────────────
         self._engine = HPMSEngine(
@@ -277,6 +248,7 @@ class HPMSRunner:
         # ── 4. Risk Manager ──────────────────────────────────────────────────
         self._risk = RiskManager(
             max_position_usd=config.RISK_MAX_POSITION_USD,
+            max_position_contracts=config.RISK_MAX_POSITION_CONTRACTS,
             leverage=config.RISK_LEVERAGE,
             max_daily_loss_usd=config.RISK_MAX_DAILY_LOSS_USD,
             max_daily_trades=config.RISK_MAX_DAILY_TRADES,
@@ -284,20 +256,18 @@ class HPMSRunner:
             cooldown_seconds=config.RISK_COOLDOWN_SECONDS,
             max_drawdown_pct=config.RISK_MAX_DRAWDOWN_PCT,
             equity_pct_per_trade=config.RISK_EQUITY_PCT_PER_TRADE,
-            auto_resume_seconds=config.RISK_AUTO_RESUME_SECONDS,
-            soft_loss_weight=config.RISK_SOFT_LOSS_WEIGHT,
+            auto_resume_seconds=getattr(config, "RISK_AUTO_RESUME_SECONDS", 300.0),
+            soft_loss_weight=getattr(config, "RISK_SOFT_LOSS_WEIGHT", 0.5),
         )
 
         # ── 5. Order Manager ─────────────────────────────────────────────────
-        # Get the underlying async client for order execution
-        api_client = self._api.client if not self._dry_run else real_api.client
         self._orders = OrderManager(
-            api=api_client,
-            symbol=config.HL_SYMBOL,
+            api=self._api,
+            symbol=config.DELTA_SYMBOL,
+            contract_value=getattr(config, "TRADE_CONTRACT_VALUE", 0.001),
         )
-        # Wire the async event loop so OrderManager can call async methods
-        api_loop = real_api.loop
-        self._orders.set_event_loop(api_loop)
+        # Wire real-time fill/order events from WebSocket into OrderManager
+        self._orders.register_with_data_manager(self._data_mgr)
 
         # ── 6. Telegram Bot ──────────────────────────────────────────────────
         self._telegram = TelegramBot(
@@ -327,7 +297,7 @@ class HPMSRunner:
 
         # ── 8. Set leverage on exchange ───────────────────────────────────────
         try:
-            self._api.set_leverage(coin=config.HL_SYMBOL, leverage=config.RISK_LEVERAGE)
+            self._api.set_leverage(symbol=config.DELTA_SYMBOL, leverage=config.RISK_LEVERAGE)
             elog.log("RISK_PARAM_UPDATE", key="leverage",
                      value=config.RISK_LEVERAGE, source="startup")
         except Exception as e:
@@ -336,19 +306,19 @@ class HPMSRunner:
         # ── 9. Start Telegram ─────────────────────────────────────────────────
         self._telegram.start()
 
-        # ── 10. Start strategy ────────────────────────────────────────────────
+        # ── 10. Start strategy (sets STATE.trading_enabled = True) ────────────
         self._strategy.start()
 
         elog.log("SYSTEM_START", component="HPMSRunner", status="fully_operational")
 
+        # Startup notification — built with concatenation, no f-string ternaries
         self._telegram.send_message(
-            "*HPMS System Online (Hyperliquid)*\n\n"
+            "*HPMS System Online*\n\n"
             "Mode: " + mode_str + "\n"
             "Network: " + net_str + "\n"
-            "Symbol: " + config.HL_SYMBOL + "\n"
+            "Symbol: " + config.DELTA_SYMBOL + "\n"
             "Leverage: " + str(config.RISK_LEVERAGE) + "x\n"
             "Integrator: " + str(config.HPMS_INTEGRATOR) + "\n"
-            "Taker fee: " + str(config.FEE_TAKER_RATE * 100) + "%\n"
             "tau=" + str(config.HPMS_TAU) +
             " lookback=" + str(config.HPMS_LOOKBACK) +
             " horizon=" + str(config.HPMS_PREDICTION_HORIZON)
@@ -357,32 +327,83 @@ class HPMSRunner:
         self._main_loop()
         return True
 
-    # ─── WARM START ───────────────────────────────────────────────────────────
+    # ─── MAIN LOOP ────────────────────────────────────────────────────────────
 
     def _warm_start(self):
+        """
+        Feed REST warmup candles into the engine in a rolling window so the
+        engine builds a full H-EMA history (needs ≥2 bars) before going live.
+
+        Also discovers the real timestamp key used by the DataManager
+        (some implementations use "t", others use "timestamp", "close_time",
+        etc.) so the main loop's bar-detection works correctly.
+
+        Returns (last_ts_value, ts_key) so the main loop can detect new bars.
+        """
         try:
             candles = self._data_mgr.get_candles("1m", limit=300)
             if not candles:
-                logger.warning("[WARM_START] No candles — engine will wait for first live bar")
+                logger.warning("[WARM_START] DataManager returned no candles — "
+                               "engine will wait for first live bar")
                 return
 
-            n = len(candles)
-            start = max(1, n - 30)
+            # ── Auto-detect timestamp key ─────────────────────────────────────
+            # Try common field names; pick the one with the largest non-zero value.
+            ts_candidates = ["t", "timestamp", "close_time", "time",
+                             "open_time", "ts", "closeTime"]
+            last_c  = candles[-1]
+            ts_key  = "t"
+            ts_best = 0
+            for k in ts_candidates:
+                v = last_c.get(k, 0)
+                try:
+                    v = float(v)
+                except Exception:
+                    continue
+                if v > ts_best:
+                    ts_best = v
+                    ts_key  = k
+            logger.info("[WARM_START] timestamp key detected: '%s' → %s", ts_key, ts_best)
+
+            # ── Rolling warm-up: feed candles one window at a time ────────────
+            # The engine needs on_bar_close called with the FULL slice ending at
+            # bar N, not just the last bar.  We call it once per bar in the
+            # second half of the warmup so the H-EMA history fills up properly.
+            n       = len(candles)
+            # Process the last 30 bars as rolling windows so dH/dt history builds
+            start   = max(1, n - 30)
             logger.info(
-                f"[WARM_START] replaying bars {start}–{n} of {n} candles "
-                f"(last_price={candles[-1].get('c', 0):.1f})"
+                "[WARM_START] replaying bars %d–%d of %d warmup candles "
+                "(ts_key='%s' last_price=%.1f)",
+                start, n, n, ts_key, last_c.get("c", 0),
             )
             for i in range(start, n + 1):
                 self._strategy.on_bar_close(candles[:i])
 
-            logger.info(f"[WARM_START] done — engine primed over {n - start + 1} bar replay")
+            last_ts = float(last_c.get(ts_key, 0))
+            logger.info(
+                "[WARM_START] done — engine primed over %d bar replay. "
+                "last_ts=%.0f  main loop now watching for ts > %.0f",
+                n - start + 1, last_ts, last_ts,
+            )
+            return
 
         except Exception as e:
-            logger.error(f"[WARM_START] exception: {e}", exc_info=True)
-
-    # ─── MAIN LOOP ────────────────────────────────────────────────────────────
+            logger.error("[WARM_START] exception: %s", e, exc_info=True)
+            return
 
     def _main_loop(self):
+        """
+        Polls DataManager for new 1m candles and feeds them to the strategy.
+        Uses TIMESTAMP-based bar detection — immune to deque maxlen rollover.
+
+        IMPORTANT: get_candles() may return an empty list during the first
+        ~60 s if the DataManager's live buffer is separate from the REST
+        warmup buffer and no WebSocket bar has closed yet.  The warm_start()
+        call above pre-populates the engine from REST data so the system is
+        active from second 0.
+        """
+        # Prime the engine with REST warmup data immediately
         self._strategy.set_warming_up(True)
         self._warm_start()
         self._strategy.set_warming_up(False)
@@ -391,36 +412,43 @@ class HPMSRunner:
         last_health_check     = time.time()
         poll_n                = 0
 
+        # Candle timestamps from this DataManager are always 0 (timestamp field
+        # absent or zero in the normalised candle dict).  Use minute-boundary
+        # wall-clock detection instead: fire on_bar_close once per calendar minute.
+        # This is drift-free and works regardless of the exchange API format.
         last_bar_minute = int(time.time() / 60)
         logger.info(
-            f"[LOOP] starting live poll — minute-boundary bar detection "
-            f"(current minute={last_bar_minute})"
+            "[LOOP] starting live poll — minute-boundary bar detection "
+            "(current minute=%d)", last_bar_minute,
         )
 
         while not self._shutdown.is_set():
             try:
                 poll_n += 1
-
-                # Refresh latest candle data from HL REST
-                self._data_mgr.refresh_latest_candles()
-
                 candles = self._data_mgr.get_candles("1m", limit=300)
 
                 if not candles:
                     if poll_n % 20 == 1:
-                        logger.debug(f"[LOOP] poll #{poll_n} — no candles yet")
+                        logger.debug(
+                            "[LOOP] poll #%d — DataManager returned no candles "
+                            "(waiting for WS data)", poll_n
+                        )
                 else:
                     current_minute = int(time.time() / 60)
-                    last_close = candles[-1].get("c", 0)
+                    last_close     = candles[-1].get("c", 0)
 
                     if current_minute > last_bar_minute:
+                        # Brief pause to let the WebSocket is_closed=True event for
+                        # the just-finished bar arrive and finalize candles[-1] before
+                        # we snapshot the deque.  WS latency is <100ms; 200ms is a
+                        # safe margin that still leaves >99% of the minute available
+                        # for signal computation and order placement (Bug 6 fix).
                         time.sleep(0.20)
-                        self._data_mgr.refresh_latest_candles()
                         candles = self._data_mgr.get_candles("1m", limit=300)
                         logger.info(
-                            f"[LOOP] ▶ new 1m bar | minute={current_minute} "
-                            f"close={last_close:.1f} candles={len(candles)} "
-                            f"poll=#{poll_n}"
+                            "[LOOP] ▶ new 1m bar | minute=%d close=%.1f "
+                            "candles=%d poll=#%d",
+                            current_minute, last_close, len(candles), poll_n,
                         )
                         last_bar_minute = current_minute
                         self._strategy.on_bar_close(candles)
@@ -428,8 +456,9 @@ class HPMSRunner:
                         if poll_n % 20 == 1:
                             secs_to_next = 60 - (time.time() % 60)
                             logger.debug(
-                                f"[LOOP] poll #{poll_n} — waiting for bar close "
-                                f"({secs_to_next:.0f}s remaining) close={last_close:.1f}"
+                                "[LOOP] poll #%d — waiting for bar close "
+                                "(%.0fs remaining) close=%.1f",
+                                poll_n, secs_to_next, last_close,
                             )
 
                 if time.time() - last_health_check > health_check_interval:
@@ -439,19 +468,20 @@ class HPMSRunner:
                 self._shutdown.wait(0.5)
 
             except Exception as e:
-                logger.error(f"[LOOP] unhandled exception (retry in 5s): {e}", exc_info=True)
+                logger.error("[LOOP] unhandled exception (will retry in 5s): %s",
+                             e, exc_info=True)
                 elog.error("SYSTEM_MAIN_LOOP", error=str(e), stage="main_loop")
                 time.sleep(5)
 
     def _health_check(self):
         if not self._data_mgr.is_ready:
             elog.warn("SYSTEM_HEALTH", issue="DataManager_not_ready")
-            self._telegram.send_message("DataManager not ready - restarting")
+            self._telegram.send_message("DataManager not ready - restarting streams")
             self._data_mgr.restart_streams()
 
         if not self._data_mgr.is_price_fresh(max_stale_seconds=120):
             elog.warn("SYSTEM_HEALTH", issue="price_stale_gt_120s")
-            self._telegram.send_message("Price data stale - check connection")
+            self._telegram.send_message("Price data stale - check exchange connection")
 
     def shutdown(self):
         elog.log("SYSTEM_SHUTDOWN", component="HPMSRunner")
@@ -465,11 +495,6 @@ class HPMSRunner:
             self._orders.close_position(reason="SHUTDOWN", current_price=price)
         if self._data_mgr:
             self._data_mgr.stop()
-        if self._api and hasattr(self._api, "close"):
-            try:
-                self._api.close()
-            except Exception:
-                pass
         if self._telegram:
             self._telegram.send_message("*HPMS System Shutdown*")
             self._telegram.stop()
@@ -480,7 +505,7 @@ class HPMSRunner:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="HPMS Trading System (Hyperliquid)")
+    parser = argparse.ArgumentParser(description="HPMS Trading System")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--testnet", action="store_true")
     args = parser.parse_args()
@@ -493,7 +518,7 @@ def main():
         runner.shutdown()
         sys.exit(0)
 
-    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGINT,  handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
     try:

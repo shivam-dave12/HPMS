@@ -28,7 +28,7 @@ class TradeRecord:
     gross_pnl:   float = 0.0
     fees_usd:    float = 0.0
     net_pnl:     float = 0.0
-    size:        float = 0.0
+    size:        int   = 0
     hold_bars:   int   = 0
     reason:      str   = ""
     closed:      bool  = False
@@ -232,16 +232,12 @@ class RiskManager:
     # ─── POSITION SIZING ─────────────────────────────────────────────────────
 
     def compute_size(self, price: float, equity_usd: float,
+                     contract_value: float = 0.001,
                      sl_pct: float = 0.0,
                      confidence: float = 1.0,
-                     norm_vol: float = 0.0,
-                     sz_decimals: int = 5,
-                     **kwargs) -> float:
+                     norm_vol: float = 0.0) -> int:
         """
-        Compute position size in COIN UNITS (Hyperliquid).
-
-        Returns a float coin size (e.g. 0.001 BTC), NOT integer contracts.
-        The result is rounded to sz_decimals (from HL meta for the coin).
+        Compute position size — institutional: confidence-weighted, volatility-normalized.
 
         Size = base_risk_size × confidence_scale × vol_scale
 
@@ -257,6 +253,9 @@ class RiskManager:
             conf_scale = max(0.5, min(1.5, confidence / 0.70))
 
             # ── Volatility normalization ──────────────────────────────────────
+            # Target: normalize risk across vol regimes.
+            # norm_vol = ATR% (e.g. 0.001 = 0.1% per bar)
+            # vol_target = 0.001 (baseline 1m ATR%)
             vol_scale = 1.0
             if norm_vol > 0:
                 vol_target = 0.001  # baseline: 0.1% per bar
@@ -265,40 +264,25 @@ class RiskManager:
             adjusted_risk = risk_usd * conf_scale * vol_scale
 
             if sl_pct > 0 and price > 0:
-                # Risk-based: how many coins can we risk adjusted_risk on?
-                sl_loss_per_coin = price * sl_pct
-                coin_size = adjusted_risk / sl_loss_per_coin if sl_loss_per_coin > 0 else 0.0
+                per_contract_sl_loss = price * sl_pct * contract_value
+                contracts = int(adjusted_risk / per_contract_sl_loss) if per_contract_sl_loss > 0 else 0
             else:
-                # Notional-based: cap by max_pos_usd
                 notional = min(adjusted_risk * self._leverage, self._max_pos_usd)
-                coin_size = notional / price if price > 0 else 0.0
+                per_contract = contract_value * price if price > 0 else 1.0
+                contracts = int(notional / per_contract) if per_contract > 0 else 0
 
-            # ── Hard cap: notional must not exceed what equity+leverage can support ──
-            # The SL path above sizes purely by risk/SL-distance with no notional cap,
-            # so a tight SL on a small account can produce a notional that requires
-            # more margin than the account holds. Cap to 90% of max leveraged equity
-            # (10% headroom so the strategy preflight's 95% check always passes).
-            # Also bounded by RISK_MAX_POSITION_USD as a secondary ceiling.
-            if equity_usd > 0 and price > 0:
-                max_notional = min(equity_usd * self._leverage * 0.90, self._max_pos_usd)
-                coin_size = min(coin_size, max_notional / price)
-
-            # Round to exchange precision
-            coin_size = round(coin_size, sz_decimals)
-
-            # Enforce minimum (smallest tradeable unit)
-            min_size = 10 ** (-sz_decimals)
-            coin_size = max(coin_size, min_size)
+            contracts = min(contracts, self._max_pos_contracts)
+            contracts = max(contracts, 1)
 
             logger.debug(
                 f"Size: base_risk=${risk_usd:.2f} conf_scale={conf_scale:.2f} "
-                f"vol_scale={vol_scale:.2f} → {coin_size} coins"
+                f"vol_scale={vol_scale:.2f} → {contracts}c"
             )
-            return coin_size
+            return contracts
 
     # ─── TRADE LIFECYCLE ──────────────────────────────────────────────────────
 
-    def on_trade_open(self, side: str, entry_price: float, size: float,
+    def on_trade_open(self, side: str, entry_price: float, size: int,
                       margin_used: float = 0.0):
         with self._lock:
             self._open_trade = TradeRecord(
@@ -311,14 +295,6 @@ class RiskManager:
                        fees: float, net_pnl: float,
                        hold_bars: int, reason: str):
         with self._lock:
-            # ── FIX: Check for midnight rollover before recording the trade ──
-            # Without this, a trade closing at 00:01 UTC gets its PnL added to
-            # yesterday's accumulator (which hasn't been reset yet), then wiped
-            # when can_trade() triggers the daily reset.  By calling
-            # _reset_if_new_day() first, the new-day reset fires before the
-            # trade is recorded, so the trade correctly belongs to the new day.
-            self._reset_if_new_day()
-
             if self._open_trade:
                 self._open_trade.exit_price = exit_price
                 self._open_trade.gross_pnl  = gross_pnl
@@ -358,10 +334,26 @@ class RiskManager:
     # ─── EXIT CONDITIONS ──────────────────────────────────────────────────────
 
     def check_exit_conditions(
-        self, dH_dt: float, dH_dt_spike: float, bars_held: int, max_hold: int
+        self, dH_dt: float, dH_dt_spike: float, bars_held: int, max_hold: int,
+        adaptive_hold_result: Optional[Dict] = None,
     ) -> Optional[str]:
-        if bars_held >= max_hold:
-            return f"MAX_HOLD: {bars_held} bars"
+        """
+        Check exit conditions.
+
+        If adaptive_hold_result is provided (from engine.evaluate_adaptive_hold),
+        use its multi-factor verdict instead of the naive bar countdown.
+        Falls back to legacy max_hold check if no adaptive result is given.
+        """
+        # ── Adaptive hold evaluation (preferred) ─────────────────────────
+        if adaptive_hold_result is not None:
+            if adaptive_hold_result.get("should_exit"):
+                return adaptive_hold_result.get("reason", "ADAPTIVE_HOLD_EXIT")
+        else:
+            # Legacy fallback
+            if bars_held >= max_hold:
+                return f"MAX_HOLD: {bars_held} bars"
+
+        # ── Energy spike (unchanged) ─────────────────────────────────────
         if abs(dH_dt) > dH_dt_spike:
             return f"ENERGY_SPIKE: |dH/dt|={abs(dH_dt):.4f} > {dH_dt_spike}"
         return None

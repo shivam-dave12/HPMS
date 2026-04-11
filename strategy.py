@@ -24,7 +24,6 @@ from hpms_engine import HPMSEngine, HPMSSignal, SignalType
 from risk_manager import RiskManager, TradeRecord
 from order_manager import OrderManager
 from state import STATE
-import config
 
 logger = logging.getLogger(__name__)
 
@@ -74,8 +73,11 @@ class HPMSStrategy:
         # Dynamic hold: TP distance stored at entry for max_hold computation
         self._current_tp_distance: float = 0.0
 
+        # Adaptive hold: track unrealized best price for trailing peak logic
+        self._unrealized_peak_price: float = 0.0
+
         # Entry tracking for ROE% computation
-        self._last_entry_size:  float = 0.0
+        self._last_entry_size:  int   = 0
         self._last_entry_price: float = 0.0
         self._last_margin_used: float = 0.0
 
@@ -94,7 +96,7 @@ class HPMSStrategy:
         STATE.trading_enabled = True
         logger.info("HPMSStrategy STARTED")
         self._push("⚡ *Strategy STARTED* — looking for signals on "
-                   f"`{getattr(self._config, 'HL_SYMBOL', 'BTC')}`")
+                   f"`{getattr(self._config, 'DELTA_SYMBOL', 'BTCUSD')}`")
 
     def stop(self):
         self._enabled = False
@@ -140,6 +142,14 @@ class HPMSStrategy:
                 if close_reason:
                     return None
 
+                # Track unrealized peak price for trailing logic
+                if self._orders._position_side == "long":
+                    self._unrealized_peak_price = max(self._unrealized_peak_price, current_price)
+                else:
+                    if self._unrealized_peak_price == 0:
+                        self._unrealized_peak_price = current_price
+                    self._unrealized_peak_price = min(self._unrealized_peak_price, current_price)
+
                 signal = self._engine.on_bar_close(closes, volumes, timestamp)
                 if signal:
                     # KDE grace period: skip energy spike check for 2 bars after
@@ -153,22 +163,37 @@ class HPMSStrategy:
                     config_spike = getattr(self._config, "TRADE_DH_DT_EXIT_SPIKE", 0.15)
                     exit_spike = max(adaptive_spike, config_spike)
 
-                    # Dynamic max hold based on ATR and TP distance
-                    dynamic_max_hold = self._engine.get_dynamic_max_hold(
-                        self._current_tp_distance, current_price
+                    # ── Adaptive hold evaluation ─────────────────────────────
+                    adaptive_hold = self._engine.evaluate_adaptive_hold(
+                        side=self._orders._position_side,
+                        entry_price=self._orders.entry_price,
+                        current_price=current_price,
+                        tp_price=self._orders._tp_price,
+                        sl_price=self._orders._sl_price,
+                        bars_held=self._orders.bars_held,
+                        unrealized_peak_price=self._unrealized_peak_price,
+                        config=self._config,
                     )
 
                     exit_reason = self._risk.check_exit_conditions(
                         dH_dt=signal.dH_dt,
                         dH_dt_spike=exit_spike,
                         bars_held=self._orders.bars_held,
-                        max_hold=dynamic_max_hold,
+                        max_hold=0,  # unused when adaptive_hold_result is provided
+                        adaptive_hold_result=adaptive_hold,
                     )
                     if exit_reason:
-                        # MAX_HOLD always exits immediately
-                        if exit_reason.startswith("MAX_HOLD"):
+                        # Adaptive hold exits and legacy MAX_HOLD exit immediately
+                        if any(tag in exit_reason for tag in (
+                            "ADAPTIVE_MAX_HOLD", "HOLD_SCORE_EXIT",
+                            "TRAILING_PEAK_DD", "ABSOLUTE_MAX", "LEGACY_MAX_HOLD",
+                            "MAX_HOLD",
+                        )):
                             self._consecutive_energy_spikes = 0
-                            logger.info(f"Force-exit triggered: {exit_reason}")
+                            logger.info(
+                                f"Adaptive exit triggered: {exit_reason} "
+                                f"(score={adaptive_hold.get('score', 'N/A')})"
+                            )
                             self._orders.close_position(
                                 reason=exit_reason, current_price=current_price
                             )
@@ -240,7 +265,8 @@ class HPMSStrategy:
                 return signal
 
             # ── Position sizing (confidence-weighted, vol-normalized) ─────────
-            equity = self._get_equity()
+            balance = self._api.get_balance("USD")
+            equity  = balance.get("available", 0.0)
             if equity <= 0:
                 logger.warning("No equity available — skipping entry")
                 self._push("⚠️ *No equity available* — cannot open position")
@@ -259,6 +285,7 @@ class HPMSStrategy:
 
             size = self._risk.compute_size(
                 current_price, equity,
+                contract_value=getattr(self._config, "TRADE_CONTRACT_VALUE", 0.001),
                 sl_pct=abs(current_price - signal.sl_price) / current_price if signal.sl_price > 0 else 0.0,
                 confidence=signal.confidence,
                 norm_vol=norm_vol,
@@ -266,40 +293,23 @@ class HPMSStrategy:
             side = "long" if signal.signal_type == SignalType.LONG else "short"
 
             # ── Pre-flight margin check ───────────────────────────────────────
-            # Hyperliquid: notional = price × coin_size, margin = notional / leverage
-            leverage      = getattr(self._config, "RISK_LEVERAGE", 50)
-            notional_est  = current_price * size
-            margin_needed = notional_est / max(leverage, 1)
+            # Avoid burning an API round-trip on a guaranteed-fail order.
+            # margin_needed = notional / leverage = price * contract_value / leverage
+            contract_value = getattr(self._orders, "_contract_value", 0.001)
+            leverage       = getattr(self._config, "RISK_LEVERAGE", 10)
+            margin_needed  = (current_price * contract_value * size) / max(leverage, 1)
             if margin_needed > equity * 0.95:
-                # compute_size already caps at 90% of leveraged equity, so this
-                # should rarely fire. When it does (e.g. rounding up), clamp the
-                # size down to the largest amount that fits before giving up.
-                import math as _math
-                max_notional  = equity * 0.90 * leverage
-                clamped_size  = _math.floor(
-                    (max_notional / current_price) * 1e5
-                ) / 1e5                              # floor at 5 dp (BTC default)
-                hl_min_notional = 10.0               # Hyperliquid $10 minimum order
-                if clamped_size * current_price >= hl_min_notional:
-                    logger.info(
-                        "MARGIN_PREFLIGHT: clamped size %.5f→%.5f "
-                        "(need $%.2f, have $%.2f equity @ %dx)",
-                        size, clamped_size, margin_needed, equity, leverage,
-                    )
-                    size          = clamped_size
-                    notional_est  = current_price * size
-                    margin_needed = notional_est / max(leverage, 1)
-                else:
-                    logger.warning(
-                        "MARGIN_PREFLIGHT FAIL: equity=$%.2f too small for "
-                        "HL $10 minimum even at %dx leverage — skipping entry",
-                        equity, leverage,
-                    )
-                    self._push(
-                        f"⚠️ *Margin too low* — equity `${equity:.2f}` cannot "
-                        f"meet HL's $10 minimum notional at `{leverage}x` leverage."
-                    )
-                    return signal
+                logger.warning(
+                    "MARGIN_PREFLIGHT FAIL: need $%.2f for %d contract(s) @ "
+                    "%.0fx but equity=$%.2f — skipping entry",
+                    margin_needed, size, leverage, equity,
+                )
+                self._push(
+                    f"⚠️ *Margin too low* — need `${margin_needed:.2f}` for `{size}c` "
+                    f"@ `{leverage}x` lev, have `${equity:.2f}`\n"
+                    f"Use /leverage to raise leverage or deposit funds."
+                )
+                return signal
 
             # ── EXECUTE ENTRY ─────────────────────────────────────────────────
             result = self._orders.open_position(
@@ -315,9 +325,10 @@ class HPMSStrategy:
             if result.get("success"):
                 # Use ACTUAL entry price from order manager (API fill price)
                 actual_entry = self._orders.entry_price or current_price
-                leverage = getattr(self._config, "RISK_LEVERAGE", 50)
-                notional = actual_entry * size
-                margin_used = notional / max(leverage, 1)
+                contract_value = getattr(self._config, "TRADE_CONTRACT_VALUE", 0.001)
+                leverage = getattr(self._config, "RISK_LEVERAGE", 10)
+                margin_used = (actual_entry * contract_value * size) / max(leverage, 1)
+                notional = actual_entry * contract_value * size
 
                 # Use EXACT entry fee from API (stored by order manager)
                 entry_fee = getattr(self._orders, "_entry_fee_usd", 0.0)
@@ -325,13 +336,13 @@ class HPMSStrategy:
                 self._risk.on_trade_open(side, actual_entry, size, margin_used)
                 self._current_tp_distance = abs(signal.tp_price - actual_entry)
                 self._consecutive_energy_spikes = 0
+                self._unrealized_peak_price = actual_entry  # reset peak tracker
                 self._last_entry_size  = size
                 self._last_entry_price = actual_entry
                 self._last_margin_used = margin_used
 
                 logger.info(
-                    f"TRADE OPEN ▶ {side.upper()} {size} {getattr(self._config, 'HL_SYMBOL', 'BTC')} "
-                    f"@ ${actual_entry:,.1f} "
+                    f"TRADE OPEN ▶ {side.upper()} {size}c @ ${actual_entry:,.1f} "
                     f"TP=${signal.tp_price:,.1f} SL=${signal.sl_price:,.1f} "
                     f"margin=${margin_used:.2f} fee=$-{entry_fee:.4f} "
                     f"conf={signal.confidence:.1%} regime={signal_regime.name} "
@@ -339,13 +350,12 @@ class HPMSStrategy:
                 )
                 self._push(
                     f"🚀 *ENTRY {side.upper()}*\n"
-                    f"Size: `{size}` {getattr(self._config, 'HL_SYMBOL', 'BTC')} | "
-                    f"Notional: `${notional:.2f}`\n"
+                    f"Size: `{size}c` | Notional: `${notional:.2f}`\n"
                     f"Entry: `${actual_entry:,.1f}`\n"
                     f"TP: `${signal.tp_price:,.1f}` (`${abs(signal.tp_price - actual_entry):.1f}`)\n"
                     f"SL: `${signal.sl_price:,.1f}` (`${abs(signal.sl_price - actual_entry):.1f}`)\n"
                     f"Margin: `${margin_used:.2f}` @ `{leverage}x`\n"
-                    f"Entry fee: `$-{entry_fee:.4f}` _(from exchange)_\n"
+                    f"Entry fee: `$-{entry_fee:.4f}` _(exact)_\n"
                     f"Conf: `{signal.confidence:.1%}` | Regime: `{signal_regime.name}`\n"
                     f"Δq: `{signal.predicted_delta_q:+.5f}`"
                 )
@@ -449,94 +459,6 @@ class HPMSStrategy:
             f"fees `$-{daily.get('daily_fees', 0):.4f}`\n"
             f"Trades: `{daily['trades_today']}`"
         )
-
-    # ─── EQUITY FETCH ─────────────────────────────────────────────────────────
-
-    def _get_equity(self) -> float:
-        """
-        Fetch account equity via the canonical HyperliquidClient.get_equity()
-        waterfall, routed through SyncHLAPI.get_equity().
-
-        Waterfall (handled entirely in api_client.py — do NOT duplicate here):
-          1. marginSummary.accountValue    — total NAV (cross + isolated + unrealisedPnL)
-          2. crossMarginSummary.accountValue — cross-margin NAV
-          3. withdrawable                  — free cash (0 when locked in open positions)
-          4. marginSummary.totalRawUsd     — raw deposited USDC (ignores PnL)
-          5. Spot USDC balance             — funds not yet transferred to perp
-          6. API-wallet cross-check        — detects HL_WALLET_ADDRESS misconfiguration
-
-        IMPORTANT: Do NOT use get_clearinghouse_state() + manual parsing here.
-        That approach was responsible for all previous zero-equity bugs:
-          - 'withdrawable' is 0.0 whenever funds are tied up in an open position.
-          - crossMarginSummary misses isolated-margin equity entirely.
-          - Neither checks the spot account.
-        All of that is handled correctly in api_client.get_equity().
-        """
-        try:
-            master_wallet = config.get_settings().wallet_address
-            if not master_wallet:
-                logger.warning("Equity fetch: HL_WALLET_ADDRESS is not set in .env")
-                return 0.0
-
-            # Route through SyncHLAPI → HyperliquidClient.get_equity()
-            # which runs the full 6-step waterfall including spot fallback.
-            equity = self._api.get_equity(master_wallet)
-
-            if equity <= 0:
-                logger.warning(
-                    f"Equity fetch returned 0 for wallet {master_wallet} — "
-                    "check api_client logs for 'clearinghouse_zero_equity' details. "
-                    "Possible causes: (1) HL_WALLET_ADDRESS is the API sub-wallet not "
-                    "the master account, (2) USDC has not been deposited, "
-                    "(3) funds are in spot account — transfer at app.hyperliquid.xyz."
-                )
-            return equity
-
-        except AttributeError:
-            # SyncHLAPI older version without get_equity() — fall back gracefully
-            logger.warning(
-                "SyncHLAPI.get_equity() not found — update main.py. "
-                "Falling back to get_clearinghouse_state() with basic parsing."
-            )
-            return self._get_equity_legacy()
-        except Exception as e:
-            logger.warning(f"Equity fetch error: {e}")
-            return 0.0
-
-    def _get_equity_legacy(self) -> float:
-        """
-        Legacy fallback — only used if SyncHLAPI.get_equity() is unavailable.
-        Uses marginSummary.accountValue (correct primary field) rather than
-        withdrawable (which is 0 when funds are locked in open positions).
-        """
-        try:
-            master_wallet = config.get_settings().wallet_address
-            state = self._api.get_clearinghouse_state(master_wallet)
-            if not state:
-                return 0.0
-            ms  = state.get("marginSummary")      or {}
-            cms = state.get("crossMarginSummary") or {}
-
-            def _sf(v):
-                try:
-                    return float(v) if v is not None else 0.0
-                except (TypeError, ValueError):
-                    return 0.0
-
-            # Priority: total NAV → cross NAV → totalRawUsd → withdrawable
-            v = _sf(ms.get("accountValue"))
-            if v > 0:
-                return v
-            v = _sf(cms.get("accountValue"))
-            if v > 0:
-                return v
-            v = _sf(ms.get("totalRawUsd"))
-            if v > 0:
-                return v
-            return max(_sf(state.get("withdrawable")), 0.0)
-        except Exception as e:
-            logger.warning(f"Legacy equity fetch error: {e}")
-            return 0.0
 
     # ─── NOTIFICATIONS ────────────────────────────────────────────────────────
 
