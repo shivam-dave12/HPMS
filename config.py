@@ -95,7 +95,7 @@ TRADE_LIMIT_OFFSET_TICKS  = 1
 # POSITION SIZING & RISK (v2 — Confidence-weighted, Vol-normalized)
 # ═══════════════════════════════════════════════════════════════════════════════
 RISK_MAX_POSITION_USD     = 500.0
-RISK_LEVERAGE             = 50
+RISK_LEVERAGE             = 40
 RISK_MAX_DAILY_LOSS_USD   = 200.0
 RISK_MAX_DAILY_TRADES     = 100
 RISK_MAX_CONSECUTIVE_LOSSES = 5
