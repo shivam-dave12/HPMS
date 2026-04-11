@@ -1,0 +1,8 @@
+numpy
+scipy
+python-dotenv
+httpx
+websockets
+eth-account
+hyperliquid-python-sdk
+python-telegram-bot>=20.0
