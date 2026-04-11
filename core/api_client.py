@@ -38,6 +38,61 @@ log = get_logger(__name__)
 cfg = get_settings()
 
 
+# ── Equity parsing ────────────────────────────────────────────────────────────
+
+def _sf(value: object) -> float:
+    """Safe float conversion. Returns 0.0 on None, empty string, or invalid input."""
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        v = value.strip()
+        return float(v) if v else 0.0
+    return 0.0
+
+
+def parse_equity_from_state(state: dict) -> float:
+    """
+    Robust equity extraction from a clearinghouseState API response.
+
+    Priority waterfall — stops at the first positive value:
+      1. withdrawable                    top-level field — always reliable
+      2. marginSummary.accountValue      total NAV (cross + isolated combined)
+      3. crossMarginSummary.accountValue cross-margin NAV only
+
+    WHY this order matters
+    ----------------------
+    The naive pattern used in many codebases:
+
+        margin = state.get("crossMarginSummary") or state.get("marginSummary", {})
+
+    is BROKEN when crossMarginSummary is present but its accountValue is "0".
+    A non-empty dict evaluates as truthy regardless of its contents, so the
+    `or` branch never falls through to marginSummary — causing equity=0 on
+    accounts that exclusively hold isolated-margin positions.
+
+    This function avoids that trap by testing the numeric value at each step,
+    not the truthiness of the containing dict.
+
+    Returns 0.0 when all fields are absent or zero. Never returns negative.
+    """
+    # 1. withdrawable (top-level)
+    v = _sf(state.get("withdrawable"))
+    if v > 0:
+        return v
+
+    # 2. marginSummary.accountValue — total across ALL margin types
+    ms = state.get("marginSummary") or {}
+    v = _sf(ms.get("accountValue"))
+    if v > 0:
+        return v
+
+    # 3. crossMarginSummary.accountValue — cross-margin only (last resort)
+    cms = state.get("crossMarginSummary") or {}
+    return max(_sf(cms.get("accountValue")), 0.0)
+
+
 # ── Price / size helpers ──────────────────────────────────────────────────────
 
 def _round_price(price: float, sz_dec: int, is_spot: bool = False) -> float:
@@ -267,13 +322,6 @@ class HyperliquidClient:
         Uses the 'userFillsByTime' endpoint which correctly filters by
         startTime (and optionally endTime). This is NOT the same as
         'userFills', which returns ALL historical fills and ignores startTime.
-
-        Parameters
-        ----------
-        wallet        : lowercase hex address
-        start_time_ms : epoch milliseconds — only fills at or after this time
-        end_time_ms   : epoch milliseconds — only fills before this time
-                        (defaults to current time when omitted)
         """
         payload: dict = {
             "type":      "userFillsByTime",
@@ -301,31 +349,87 @@ class HyperliquidClient:
 
     async def get_clearinghouse_state(self, wallet: str) -> dict:
         result = await self._post_info({"type": "clearinghouseState", "user": wallet})
-
-        if not result or not result.get("marginSummary"):
-            # Use positional printf-style format — safe on any logger implementation.
+        if not result or not isinstance(result, dict):
             log.warning(
-                "api_clearinghouse_empty wallet=%s — marginSummary missing. "
-                "HL_WALLET_ADDRESS may point to the API sub-wallet instead of "
-                "the master account. Equity will read as 0.",
-                wallet[:18],
+                "api_clearinghouse_empty",
+                wallet = wallet[:18],
+                note   = (
+                    "Response missing or not a dict. WALLET_ADDRESS may point "
+                    "to the API sub-wallet instead of the master account."
+                ),
             )
-            return result or {}
+            return {}
 
-        # Explicit balance debug so the master-wallet value is always visible
-        # in logs at DEBUG level, confirming the correct wallet is queried.
-        ms = result["marginSummary"]
+        # Log all three equity fields at DEBUG so misconfigured wallets
+        # are immediately visible — no guessing which field the bot reads.
+        ms  = result.get("marginSummary")      or {}
+        cms = result.get("crossMarginSummary") or {}
         log.debug(
-            "clearinghouse_balance",
-            wallet       = wallet[:18],
-            accountValue = ms.get("accountValue"),
-            withdrawable = result.get("withdrawable"),
+            "clearinghouse_state_raw",
+            wallet        = wallet[:18],
+            withdrawable  = result.get("withdrawable"),
+            ms_acct_val   = ms.get("accountValue"),
+            cms_acct_val  = cms.get("accountValue"),
+            parsed_equity = parse_equity_from_state(result),
         )
         return result
 
     async def get_spot_clearinghouse_state(self, wallet: str) -> dict:
         result = await self._post_info({"type": "spotClearinghouseState", "user": wallet})
         return result or {}
+
+    async def get_equity(self, wallet: str, state: dict | None = None) -> float:
+        """
+        Return account equity using a full multi-field waterfall with spot fallback.
+
+        Parameters
+        ----------
+        wallet : master account address (WALLET_ADDRESS from .env)
+        state  : optional pre-fetched clearinghouseState dict — when supplied,
+                 the perp fields are read from it directly, avoiding a redundant
+                 API call.  A spot call is still made if all perp fields are zero.
+
+        Waterfall
+        ---------
+        1. withdrawable                   (always reliable — available USDC)
+        2. marginSummary.accountValue     (total NAV — cross + isolated)
+        3. crossMarginSummary.accountValue (cross-margin NAV only)
+        4. spot USDC balance              (funds not yet transferred to perp)
+
+        Never raises. Returns 0.0 on complete failure.
+        """
+        try:
+            if state is None:
+                state = await self.get_clearinghouse_state(wallet)
+
+            equity = parse_equity_from_state(state)
+            if equity > 0:
+                return equity
+
+            # Spot USDC fallback — triggered when the account has USDC in the
+            # spot wallet but has not yet transferred it to the perp margin account.
+            spot = await self.get_spot_clearinghouse_state(wallet)
+            for b in spot.get("balances", []):
+                if b.get("coin") == "USDC":
+                    v = _sf(b.get("total"))
+                    if v > 0:
+                        log.info(
+                            "equity_from_spot_usdc",
+                            wallet = wallet[:18],
+                            usdc   = round(v, 4),
+                            note   = (
+                                "All perp equity fields are 0; reading spot USDC. "
+                                "Transfer funds at app.hyperliquid.xyz → Transfer "
+                                "to enable perp trading."
+                            ),
+                        )
+                        return v
+
+            return 0.0
+
+        except Exception as e:
+            log.warning("get_equity_failed", wallet=wallet[:18], err=str(e))
+            return 0.0
 
     async def get_meta(self) -> dict:
         return await self._post_info({"type": "meta"})
