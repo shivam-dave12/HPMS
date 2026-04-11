@@ -56,41 +56,58 @@ def parse_equity_from_state(state: dict) -> float:
     """
     Robust equity extraction from a clearinghouseState API response.
 
+    Hyperliquid clearinghouseState fields (all returned as strings):
+      withdrawable              — free USDC available to withdraw (cross free cash).
+                                  Zero when all cash is tied up in isolated margin.
+      marginSummary.accountValue  — total NAV = cross equity + isolated equity + unrealizedPnl.
+                                    This is the most complete picture of account worth.
+      marginSummary.totalRawUsd   — raw deposited USDC excluding unrealized PnL.
+                                    Reliable even when positions are deeply underwater.
+      crossMarginSummary.accountValue — cross-margin NAV only (excludes isolated positions).
+
     Priority waterfall — stops at the first positive value:
-      1. withdrawable                    top-level field — always reliable
-      2. marginSummary.accountValue      total NAV (cross + isolated combined)
-      3. crossMarginSummary.accountValue cross-margin NAV only
+      1. marginSummary.accountValue   — total equity across ALL margin types (best single number)
+      2. crossMarginSummary.accountValue — cross-margin equity (isolated accounts may be 0 here)
+      3. withdrawable                 — free cash only; 0 when margin is locked in positions
+      4. marginSummary.totalRawUsd    — raw deposited USDC (last resort; ignores PnL)
 
-    WHY this order matters
-    ----------------------
-    The naive pattern used in many codebases:
+    WHY marginSummary.accountValue is preferred over withdrawable
+    ------------------------------------------------------------
+    `withdrawable` is 0 whenever funds are locked in an open position or isolated
+    margin. Using it as the primary source caused the bot to report 0 equity while
+    a trade was live.  marginSummary.accountValue correctly includes mark-to-market
+    value of all positions.
 
+    WHY we don't just use `or` on the containing dict
+    --------------------------------------------------
+    The naive pattern:
         margin = state.get("crossMarginSummary") or state.get("marginSummary", {})
-
     is BROKEN when crossMarginSummary is present but its accountValue is "0".
-    A non-empty dict evaluates as truthy regardless of its contents, so the
-    `or` branch never falls through to marginSummary — causing equity=0 on
-    accounts that exclusively hold isolated-margin positions.
-
-    This function avoids that trap by testing the numeric value at each step,
-    not the truthiness of the containing dict.
+    A non-empty dict evaluates as truthy regardless of its contents.
 
     Returns 0.0 when all fields are absent or zero. Never returns negative.
     """
-    # 1. withdrawable (top-level)
-    v = _sf(state.get("withdrawable"))
-    if v > 0:
-        return v
+    ms  = state.get("marginSummary")      or {}
+    cms = state.get("crossMarginSummary") or {}
 
-    # 2. marginSummary.accountValue — total across ALL margin types
-    ms = state.get("marginSummary") or {}
+    # 1. marginSummary.accountValue — best: total NAV across ALL margin types
     v = _sf(ms.get("accountValue"))
     if v > 0:
         return v
 
-    # 3. crossMarginSummary.accountValue — cross-margin only (last resort)
-    cms = state.get("crossMarginSummary") or {}
-    return max(_sf(cms.get("accountValue")), 0.0)
+    # 2. crossMarginSummary.accountValue — cross-margin NAV only
+    v = _sf(cms.get("accountValue"))
+    if v > 0:
+        return v
+
+    # 3. withdrawable — free cash (0 when funds locked in positions)
+    v = _sf(state.get("withdrawable"))
+    if v > 0:
+        return v
+
+    # 4. marginSummary.totalRawUsd — raw deposited USDC (ignores unrealized PnL)
+    v = _sf(ms.get("totalRawUsd"))
+    return max(v, 0.0)
 
 
 # ── Price / size helpers ──────────────────────────────────────────────────────
@@ -250,12 +267,25 @@ class HyperliquidClient:
     # ── Wallet validation ─────────────────────────────────────────────────────
 
     async def validate_api_wallet(self) -> tuple[bool, str]:
+        # ── Critical misconfiguration check ───────────────────────────────────
+        # HL_WALLET_ADDRESS must be the MASTER account address.
+        # HL_PRIVATE_KEY derives the API sub-wallet used only for signing.
+        # If both resolve to the same address, funds will never be found.
+        if cfg.wallet_address.lower() == self._api_wallet_address_str.lower():
+            return False, (
+                f"MISCONFIGURATION: HL_WALLET_ADDRESS ({cfg.wallet_address[:20]}) "
+                f"is the same as the address derived from HL_PRIVATE_KEY. "
+                "These must be different accounts. "
+                "HL_WALLET_ADDRESS = your MASTER account (login address at app.hyperliquid.xyz). "
+                "HL_PRIVATE_KEY = the API sub-wallet private key added under Settings → API."
+            )
+
         try:
             state = await self.get_clearinghouse_state(cfg.wallet_address)
             _ = state.get("marginSummary", {})
         except Exception as e:
             return False, (
-                f"Main wallet not found on Hyperliquid ({cfg.wallet_address[:18]}). "
+                f"Main wallet not found on Hyperliquid ({cfg.wallet_address}). "
                 f"Have you deposited USDC? Error: {e}"
             )
 
@@ -348,30 +378,63 @@ class HyperliquidClient:
         return r if isinstance(r, list) else []
 
     async def get_clearinghouse_state(self, wallet: str) -> dict:
+        # ── Misconfiguration guard ────────────────────────────────────────────
+        # The most common cause of zero balance is querying the API sub-wallet
+        # (derived from HL_PRIVATE_KEY) instead of the master account wallet.
+        # HL returns all-zero clearinghouseState for agent/API wallets because
+        # they hold no margin — funds live on the master account only.
+        if wallet.lower() == self._api_wallet_address_str.lower():
+            log.warning(
+                "clearinghouse_wallet_misconfiguration",
+                queried_wallet  = wallet[:20],
+                api_wallet      = self._api_wallet_address_str[:20],
+                note            = (
+                    "HL_WALLET_ADDRESS matches the API signing wallet derived from "
+                    "HL_PRIVATE_KEY. This will always return zero balance. "
+                    "Set HL_WALLET_ADDRESS to your MASTER Hyperliquid account address "
+                    "(the one you use to log into app.hyperliquid.xyz)."
+                ),
+            )
+
         result = await self._post_info({"type": "clearinghouseState", "user": wallet})
         if not result or not isinstance(result, dict):
             log.warning(
                 "api_clearinghouse_empty",
-                wallet = wallet[:18],
+                wallet = wallet,  # log full address — truncation hides misconfiguration
                 note   = (
-                    "Response missing or not a dict. WALLET_ADDRESS may point "
-                    "to the API sub-wallet instead of the master account."
+                    "Response missing or not a dict. Ensure HL_WALLET_ADDRESS is the "
+                    "MASTER account address, not the API sub-wallet address."
                 ),
             )
             return {}
 
-        # Log all three equity fields at DEBUG so misconfigured wallets
-        # are immediately visible — no guessing which field the bot reads.
+        # Log ALL equity fields at DEBUG (full address, not truncated — truncation
+        # previously hid whether the master or API wallet was being queried).
         ms  = result.get("marginSummary")      or {}
         cms = result.get("crossMarginSummary") or {}
+        parsed = parse_equity_from_state(result)
         log.debug(
             "clearinghouse_state_raw",
-            wallet        = wallet[:18],
-            withdrawable  = result.get("withdrawable"),
-            ms_acct_val   = ms.get("accountValue"),
-            cms_acct_val  = cms.get("accountValue"),
-            parsed_equity = parse_equity_from_state(result),
+            wallet            = wallet,           # full address
+            withdrawable      = result.get("withdrawable"),
+            ms_acct_val       = ms.get("accountValue"),
+            ms_total_raw_usd  = ms.get("totalRawUsd"),
+            cms_acct_val      = cms.get("accountValue"),
+            open_positions    = len(result.get("assetPositions", [])),
+            parsed_equity     = parsed,
         )
+
+        if parsed == 0.0 and wallet.lower() != self._api_wallet_address_str.lower():
+            log.warning(
+                "clearinghouse_zero_equity",
+                wallet = wallet,
+                note   = (
+                    "All balance fields are zero. Verify: "
+                    "(1) HL_WALLET_ADDRESS is the master account (not API sub-wallet), "
+                    "(2) USDC has been deposited to the perp account at app.hyperliquid.xyz."
+                ),
+            )
+
         return result
 
     async def get_spot_clearinghouse_state(self, wallet: str) -> dict:
@@ -380,21 +443,23 @@ class HyperliquidClient:
 
     async def get_equity(self, wallet: str, state: dict | None = None) -> float:
         """
-        Return account equity using a full multi-field waterfall with spot fallback.
+        Return account equity using a full multi-field waterfall with fallbacks.
 
         Parameters
         ----------
-        wallet : master account address (WALLET_ADDRESS from .env)
+        wallet : master account address (HL_WALLET_ADDRESS from .env)
         state  : optional pre-fetched clearinghouseState dict — when supplied,
-                 the perp fields are read from it directly, avoiding a redundant
-                 API call.  A spot call is still made if all perp fields are zero.
+                 perp fields are read from it directly, avoiding a redundant
+                 API call. A spot call is still made if all perp fields are zero.
 
         Waterfall
         ---------
-        1. withdrawable                   (always reliable — available USDC)
-        2. marginSummary.accountValue     (total NAV — cross + isolated)
-        3. crossMarginSummary.accountValue (cross-margin NAV only)
-        4. spot USDC balance              (funds not yet transferred to perp)
+        1. marginSummary.accountValue     (total NAV — cross + isolated + unrealizedPnl)
+        2. crossMarginSummary.accountValue (cross-margin NAV only)
+        3. withdrawable                   (free cash; 0 when locked in positions)
+        4. marginSummary.totalRawUsd      (raw deposited USDC; ignores unrealizedPnl)
+        5. Spot USDC balance              (funds not yet transferred to perp)
+        6. Re-fetch with API wallet addr  (last resort — catches HL_WALLET_ADDRESS misconfiguration)
 
         Never raises. Returns 0.0 on complete failure.
         """
@@ -415,7 +480,7 @@ class HyperliquidClient:
                     if v > 0:
                         log.info(
                             "equity_from_spot_usdc",
-                            wallet = wallet[:18],
+                            wallet = wallet,
                             usdc   = round(v, 4),
                             note   = (
                                 "All perp equity fields are 0; reading spot USDC. "
@@ -425,10 +490,45 @@ class HyperliquidClient:
                         )
                         return v
 
+            # Last-resort: if HL_WALLET_ADDRESS was misconfigured as the API sub-wallet,
+            # try the API wallet address to detect the problem and guide the user.
+            if wallet.lower() != self._api_wallet_address_str.lower():
+                log.warning(
+                    "get_equity_retrying_api_wallet",
+                    master_wallet = wallet,
+                    api_wallet    = self._api_wallet_address_str,
+                    note          = (
+                        "Master wallet returned 0. Checking if HL_WALLET_ADDRESS "
+                        "and HL_PRIVATE_KEY belong to separate accounts (correct) "
+                        "or the same account (misconfigured)."
+                    ),
+                )
+                api_state = await self._post_info({
+                    "type": "clearinghouseState",
+                    "user": self._api_wallet_address_str,
+                })
+                if isinstance(api_state, dict):
+                    api_equity = parse_equity_from_state(api_state)
+                    if api_equity > 0:
+                        log.warning(
+                            "get_equity_misconfiguration_detected",
+                            api_wallet_equity = api_equity,
+                            master_wallet     = wallet,
+                            action_required   = (
+                                "FUNDS FOUND ON API WALLET. "
+                                "Set HL_WALLET_ADDRESS in .env to your master account address "
+                                "(the address you log in with at app.hyperliquid.xyz). "
+                                "The API wallet derived from HL_PRIVATE_KEY should NOT be "
+                                "used as HL_WALLET_ADDRESS."
+                            ),
+                        )
+                        # Return the equity but log it as misconfigured
+                        return api_equity
+
             return 0.0
 
         except Exception as e:
-            log.warning("get_equity_failed", wallet=wallet[:18], err=str(e))
+            log.warning("get_equity_failed", wallet=wallet, err=str(e))
             return 0.0
 
     async def get_meta(self) -> dict:
