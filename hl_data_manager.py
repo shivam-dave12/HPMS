@@ -172,10 +172,10 @@ class HLDataManager:
     # ── REST warmup ───────────────────────────────────────────────────────────
 
     def _warmup_candles(self, label: str) -> None:
-        cfg = self._WARMUP_INTERVALS.get(label)
-        if not cfg:
+        cfg_entry = self._WARMUP_INTERVALS.get(label)
+        if not cfg_entry:
             return
-        interval_str, limit = cfg
+        interval_str, limit = cfg_entry
         tf_map = {
             "1m": self._candles_1m, "5m": self._candles_5m,
             "15m": self._candles_15m, "1h": self._candles_1h,
@@ -183,13 +183,12 @@ class HLDataManager:
         }
         target = tf_map[label]
 
-        # Compute time range
         _INTERVAL_SECONDS = {
             "1m": 60, "5m": 300, "15m": 900,
             "1h": 3600, "4h": 14400, "1d": 86400,
         }
-        now_ms = int(time.time() * 1000)
-        iv_s = _INTERVAL_SECONDS[label]
+        now_ms   = int(time.time() * 1000)
+        iv_s     = _INTERVAL_SECONDS[label]
         start_ms = now_ms - limit * iv_s * 1000
 
         for attempt in range(3):
@@ -198,10 +197,10 @@ class HLDataManager:
                     self._client._post_info({
                         "type": "candleSnapshot",
                         "req": {
-                            "coin": self._symbol,
-                            "interval": interval_str,
+                            "coin":      self._symbol,
+                            "interval":  interval_str,
                             "startTime": start_ms,
-                            "endTime": now_ms,
+                            "endTime":   now_ms,
                         },
                     }),
                     timeout=15,
@@ -212,23 +211,28 @@ class HLDataManager:
                     time.sleep(1)
                     continue
 
-                # Sort by open time
                 raw = sorted(raw, key=lambda c: int(c.get("t", 0)))
 
                 seeded = 0
                 for c in raw:
                     try:
                         close_ts = int(c.get("T", 0))
-                        # Skip the current forming candle (incomplete volume)
-                        if close_ts >= now_ms:
+
+                        # Apply the same 1-second clock-skew buffer as
+                        # refresh_latest_candles. Without this buffer, a candle
+                        # whose T equals the exact minute boundary is dropped
+                        # whenever the client clock is even 1 ms behind the HL
+                        # server, starving the engine of the most recent bar.
+                        if close_ts > (now_ms + 1000):
                             continue
+
                         candle = Candle(
-                            timestamp=int(c["t"]) / 1000.0,
-                            open=float(c["o"]),
-                            high=float(c["h"]),
-                            low=float(c["l"]),
-                            close=float(c["c"]),
-                            volume=float(c["v"]),
+                            timestamp = int(c["t"]) / 1000.0,
+                            open      = float(c["o"]),
+                            high      = float(c["h"]),
+                            low       = float(c["l"]),
+                            close     = float(c["c"]),
+                            volume    = float(c["v"]),
                         )
                         if candle.close > 0:
                             target.append(candle)
@@ -254,7 +258,7 @@ class HLDataManager:
         """Fetch current mid price via REST."""
         try:
             mids = self._run_async(self._client.get_all_mids(), timeout=10)
-            mid = mids.get(self._symbol)
+            mid  = mids.get(self._symbol)
             if mid and mid > 0:
                 with self._lock:
                     self._last_price = mid
@@ -294,12 +298,12 @@ class HLDataManager:
             "4h": len(self._candles_4h), "1d": len(self._candles_1d),
         }
         mins = {
-            "1m": getattr(config, "MIN_CANDLES_1M", 100),
-            "5m": getattr(config, "MIN_CANDLES_5M", 50),
-            "15m": getattr(config, "MIN_CANDLES_15M", 20),
-            "1h": getattr(config, "MIN_CANDLES_1H", 10),
-            "4h": getattr(config, "MIN_CANDLES_4H", 5),
-            "1d": getattr(config, "MIN_CANDLES_1D", 3),
+            "1m":  getattr(config, "MIN_CANDLES_1M",  100),
+            "5m":  getattr(config, "MIN_CANDLES_5M",   50),
+            "15m": getattr(config, "MIN_CANDLES_15M",  20),
+            "1h":  getattr(config, "MIN_CANDLES_1H",   10),
+            "4h":  getattr(config, "MIN_CANDLES_4H",    5),
+            "1d":  getattr(config, "MIN_CANDLES_1D",    3),
         }
         missing = [f"{tf}({counts[tf]}<{mins[tf]})" for tf in mins if counts[tf] < mins[tf]]
         if missing:
@@ -311,7 +315,7 @@ class HLDataManager:
 
     def refresh_latest_candles(self):
         """
-        Fetch latest 1m candles (last 5 bars) and update the deque.
+        Fetch latest 1m candles (last 8 bars) and update the deque.
         Also refreshes price and orderbook.
         Called periodically from the main loop.
 
@@ -324,28 +328,34 @@ class HLDataManager:
           t  = open time (ms)     — start of the bar
           T  = close time (ms)    — end of the bar
           v  = volume (base asset, e.g. BTC)
-        If T >= now, the candle is still forming.
+
+        Forming candle detection uses a 1-second clock-skew buffer:
+          is_forming = close_ts > (now_ms + 1000)
+        This tolerates up to 1 s of client-behind-server skew without ever
+        dropping a completed bar.
+
+        Same-candle threshold is 1 second (< 1.0 s between timestamps).
+        Three cases for each incoming completed candle:
+          1. |ts - deque[-1].timestamp| < 1.0  →  same bar, update in place
+          2. ts > deque[-1].timestamp           →  new bar or gap-fill, append
+          3. ts < deque[-1].timestamp           →  older than deque tail, skip
+        Gap-fill path: when the main loop misses one or more bars, the next
+        refresh recovers all of them because candles are iterated in ascending
+        time order and the deque tail advances with each append.
         """
         try:
-            now_ms = int(time.time() * 1000)
-
-            # Fetch 8 minutes instead of 5 to avoid boundary misses:
-            # with exactly 5 min the candle at start_ms boundary may be
-            # excluded when its open time is 1–2 ms before start_ms.
+            now_ms   = int(time.time() * 1000)
             start_ms = now_ms - 8 * 60 * 1000
-
-            # Extend endTime 2 minutes past now so the request always
-            # covers the current forming candle regardless of API latency.
-            end_ms = now_ms + 2 * 60 * 1000
+            end_ms   = now_ms + 2 * 60 * 1000
 
             raw = self._run_async(
                 self._client._post_info({
                     "type": "candleSnapshot",
                     "req": {
-                        "coin": self._symbol,
-                        "interval": "1m",
+                        "coin":      self._symbol,
+                        "interval":  "1m",
                         "startTime": start_ms,
-                        "endTime": end_ms,
+                        "endTime":   end_ms,
                     },
                 }),
                 timeout=10,
@@ -356,15 +366,15 @@ class HLDataManager:
                 with self._lock:
                     for c in raw:
                         try:
-                            ts = int(c["t"]) / 1000.0
+                            ts       = int(c["t"]) / 1000.0
                             close_ts = int(c.get("T", 0))
-                            candle = Candle(
-                                timestamp=ts,
-                                open=float(c["o"]),
-                                high=float(c["h"]),
-                                low=float(c["l"]),
-                                close=float(c["c"]),
-                                volume=float(c["v"]),
+                            candle   = Candle(
+                                timestamp = ts,
+                                open      = float(c["o"]),
+                                high      = float(c["h"]),
+                                low       = float(c["l"]),
+                                close     = float(c["c"]),
+                                volume    = float(c["v"]),
                             )
                             if candle.close <= 0:
                                 continue
@@ -373,29 +383,25 @@ class HLDataManager:
                             self._last_price = candle.close
                             self._last_price_update_time = time.time()
 
-                            # Forming candle detection with 1-second clock-skew buffer.
-                            #
-                            # Bug in original code: `close_ts >= now_ms` fails when the
-                            # client clock is even slightly behind HL server time — a
-                            # completed candle (T = minute_boundary) would read as forming
-                            # if client now_ms < T by even 1 ms, causing it to be silently
-                            # dropped.  The buffer means: only treat a candle as forming
-                            # if its close time is MORE than 1 s in the future.  This
-                            # tolerates up to 1 s of client-behind-server clock skew
-                            # without ever dropping a completed bar.
                             is_forming = close_ts > (now_ms + 1000)
-
                             if is_forming:
-                                # Don't write forming candle into the deque —
-                                # it has incomplete volume and would block filters.
-                                # Price update above is sufficient.
+                                # Forming candle — price update above is sufficient;
+                                # don't write incomplete volume into the deque.
                                 continue
 
-                            # Completed candle — update or append
-                            if self._candles_1m and abs(self._candles_1m[-1].timestamp - ts) < 30:
-                                self._candles_1m[-1] = candle
-                            elif not self._candles_1m or ts > self._candles_1m[-1].timestamp:
+                            # Completed candle — three-case deque update
+                            if self._candles_1m:
+                                tail_ts = self._candles_1m[-1].timestamp
+                                if abs(tail_ts - ts) < 1.0:
+                                    # Case 1: same bar — update in place
+                                    self._candles_1m[-1] = candle
+                                elif ts > tail_ts:
+                                    # Case 2: new bar or gap-fill — append
+                                    self._candles_1m.append(candle)
+                                # Case 3: ts < tail_ts — older than deque tail, skip
+                            else:
                                 self._candles_1m.append(candle)
+
                         except Exception:
                             continue
 
@@ -422,8 +428,8 @@ class HLDataManager:
     def get_orderbook(self) -> Dict:
         with self._lock:
             return {
-                "bids": list(self._orderbook.get("bids", [])),
-                "asks": list(self._orderbook.get("asks", [])),
+                "bids":      list(self._orderbook.get("bids", [])),
+                "asks":      list(self._orderbook.get("asks", [])),
                 "timestamp": time.time(),
             }
 
@@ -453,17 +459,17 @@ class HLDataManager:
 
     def get_volume_delta(self, lookback_seconds: float = 60.0) -> Dict:
         with self._lock:
-            cutoff = time.time() - lookback_seconds
-            buy_vol = sum(t["quantity"] for t in self._recent_trades
-                          if t["timestamp"] >= cutoff and t["side"] == "buy")
+            cutoff   = time.time() - lookback_seconds
+            buy_vol  = sum(t["quantity"] for t in self._recent_trades
+                           if t["timestamp"] >= cutoff and t["side"] == "buy")
             sell_vol = sum(t["quantity"] for t in self._recent_trades
-                          if t["timestamp"] >= cutoff and t["side"] == "sell")
+                           if t["timestamp"] >= cutoff and t["side"] == "sell")
         total = buy_vol + sell_vol
         return {
-            "buy_volume": buy_vol,
+            "buy_volume":  buy_vol,
             "sell_volume": sell_vol,
-            "delta": buy_vol - sell_vol,
-            "delta_pct": (buy_vol - sell_vol) / total if total > 0 else 0.0,
+            "delta":       buy_vol - sell_vol,
+            "delta_pct":   (buy_vol - sell_vol) / total if total > 0 else 0.0,
         }
 
     def wait_until_ready(self, timeout_sec: float = 120.0) -> bool:

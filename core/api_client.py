@@ -301,15 +301,26 @@ class HyperliquidClient:
 
     async def get_clearinghouse_state(self, wallet: str) -> dict:
         result = await self._post_info({"type": "clearinghouseState", "user": wallet})
+
         if not result or not result.get("marginSummary"):
+            # Use positional printf-style format — safe on any logger implementation.
             log.warning(
-                "api_clearinghouse_empty",
-                wallet = wallet[:18],
-                note   = (
-                    "marginSummary missing — WALLET_ADDRESS may point to the API "
-                    "sub-wallet instead of the master account. Equity will read as 0."
-                ),
+                "api_clearinghouse_empty wallet=%s — marginSummary missing. "
+                "HL_WALLET_ADDRESS may point to the API sub-wallet instead of "
+                "the master account. Equity will read as 0.",
+                wallet[:18],
             )
+            return result or {}
+
+        # Explicit balance debug so the master-wallet value is always visible
+        # in logs at DEBUG level, confirming the correct wallet is queried.
+        ms = result["marginSummary"]
+        log.debug(
+            "clearinghouse_balance",
+            wallet       = wallet[:18],
+            accountValue = ms.get("accountValue"),
+            withdrawable = result.get("withdrawable"),
+        )
         return result
 
     async def get_spot_clearinghouse_state(self, wallet: str) -> dict:
