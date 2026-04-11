@@ -446,40 +446,97 @@ class HPMSStrategy:
 
         HL clearinghouseState field guide
         ----------------------------------
-        withdrawable (top-level)          : best estimate of free margin;
-                                            accounts for cross + isolated PnL
+        withdrawable (top-level)          : best free-margin figure; accounts
+                                            for cross + isolated PnL
         crossMarginSummary.accountValue   : cross-margin equity only
         crossMarginSummary.totalMarginUsed: margin locked in cross positions
-        marginSummary.accountValue        : whole-account equity (cross + isolated);
-                                            use only as last-resort fallback
+        marginSummary.accountValue        : whole-account equity; last resort
+
+        Common zero-equity cause on Hyperliquid
+        ----------------------------------------
+        HL separates the MASTER wallet (holds funds) from the API sub-wallet
+        (signs orders).  clearinghouseState for the API sub-wallet always
+        returns 0 — funds are held on the master.
+
+        HL_WALLET_ADDRESS in .env must be the MASTER wallet address, NOT the
+        address derived from HL_PRIVATE_KEY.  If they're the same you're using
+        a personal wallet directly (fine), but if HL_PRIVATE_KEY is an API
+        sub-wallet key, HL_WALLET_ADDRESS must point to the master.
+
+        We auto-detect this by falling back to the API wallet address if the
+        master returns 0 and logging a clear warning.
         """
         try:
-            wallet = config.get_settings().wallet_address
-            # Direct sync call — SyncHLAPI.get_clearinghouse_state returns dict
-            state = self._api.get_clearinghouse_state(wallet)
-            if not state:
+            master_wallet = config.get_settings().wallet_address
+            if not master_wallet:
+                logger.warning("Equity fetch: HL_WALLET_ADDRESS is not set in .env")
                 return 0.0
 
-            # 1. Top-level withdrawable — most accurate free-margin figure on HL
-            top_withdrawable = float(state.get("withdrawable") or 0)
-            if top_withdrawable > 0:
-                return top_withdrawable
+            # ── 1. Query master wallet ────────────────────────────────────────
+            state = self._api.get_clearinghouse_state(master_wallet)
+            equity = self._parse_equity_from_state(state, master_wallet)
 
-            # 2. Cross-margin free equity (accountValue − marginUsed)
-            cross = state.get("crossMarginSummary", {})
-            cross_av = float(cross.get("accountValue") or 0)
-            cross_mu = float(cross.get("totalMarginUsed") or 0)
-            cross_free = cross_av - cross_mu
-            if cross_free > 0:
-                return cross_free
+            if equity > 0:
+                return equity
 
-            # 3. Whole-account equity as last resort (may include isolated margin)
-            margin_summary = state.get("marginSummary", {})
-            return float(margin_summary.get("accountValue") or 0)
+            # ── 2. Zero equity on master — check if HL_WALLET_ADDRESS is wrong ─
+            # If HL_PRIVATE_KEY belongs to an API sub-wallet the master wallet
+            # is a DIFFERENT address.  Try the API wallet as a diagnostic fallback.
+            try:
+                api_wallet_addr = self._api.client.api_wallet_address
+                if api_wallet_addr and api_wallet_addr.lower() != master_wallet.lower():
+                    state2 = self._api.get_clearinghouse_state(api_wallet_addr)
+                    equity2 = self._parse_equity_from_state(state2, api_wallet_addr)
+                    if equity2 > 0:
+                        logger.warning(
+                            f"EQUITY MISCONFIGURATION: "
+                            f"HL_WALLET_ADDRESS={master_wallet[:14]}… has 0 equity, "
+                            f"but the API wallet {api_wallet_addr[:14]}… has ${equity2:.2f}. "
+                            f"Update HL_WALLET_ADDRESS in .env to your MASTER wallet "
+                            f"(the account you deposited USDC into on app.hyperliquid.xyz)."
+                        )
+                        return equity2
+            except Exception as e:
+                logger.debug(f"API wallet fallback equity check failed: {e}")
+
+            logger.warning(
+                f"Equity fetch returned 0 for wallet {master_wallet[:14]}… — "
+                f"verify HL_WALLET_ADDRESS is the master account with deposited funds."
+            )
+            return 0.0
 
         except Exception as e:
             logger.warning(f"Equity fetch error: {e}")
             return 0.0
+
+    @staticmethod
+    def _parse_equity_from_state(state: dict, wallet: str) -> float:
+        """
+        Extract the best free-margin figure from a clearinghouseState response.
+        Returns 0.0 if the state is empty or all fields are zero.
+        """
+        if not state:
+            return 0.0
+
+        # 1. Top-level withdrawable — most accurate free-margin figure on HL.
+        #    Accounts for cross + isolated positions and unrealised PnL.
+        top_withdrawable = float(state.get("withdrawable") or 0)
+        if top_withdrawable > 0:
+            return top_withdrawable
+
+        # 2. Cross-margin free equity (accountValue − totalMarginUsed).
+        #    Used when withdrawable is absent (older API versions).
+        cross = state.get("crossMarginSummary", {})
+        cross_av = float(cross.get("accountValue") or 0)
+        cross_mu = float(cross.get("totalMarginUsed") or 0)
+        cross_free = cross_av - cross_mu
+        if cross_free > 0:
+            return cross_free
+
+        # 3. Whole-account equity as last resort.
+        #    May include isolated margin so it slightly overstates free margin.
+        margin_summary = state.get("marginSummary", {})
+        return float(margin_summary.get("accountValue") or 0)
 
     # ─── NOTIFICATIONS ────────────────────────────────────────────────────────
 

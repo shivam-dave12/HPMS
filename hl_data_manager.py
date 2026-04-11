@@ -328,7 +328,15 @@ class HLDataManager:
         """
         try:
             now_ms = int(time.time() * 1000)
-            start_ms = now_ms - 5 * 60 * 1000  # last 5 minutes
+
+            # Fetch 8 minutes instead of 5 to avoid boundary misses:
+            # with exactly 5 min the candle at start_ms boundary may be
+            # excluded when its open time is 1–2 ms before start_ms.
+            start_ms = now_ms - 8 * 60 * 1000
+
+            # Extend endTime 2 minutes past now so the request always
+            # covers the current forming candle regardless of API latency.
+            end_ms = now_ms + 2 * 60 * 1000
 
             raw = self._run_async(
                 self._client._post_info({
@@ -337,7 +345,7 @@ class HLDataManager:
                         "coin": self._symbol,
                         "interval": "1m",
                         "startTime": start_ms,
-                        "endTime": now_ms,
+                        "endTime": end_ms,
                     },
                 }),
                 timeout=10,
@@ -365,8 +373,17 @@ class HLDataManager:
                             self._last_price = candle.close
                             self._last_price_update_time = time.time()
 
-                            # Detect forming candle: close_time >= now
-                            is_forming = close_ts >= now_ms
+                            # Forming candle detection with 1-second clock-skew buffer.
+                            #
+                            # Bug in original code: `close_ts >= now_ms` fails when the
+                            # client clock is even slightly behind HL server time — a
+                            # completed candle (T = minute_boundary) would read as forming
+                            # if client now_ms < T by even 1 ms, causing it to be silently
+                            # dropped.  The buffer means: only treat a candle as forming
+                            # if its close time is MORE than 1 s in the future.  This
+                            # tolerates up to 1 s of client-behind-server clock skew
+                            # without ever dropping a completed bar.
+                            is_forming = close_ts > (now_ms + 1000)
 
                             if is_forming:
                                 # Don't write forming candle into the deque —
