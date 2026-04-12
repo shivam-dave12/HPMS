@@ -253,14 +253,40 @@ class HPMSStrategy:
                 return signal
 
             # ── Regime filter ─────────────────────────────────────────────────
-            # In CHOPPY regime with low confidence, skip — edge is insufficient
-            from hpms_engine import RegimeType
-            signal_regime = getattr(signal, "regime", RegimeType.UNKNOWN)
+            # Two independent checks:
+            #
+            # 1. CHOPPY + low confidence: edge is insufficient in a directionless
+            #    market.  Unchanged from previous logic.
+            #
+            # 2. TRENDING + signal opposes the measured trend direction: a counter-
+            #    trend entry into confirmed momentum requires materially higher
+            #    confidence (≥ 0.70) to justify overriding the regime signal.
+            #    Production logs showed ALL LONG signals occurring with negative
+            #    trend_strength (bearish regime), yet passing the filter because
+            #    only CHOPPY was checked.  This adds the missing TRENDING gate.
+            from hpms_engine import RegimeType, SignalType as _ST
+            signal_regime    = getattr(signal, "regime",          RegimeType.UNKNOWN)
+            sig_trend_str    = getattr(signal, "trend_strength",  0.0)
+
             if signal_regime == RegimeType.CHOPPY and signal.confidence < 0.55:
                 self._log_blocked(
                     f"REGIME: CHOPPY + low conf ({signal.confidence:.1%})", signal
                 )
                 return signal
+
+            if signal_regime == RegimeType.TRENDING:
+                trend_aligns = (
+                    (signal.signal_type == _ST.LONG  and sig_trend_str > 0) or
+                    (signal.signal_type == _ST.SHORT and sig_trend_str < 0)
+                )
+                if not trend_aligns and signal.confidence < 0.70:
+                    self._log_blocked(
+                        f"REGIME: TRENDING counter-trend "
+                        f"(strength={sig_trend_str:+.3f}) + "
+                        f"insufficient conf ({signal.confidence:.1%}<0.70)",
+                        signal,
+                    )
+                    return signal
 
             # ── Position sizing (confidence-weighted, vol-normalized) ─────────
             balance = self._api.get_balance("USD")
@@ -342,6 +368,7 @@ class HPMSStrategy:
                     f"TP=${signal.tp_price:,.1f} SL=${signal.sl_price:,.1f} "
                     f"margin=${margin_used:.2f} fee=$-{entry_fee:.4f} "
                     f"conf={signal.confidence:.1%} regime={signal_regime.name} "
+                    f"trend={sig_trend_str:+.3f} "
                     f"id={result.get('order_id', '')}"
                 )
                 self._push(
@@ -352,7 +379,8 @@ class HPMSStrategy:
                     f"SL: `${signal.sl_price:,.1f}` (`${abs(signal.sl_price - actual_entry):.1f}`)\n"
                     f"Margin: `${margin_used:.2f}` @ `{leverage}x`\n"
                     f"Entry fee: `$-{entry_fee:.4f}` _(exact)_\n"
-                    f"Conf: `{signal.confidence:.1%}` | Regime: `{signal_regime.name}`\n"
+                    f"Conf: `{signal.confidence:.1%}` | Regime: `{signal_regime.name}` "
+                    f"trend `{sig_trend_str:+.3f}`\n"
                     f"Δq: `{signal.predicted_delta_q:+.5f}`"
                 )
                 self._block_count = 0

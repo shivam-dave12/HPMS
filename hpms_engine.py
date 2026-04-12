@@ -81,8 +81,9 @@ class HPMSSignal:
     reason:            str
     compute_time_us:   float
     bar_timestamp:     float
-    bars_since_kde:    int = 0
+    bars_since_kde:    int   = 0
     regime:            RegimeType = RegimeType.UNKNOWN
+    trend_strength:    float = 0.0
 
 
 @dataclass
@@ -464,7 +465,15 @@ class HPMSEngine:
             # Efficiency ratio: |net move| / total path
             net_move = abs(closes_recent[-1] - closes_recent[0])
             total_path = np.sum(np.abs(np.diff(closes_recent)))
-            efficiency = net_move / total_path if total_path > 0 else 0.0
+            # efficiency² forces drift to vanish in choppy markets (efficiency≈0)
+            # and grow in trending ones.  Cast to Python float before arithmetic
+            # to prevent numpy.float64 from contaminating the integrator chain:
+            # once dp1 = -dV_func(q) carries a numpy scalar, every subsequent
+            # p += dt*dp expression becomes numpy.float64, causing all downstream
+            # boolean comparisons (p_pred > 0 etc.) to produce numpy.bool_ instead
+            # of Python bool.  numpy.bool_ is not handled natively by json.dumps
+            # and falls through to default=str → serialised as the string "True".
+            efficiency = float(net_move / total_path) if total_path > 0 else 0.0
 
             # Drift force = mean momentum × efficiency² (only strong in clear trends)
             # efficiency² makes it vanish quickly in choppy markets
@@ -853,69 +862,107 @@ class HPMSEngine:
                      traj_factor=round(traj_factor, 3),
                      regime=regime.name)
 
-        # ── Step 8: TP/SL — PROPORTIONAL TO PREDICTED MOVE ───────────────────
-        # TP = f(predicted_move), bounded by ATR reality
-        # SL = volatility-based (ATR), NOT fixed %
-        # TP = proportional to predicted move, with fee-aware NET R:R floor
+        # ── Step 8: TP/SL — Signal-derived, Gross R:R gated ────────────────────
+        #
+        # Design principle
+        # ─────────────────
+        # TP is derived exclusively from the predicted price move.  We NEVER
+        # inflate TP beyond the prediction to satisfy a fee-aware R:R target —
+        # that practice manufactures phantom targets that are unreachable within
+        # the prediction horizon and causes the trailing stop to remain stuck in
+        # INITIAL indefinitely (as confirmed in production logs).
+        #
+        # Rejection, not inflation, is the industry-grade response to a weak
+        # signal.  If the predicted move is too small to support the ATR-based SL
+        # with gross R:R ≥ MIN_GROSS_RR, the signal is demoted to FLAT.
+        #
+        # Fee accounting
+        # ──────────────
+        # fee_rt_price = price × fee_rate × 2 (round-trip, price-space per BTC).
+        # This is dimensionally identical to TP/SL distances (price-space).
+        # It is position-size invariant: with a 0.001 BTC/contract instrument the
+        # fee per contract (USD) scales with size, but the fee per unit of price
+        # exposure (fee_rt_price) is constant.
+        #
+        # We log net_rr for awareness.  net_rr is NOT used to inflate TP.
+        # A net_rr ≤ 0 (TP below fee floor) is an unconditional FLAT because
+        # the trade loses money even on a TP hit.
+        #
         if signal_type != SignalType.FLAT and len(closes_arr) >= 15:
-            recent = closes_arr[-15:]
+            recent     = closes_arr[-15:]
             bar_ranges = np.abs(np.diff(recent))
-            atr_1bar = float(np.mean(bar_ranges)) if len(bar_ranges) > 0 else current_price * 0.0005
+            atr_1bar   = (float(np.mean(bar_ranges))
+                          if len(bar_ranges) > 0
+                          else current_price * 0.0005)
 
-            # Estimate round-trip fee in price terms (for R:R computation)
-            # Uses the exchange fee rate (~0.05% taker) to compute fee drag
-            fee_rate = getattr(self, '_fee_rate', 0.00053)  # Delta taker fee ~0.053%
-            fee_per_side_price = current_price * fee_rate
-            rt_fee_price = fee_per_side_price * 2  # entry + exit
+            # Round-trip fee in price-space (position-size invariant)
+            fee_rt_price = current_price * self._fee_rate * 2
 
-            # TP proportional to predicted move
+            # ── Take-Profit: signal-derived ───────────────────────────────
+            # Primary source: 85% of predicted price move (forecast haircut).
+            # Floor: 1.5 × ATR (minimum room beyond intra-bar noise).
+            # Cap: config maximum (prevents runaway TP on extreme forecasts).
             predicted_dollar_move = abs(predicted_pct_move) * current_price
-            tp_distance = max(predicted_dollar_move * 0.85, atr_1bar * 2.0)
-
-            # SL based on ATR: 1.3 × ATR × sqrt(horizon) — tighter SL for better R:R
-            sl_distance = atr_1bar * 1.3 * math.sqrt(self._horizon)
-
-            # ── Fee-aware NET R:R enforcement ────────────────────────────
-            # net_reward = tp_distance - rt_fee_price (what you keep after fees on a win)
-            # net_risk   = sl_distance + rt_fee_price (what you lose including fees on a loss)
-            # net_rr     = net_reward / net_risk
-            # We enforce net_rr >= 1.5 so that 50% WR is profitable
-            min_net_rr = 1.5
-            net_reward = tp_distance - rt_fee_price
-            net_risk = sl_distance + rt_fee_price
-
-            if net_risk > 0 and net_reward / net_risk < min_net_rr:
-                # Widen TP to meet net R:R requirement
-                tp_distance = min_net_rr * net_risk + rt_fee_price
-
-            # ── Minimum TP: must exceed 3× round-trip fees ───────────────
-            # If TP can't cover 3× fees, the trade has no edge
-            min_tp = rt_fee_price * 3.0
-            if tp_distance < min_tp:
-                tp_distance = min_tp
-
-            # Hard caps from config (widened to allow room)
+            tp_distance = max(predicted_dollar_move * 0.85, atr_1bar * 1.5)
             tp_distance = min(tp_distance, current_price * self._tp_pct)
+            tp_distance = max(tp_distance, current_price * 0.0002)  # absolute floor
+
+            # ── Stop-Loss: ATR-calibrated ─────────────────────────────────
+            # sqrt(horizon) scales single-bar ATR to the holding-period window.
+            # 1.3× survival buffer above expected noise during the trade.
+            sl_distance = atr_1bar * 1.3 * math.sqrt(self._horizon)
             sl_distance = min(sl_distance, current_price * self._sl_pct)
+            sl_distance = max(sl_distance, current_price * 0.0001)  # absolute floor
 
-            # Floors
-            tp_distance = max(tp_distance, current_price * 0.0002)
-            sl_distance = max(sl_distance, current_price * 0.0001)
+            # ── Gross R:R (exchange-level, fee-exclusive) ─────────────────
+            # Primary gate: reward-to-risk before fees.
+            # Reject if the predicted move is too small for the SL risk taken.
+            gross_rr  = tp_distance / sl_distance if sl_distance > 0 else 0.0
 
-            # Final net R:R check — if after caps it's still bad, demote to FLAT
-            final_net_rr = (tp_distance - rt_fee_price) / (sl_distance + rt_fee_price) if (sl_distance + rt_fee_price) > 0 else 0
-            if final_net_rr < 1.0:
+            # ── Net R:R (fee-inclusive, per-unit) ────────────────────────
+            # Informational: honest post-fee expectation.
+            # Used only for the TP-below-fee-floor guard; never to widen TP.
+            net_reward   = tp_distance - fee_rt_price
+            net_risk     = sl_distance + fee_rt_price
+            final_net_rr = net_reward / net_risk if net_risk > 0 else 0.0
+
+            _MIN_GROSS_RR = 1.5   # minimum reward:risk before fees
+
+            if gross_rr < _MIN_GROSS_RR:
+                # Predicted move insufficient for the SL risk — reject cleanly.
                 signal_type = SignalType.FLAT
-                reason = (f"FLAT: net_RR={final_net_rr:.2f}<1.0 after fee drag "
-                          f"(tp=${tp_distance:.0f} sl=${sl_distance:.0f} fees=${rt_fee_price:.0f})")
+                reason = (
+                    f"FLAT: gross_rr={gross_rr:.2f}<{_MIN_GROSS_RR} "
+                    f"— predicted=${predicted_dollar_move:.0f} "
+                    f"tp=${tp_distance:.0f} sl=${sl_distance:.0f} "
+                    f"(need tp≥${sl_distance * _MIN_GROSS_RR:.0f})"
+                )
                 tp_price = 0.0
                 sl_price = 0.0
                 elog.log("ENGINE_SKIP", reason=reason,
-                         net_rr=round(final_net_rr, 3),
+                         gross_rr=round(gross_rr, 3),
+                         predicted_dollar_move=round(predicted_dollar_move, 1),
                          tp_dist=round(tp_distance, 1),
                          sl_dist=round(sl_distance, 1),
-                         rt_fee_price=round(rt_fee_price, 1))
+                         min_gross_rr=_MIN_GROSS_RR)
+
+            elif net_reward <= 0:
+                # TP does not cover the round-trip fee: a TP hit still loses money.
+                signal_type = SignalType.FLAT
+                reason = (
+                    f"FLAT: TP below fee floor "
+                    f"— net_reward=${net_reward:.1f} "
+                    f"(tp=${tp_distance:.0f} fee_rt=${fee_rt_price:.0f})"
+                )
+                tp_price = 0.0
+                sl_price = 0.0
+                elog.log("ENGINE_SKIP", reason=reason,
+                         net_reward=round(net_reward, 2),
+                         fee_rt_price=round(fee_rt_price, 1),
+                         tp_dist=round(tp_distance, 1))
+
             else:
+                # Valid trade — place TP/SL symmetrically around entry.
                 if signal_type == SignalType.LONG:
                     tp_price = current_price + tp_distance
                     sl_price = current_price - sl_distance
@@ -923,15 +970,24 @@ class HPMSEngine:
                     tp_price = current_price - tp_distance
                     sl_price = current_price + sl_distance
 
-                elog.log("ENGINE_RR",
-                         tp_dist=round(tp_distance, 1),
-                         sl_dist=round(sl_distance, 1),
-                         gross_rr=round(tp_distance/sl_distance, 2) if sl_distance > 0 else 0,
-                         net_rr=round(final_net_rr, 2),
-                         rt_fee_price=round(rt_fee_price, 1),
-                         be_winrate=round(1/(1+final_net_rr)*100, 0))
+                elog.log(
+                    "ENGINE_RR",
+                    tp_dist=round(tp_distance, 1),
+                    sl_dist=round(sl_distance, 1),
+                    gross_rr=round(gross_rr, 2),
+                    net_rr=round(final_net_rr, 2),
+                    fee_rt_price=round(fee_rt_price, 1),
+                    predicted_move=round(predicted_dollar_move, 1),
+                    atr_1bar=round(atr_1bar, 1),
+                    # Breakeven win-rate at gross R:R (before fees)
+                    be_wr_gross=round(1.0 / (1.0 + gross_rr) * 100.0, 1),
+                    # Breakeven win-rate at net R:R (after fees)
+                    be_wr_net=(round(1.0 / (1.0 + final_net_rr) * 100.0, 1)
+                               if final_net_rr > 0 else 100.0),
+                )
 
         elif signal_type != SignalType.FLAT:
+            # Insufficient candle history — use config percentages as fallback.
             if signal_type == SignalType.LONG:
                 tp_price = current_price * (1.0 + self._tp_pct)
                 sl_price = current_price * (1.0 - self._sl_pct)
@@ -1002,6 +1058,7 @@ class HPMSEngine:
             bar_timestamp=timestamp,
             bars_since_kde=self._bars_since_kde_build,
             regime=regime,
+            trend_strength=trend_strength,
         )
 
     # ─── DIAGNOSTICS ──────────────────────────────────────────────────────────
@@ -1195,20 +1252,41 @@ class HPMSEngine:
         #   b) actual fee breakeven + margin
         # This ensures we never move to "breakeven" at a price that would
         # still result in a net loss after fees.
+        # ── Activation threshold ─────────────────────────────────────────────
+        #
+        # Separation of concerns
+        # ───────────────────────
+        # Two independent questions are answered here:
+        #
+        # 1. "Has the trade moved far enough to begin trailing?"
+        #    → activation_move = TP_distance × TRAILING_BE_ACTIVATION_PCT
+        #    → This is a TP-progress trigger, position-size invariant, and
+        #      proportional to the trade's expected earning potential.
+        #
+        # 2. "What is the worst SL price we will accept once trailing starts?"
+        #    → floor_sl = entry ± fee_breakeven_with_margin
+        #    → The SL can never be placed where a fill would leave a net loss
+        #      after paying both legs of the exchange fee.
+        #
+        # Previously, (1) and (2) were conflated via:
+        #   activation_move = max(TP × 40%, fee_breakeven)
+        # In the observed fee environment (fee_breakeven ≈ $76, TP ≈ $88) the
+        # fee floor always dominated, requiring >94% of the TP to be earned
+        # before trailing began — making the INITIAL phase effectively permanent.
+        #
+        # The fix: activation uses only TP percentage; the fee floor is applied
+        # exclusively as a constraint on the candidate SL, never on activation.
+        #
         be_activation_pct = getattr(config, "TRAILING_BE_ACTIVATION_PCT", 0.40)
-        activation_move = max(
-            entry_to_tp * be_activation_pct,
-            fee_breakeven_with_margin,
-        )
-        activation_progress = activation_move / entry_to_tp
+        activation_move   = entry_to_tp * be_activation_pct
 
-        lock_tp_pct = getattr(config, "TRAILING_LOCK_TP_PCT", 0.75)
-        atr_mult = getattr(config, "TRAILING_ATR_MULTIPLIER", 3.0)
-        lock_atr_mult = getattr(config, "TRAILING_LOCK_ATR_MULTIPLIER", 1.5)
-        min_step = getattr(config, "TRAILING_MIN_STEP_TICKS", 0.5)
+        lock_tp_pct   = getattr(config, "TRAILING_LOCK_TP_PCT",         0.75)
+        atr_mult      = getattr(config, "TRAILING_ATR_MULTIPLIER",       3.0)
+        lock_atr_mult = getattr(config, "TRAILING_LOCK_ATR_MULTIPLIER",  1.5)
+        min_step      = getattr(config, "TRAILING_MIN_STEP_TICKS",       0.5)
 
         if favorable_move < activation_move:
-            # ── INITIAL: haven't moved past fee breakeven yet ────────────
+            # ── INITIAL — trade has not earned the right to trail yet ───────
             result["phase"] = "INITIAL"
             elog.log(
                 "ENGINE_TRAIL",
@@ -1217,63 +1295,73 @@ class HPMSEngine:
                 progress=round(tp_progress, 4),
                 favorable_move=round(favorable_move, 2),
                 activation_move=round(activation_move, 2),
+                activation_pct=be_activation_pct,
                 fee_be=round(fee_breakeven_move, 2),
                 fee_be_margin=round(fee_breakeven_with_margin, 2),
                 atr=round(atr, 2),
             )
             return result
 
-        # ── Past activation — compute breakeven floor from actual fees ───
-        # The SL floor guarantees: if SL is hit, gross PnL >= total fees.
-        # floor = entry + fee_breakeven_with_margin (long)
-        # floor = entry - fee_breakeven_with_margin (short)
-        be_floor = fee_breakeven_with_margin
-
+        # ── Past activation: compute ATR-based trail distance ────────────────
         if tp_progress >= lock_tp_pct:
-            # Phase LOCK: close to TP, tighten trail
+            # LOCK: close to TP — tighten trail to protect accumulated profit.
             trail_distance = atr * lock_atr_mult
-            result["phase"] = "LOCK"
-        elif tp_progress >= activation_progress:
-            # Phase TRAILING: standard wide trail
-            trail_distance = atr * atr_mult
-            result["phase"] = "TRAILING"
+            phase          = "LOCK"
         else:
-            # Phase BREAKEVEN: just entered the zone
-            trail_distance = favorable_move
-            result["phase"] = "BREAKEVEN"
+            # TRAILING: wide ATR trail to survive normal pullbacks.
+            trail_distance = atr * atr_mult
+            phase          = "TRAILING"
 
         result["trail_dist"] = round(trail_distance, 2)
 
-        # ── Compute candidate SL ─────────────────────────────────────────
+        # ── Fee-breakeven floor: ensures SL never sits below break-even ──────
+        # Once trailing begins the SL is constrained so that if it is hit, the
+        # gross P&L covers the full round-trip fee (entry already paid + the
+        # estimated exit fee).  The BREAKEVEN phase is reported when this floor
+        # is the binding constraint rather than the ATR trail.
+        be_floor = fee_breakeven_with_margin
+
+        # ── Compute candidate SL and apply ratchet ───────────────────────────
         if is_long:
-            # Trail below current price, floor at entry + fee breakeven
-            trail_sl = current_price - trail_distance
-            floor_sl = entry_price + be_floor
+            trail_sl     = current_price - trail_distance
+            floor_sl     = entry_price   + be_floor
             candidate_sl = max(trail_sl, floor_sl)
 
-            # Ratchet: only move UP
+            # Phase reporting: BREAKEVEN when the fee floor overrides the trail.
+            if trail_sl < floor_sl:
+                phase = "BREAKEVEN"
+
+            # Ratchet: SL can only move UP for a long position.
             if candidate_sl > current_sl + min_step:
                 result["new_sl"] = round(candidate_sl, 1)
-        else:
-            # Trail above current price, ceiling at entry - fee breakeven
-            trail_sl = current_price + trail_distance
-            ceiling_sl = entry_price - be_floor
+
+        else:  # short
+            trail_sl     = current_price + trail_distance
+            ceiling_sl   = entry_price   - be_floor
             candidate_sl = min(trail_sl, ceiling_sl)
 
-            # Ratchet: only move DOWN
+            # Phase reporting: BREAKEVEN when the fee ceiling overrides the trail.
+            if trail_sl > ceiling_sl:
+                phase = "BREAKEVEN"
+
+            # Ratchet: SL can only move DOWN for a short position.
             if candidate_sl < current_sl - min_step:
                 result["new_sl"] = round(candidate_sl, 1)
 
+        result["phase"] = phase
+
         elog.log(
             "ENGINE_TRAIL",
-            phase=result["phase"],
+            phase=phase,
             bars=bars_held,
             progress=round(tp_progress, 4),
+            favorable_move=round(favorable_move, 2),
+            activation_move=round(activation_move, 2),
             atr=round(atr, 2),
             trail_dist=round(trail_distance, 2),
             current_sl=round(current_sl, 1),
             new_sl=result["new_sl"],
-            candidate=round(candidate_sl, 1) if candidate_sl else None,
+            candidate=round(candidate_sl, 1),
             fee_be=round(fee_breakeven_move, 2),
             fee_be_margin=round(fee_breakeven_with_margin, 2),
             total_fees=round(total_round_trip_fees, 4),
