@@ -57,7 +57,7 @@ SIGNAL_ACCELERATION_CHECK = True    # ALWAYS ON — second derivative confirmati
 # ═══════════════════════════════════════════════════════════════════════════════
 # TRADE EXECUTION (v2 — Dynamic TP/SL)
 # ═══════════════════════════════════════════════════════════════════════════════
-TRADE_TP_PCT              = 0.0035  # MAX TP cap (actual TP proportional to predicted move)
+TRADE_TP_PCT              = 0.0055  # MAX TP cap (widened to allow fee-aware R:R to work)
 TRADE_SL_PCT              = 0.0018  # MAX SL cap (actual SL based on ATR)
 
 # ── Trailing Stop System (replaces time-based max hold) ──────────────

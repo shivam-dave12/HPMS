@@ -276,6 +276,9 @@ class HPMSEngine:
         self._trajectory_log_depth = trajectory_log_depth
         self._bars_since_kde_build = 0
 
+        # Fee rate for R:R computation (Delta taker fee ≈ 0.053%)
+        self._fee_rate = 0.00053
+
         self._landscape  = PotentialLandscape(bandwidth=kde_bandwidth, grid_points=kde_grid_points)
         self._integrator = _INTEGRATORS.get(integrator, _rk4_step)
         self._state      = EngineState()
@@ -305,6 +308,7 @@ class HPMSEngine:
             "integrator":           ("_integrator_name",   str),
             "H_ema_span":           ("_H_ema_span",        int),
             "kde_rebuild_interval": ("_kde_rebuild_interval", int),
+            "fee_rate":             ("_fee_rate",            float),
         }
         if key not in _MAP:
             return False
@@ -338,6 +342,7 @@ class HPMSEngine:
             "sl_pct":               self._sl_pct,
             "H_ema_span":           self._H_ema_span,
             "kde_rebuild_interval": self._kde_rebuild_interval,
+            "fee_rate":             self._fee_rate,
         }
 
     # ─── PHASE SPACE RECONSTRUCTION ───────────────────────────────────────────
@@ -362,10 +367,37 @@ class HPMSEngine:
         return (log_c - mu) / std, std
 
     def _compute_p(self, q_series: np.ndarray) -> np.ndarray:
+        """
+        Compute phase-space momentum as smoothed rate of change of q.
+
+        Original: p = (q[t] - q[t-tau]) / tau — pure finite difference.
+        Problem: extremely noisy, single-bar spikes dominate.
+
+        Fix: exponentially-weighted moving average of the tau-lagged difference.
+        This preserves the directional signal while rejecting single-bar noise.
+        The EWM span matches tau, so the smoothing window is physically consistent
+        with the embedding delay.
+        """
         tau = self._tau
         p = np.full_like(q_series, np.nan)
-        if len(q_series) > tau:
-            p[tau:] = (q_series[tau:] - q_series[:-tau]) / tau
+        if len(q_series) <= tau:
+            return p
+
+        # Raw tau-lagged difference (same as before)
+        raw_diff = (q_series[tau:] - q_series[:-tau]) / tau
+
+        # EWM smoothing: span = tau gives half-life ≈ tau/2.7 bars
+        # This rejects single-bar spikes while preserving multi-bar trends
+        if len(raw_diff) >= 3:
+            alpha = 2.0 / (tau + 1.0)
+            smoothed = np.empty_like(raw_diff)
+            smoothed[0] = raw_diff[0]
+            for i in range(1, len(raw_diff)):
+                smoothed[i] = alpha * raw_diff[i] + (1.0 - alpha) * smoothed[i - 1]
+            p[tau:] = smoothed
+        else:
+            p[tau:] = raw_diff
+
         return p
 
     def _compute_H(self, q: float, p: float) -> Tuple[float, float, float]:
@@ -398,13 +430,54 @@ class HPMSEngine:
     # ─── FORWARD INTEGRATION ──────────────────────────────────────────────────
 
     def _integrate_forward(self, q0: float, p0: float) -> List[TrajectoryPoint]:
+        """
+        Forward-integrate the trajectory in phase space.
+
+        Core improvement: drift-corrected Hamiltonian.
+
+        The original H = p²/2m + V(q) is purely conservative with V(q) derived
+        from KDE of historical q values. This creates a mean-reversion bias:
+        trajectories always get pulled back toward the density center (where
+        prices WERE), even in trending markets.
+
+        Fix: Add a regime-dependent drift force F:
+            H_eff = p²/2m + V(q) - F·q
+
+        In trending markets, F biases trajectories forward with the trend.
+        In choppy markets, F ≈ 0 (pure mean-reversion is correct).
+
+        The drift is derived from the efficiency ratio of recent price action,
+        NOT from a separate indicator — it's an intrinsic property of the
+        phase-space dynamics.
+        """
         trajectory = [TrajectoryPoint(t=0.0, q=q0, p=p0, H=self._compute_H(q0, p0)[0])]
         q, p = q0, p0
         steps_per_bar = max(1, int(1.0 / self._dt))
 
+        # ── Compute drift force from recent phase-space dynamics ─────
+        # Drift = weighted average of recent momentum, scaled by trend efficiency
+        drift_force = 0.0
+        if len(self._state.p_history) >= 10 and len(self._state.close_history) >= 20:
+            p_arr = np.array(self._state.p_history[-20:])
+            closes_recent = np.array(self._state.close_history[-20:])
+
+            # Efficiency ratio: |net move| / total path
+            net_move = abs(closes_recent[-1] - closes_recent[0])
+            total_path = np.sum(np.abs(np.diff(closes_recent)))
+            efficiency = net_move / total_path if total_path > 0 else 0.0
+
+            # Drift force = mean momentum × efficiency² (only strong in clear trends)
+            # efficiency² makes it vanish quickly in choppy markets
+            mean_p = float(np.mean(p_arr[-10:]))
+            drift_force = mean_p * efficiency * efficiency * 0.5
+
+        def dV_dq_with_drift(q_val):
+            """Effective force: -dV/dq + F (drift opposes potential gradient in trends)"""
+            return self._landscape.dV_dq(q_val) - drift_force
+
         for bar in range(1, self._horizon + 1):
             for _ in range(steps_per_bar):
-                q, p = self._integrator(q, p, self._dt, self._mass, self._landscape.dV_dq)
+                q, p = self._integrator(q, p, self._dt, self._mass, dV_dq_with_drift)
             H, _, _ = self._compute_H(q, p)
             trajectory.append(TrajectoryPoint(t=float(bar), q=q, p=p, H=H))
 
@@ -578,14 +651,24 @@ class HPMSEngine:
         delta_q = q_pred - q_now
 
         std_log = max(ewma_std, 1e-12)
-        predicted_pct_move = delta_q * std_log
+
+        # ── Proper inverse z-score: q_pred back to log-price space ───────
+        # q = (log_price - mu) / std, so log_price_pred = q_pred * std + mu
+        # But mu is the EWMA mean of the normalization window, which we need.
+        # We recover mu from: q_now * std + mu = log(current_price)
+        # → mu = log(current_price) - q_now * std
+        log_current = math.log(float(closes_arr[-1]))
+        mu_recovered = log_current - q_now * std_log
+        log_price_pred = q_pred * std_log + mu_recovered
+        predicted_pct_move = math.exp(log_price_pred - log_current) - 1.0
 
         elog.log("ENGINE_TRAJECTORY",
                  q_start=round(q_now, 6), q_pred=round(q_pred, 6),
                  p_start=round(p_now, 6), p_pred=round(p_pred, 6),
                  delta_q_zscale=round(delta_q, 6),
                  predicted_pct_move=round(predicted_pct_move, 6),
-                 std_log=round(std_log, 8), horizon_bars=self._horizon)
+                 std_log=round(std_log, 8), horizon_bars=self._horizon,
+                 drift_corrected=True)
 
         # ── Step 6: Signal criteria ───────────────────────────────────────────
 
@@ -773,37 +856,81 @@ class HPMSEngine:
         # ── Step 8: TP/SL — PROPORTIONAL TO PREDICTED MOVE ───────────────────
         # TP = f(predicted_move), bounded by ATR reality
         # SL = volatility-based (ATR), NOT fixed %
+        # TP = proportional to predicted move, with fee-aware NET R:R floor
         if signal_type != SignalType.FLAT and len(closes_arr) >= 15:
             recent = closes_arr[-15:]
             bar_ranges = np.abs(np.diff(recent))
             atr_1bar = float(np.mean(bar_ranges)) if len(bar_ranges) > 0 else current_price * 0.0005
 
-            # TP proportional to predicted move: use 70% of predicted move as TP
-            # (leaving room — don't need the full predicted move to be profitable)
+            # Estimate round-trip fee in price terms (for R:R computation)
+            # Uses the exchange fee rate (~0.05% taker) to compute fee drag
+            fee_rate = getattr(self, '_fee_rate', 0.00053)  # Delta taker fee ~0.053%
+            fee_per_side_price = current_price * fee_rate
+            rt_fee_price = fee_per_side_price * 2  # entry + exit
+
+            # TP proportional to predicted move
             predicted_dollar_move = abs(predicted_pct_move) * current_price
-            tp_distance = max(predicted_dollar_move * 0.70, atr_1bar * 1.5)
+            tp_distance = max(predicted_dollar_move * 0.85, atr_1bar * 2.0)
 
-            # SL based on ATR: 1.5 × ATR × sqrt(horizon)
-            sl_distance = atr_1bar * 1.5 * math.sqrt(self._horizon)
+            # SL based on ATR: 1.3 × ATR × sqrt(horizon) — tighter SL for better R:R
+            sl_distance = atr_1bar * 1.3 * math.sqrt(self._horizon)
 
-            # Ensure minimum R:R of 1.5:1
-            if tp_distance < sl_distance * 1.5:
-                tp_distance = sl_distance * 1.5
+            # ── Fee-aware NET R:R enforcement ────────────────────────────
+            # net_reward = tp_distance - rt_fee_price (what you keep after fees on a win)
+            # net_risk   = sl_distance + rt_fee_price (what you lose including fees on a loss)
+            # net_rr     = net_reward / net_risk
+            # We enforce net_rr >= 1.5 so that 50% WR is profitable
+            min_net_rr = 1.5
+            net_reward = tp_distance - rt_fee_price
+            net_risk = sl_distance + rt_fee_price
 
-            # Hard caps from config
+            if net_risk > 0 and net_reward / net_risk < min_net_rr:
+                # Widen TP to meet net R:R requirement
+                tp_distance = min_net_rr * net_risk + rt_fee_price
+
+            # ── Minimum TP: must exceed 3× round-trip fees ───────────────
+            # If TP can't cover 3× fees, the trade has no edge
+            min_tp = rt_fee_price * 3.0
+            if tp_distance < min_tp:
+                tp_distance = min_tp
+
+            # Hard caps from config (widened to allow room)
             tp_distance = min(tp_distance, current_price * self._tp_pct)
             sl_distance = min(sl_distance, current_price * self._sl_pct)
 
             # Floors
-            tp_distance = max(tp_distance, current_price * 0.0001)
+            tp_distance = max(tp_distance, current_price * 0.0002)
             sl_distance = max(sl_distance, current_price * 0.0001)
 
-            if signal_type == SignalType.LONG:
-                tp_price = current_price + tp_distance
-                sl_price = current_price - sl_distance
+            # Final net R:R check — if after caps it's still bad, demote to FLAT
+            final_net_rr = (tp_distance - rt_fee_price) / (sl_distance + rt_fee_price) if (sl_distance + rt_fee_price) > 0 else 0
+            if final_net_rr < 1.0:
+                signal_type = SignalType.FLAT
+                reason = (f"FLAT: net_RR={final_net_rr:.2f}<1.0 after fee drag "
+                          f"(tp=${tp_distance:.0f} sl=${sl_distance:.0f} fees=${rt_fee_price:.0f})")
+                tp_price = 0.0
+                sl_price = 0.0
+                elog.log("ENGINE_SKIP", reason=reason,
+                         net_rr=round(final_net_rr, 3),
+                         tp_dist=round(tp_distance, 1),
+                         sl_dist=round(sl_distance, 1),
+                         rt_fee_price=round(rt_fee_price, 1))
             else:
-                tp_price = current_price - tp_distance
-                sl_price = current_price + sl_distance
+                if signal_type == SignalType.LONG:
+                    tp_price = current_price + tp_distance
+                    sl_price = current_price - sl_distance
+                else:
+                    tp_price = current_price - tp_distance
+                    sl_price = current_price + sl_distance
+
+                elog.log("ENGINE_RR",
+                         tp_dist=round(tp_distance, 1),
+                         sl_dist=round(sl_distance, 1),
+                         gross_rr=round(tp_distance/sl_distance, 2) if sl_distance > 0 else 0,
+                         net_rr=round(final_net_rr, 2),
+                         rt_fee_price=round(rt_fee_price, 1),
+                         be_winrate=round(1/(1+final_net_rr)*100, 0))
+
         elif signal_type != SignalType.FLAT:
             if signal_type == SignalType.LONG:
                 tp_price = current_price * (1.0 + self._tp_pct)
