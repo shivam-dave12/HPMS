@@ -364,6 +364,96 @@ class OrderManager:
                 logger.error(f"Close exception: {e}", exc_info=True)
                 return {"success": False, "error": str(e)}
 
+    # ─── TRAILING STOP — SL MODIFICATION ────────────────────────────────────
+
+    def update_sl_price(self, new_sl_price: float) -> bool:
+        """
+        Move the stop-loss to a new (better) price.
+
+        Rules enforced:
+          - Long:  new SL must be >= current SL (can only move UP)
+          - Short: new SL must be <= current SL (can only move DOWN)
+          - Must have an active SL order to replace
+
+        Returns True if SL was successfully updated on the exchange.
+        """
+        with self._lock:
+            if not self._position_side or not self._sl_order_id:
+                return False
+
+            new_sl_price = round(new_sl_price, 1)
+
+            # Enforce ratchet: SL can only improve
+            if self._position_side == "long" and new_sl_price <= self._sl_price:
+                return False
+            if self._position_side == "short" and new_sl_price >= self._sl_price:
+                return False
+
+            old_sl = self._sl_price
+            old_sl_id = self._sl_order_id
+            exit_side = "sell" if self._position_side == "long" else "buy"
+
+            try:
+                # Cancel old SL
+                self._api.cancel_order(old_sl_id)
+
+                # Place new SL
+                sl_resp = self._api.place_stop_market_order(
+                    symbol=self._symbol,
+                    side=exit_side,
+                    size=self._position_size,
+                    stop_price=new_sl_price,
+                    reduce_only=True,
+                    product_id=self._product_id,
+                )
+                if sl_resp.get("success"):
+                    self._sl_order_id = sl_resp["result"].get("order_id")
+                    self._sl_price = new_sl_price
+                    logger.info(
+                        f"SL TRAILED: {old_sl:.1f} → {new_sl_price:.1f} "
+                        f"({self._position_side}) id={self._sl_order_id}"
+                    )
+                    return True
+                else:
+                    # Failed to place new SL — try to restore the old one
+                    logger.error(
+                        f"SL trail failed (new order): {sl_resp.get('error')} "
+                        f"— attempting to restore old SL @ {old_sl:.1f}"
+                    )
+                    restore = self._api.place_stop_market_order(
+                        symbol=self._symbol,
+                        side=exit_side,
+                        size=self._position_size,
+                        stop_price=old_sl,
+                        reduce_only=True,
+                        product_id=self._product_id,
+                    )
+                    if restore.get("success"):
+                        self._sl_order_id = restore["result"].get("order_id")
+                        logger.info(f"SL restored @ {old_sl:.1f}")
+                    else:
+                        logger.error(f"SL RESTORE FAILED: {restore.get('error')} — POSITION UNPROTECTED")
+                    return False
+
+            except Exception as e:
+                logger.error(f"SL trail exception: {e}")
+                # Try to restore
+                try:
+                    restore = self._api.place_stop_market_order(
+                        symbol=self._symbol,
+                        side=exit_side,
+                        size=self._position_size,
+                        stop_price=old_sl,
+                        reduce_only=True,
+                        product_id=self._product_id,
+                    )
+                    if restore.get("success"):
+                        self._sl_order_id = restore["result"].get("order_id")
+                        self._sl_price = old_sl
+                except Exception:
+                    logger.error("SL RESTORE ALSO FAILED — POSITION UNPROTECTED")
+                return False
+
     def _cancel_sl_tp(self):
         """Cancel outstanding SL/TP orders."""
         for oid in (self._sl_order_id, self._tp_order_id):

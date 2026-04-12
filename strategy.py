@@ -70,12 +70,6 @@ class HPMSStrategy:
         # Energy spike exit confirmation: require 2 consecutive bars above threshold
         self._consecutive_energy_spikes = 0
 
-        # Dynamic hold: TP distance stored at entry for max_hold computation
-        self._current_tp_distance: float = 0.0
-
-        # Adaptive hold: track unrealized best price for trailing peak logic
-        self._unrealized_peak_price: float = 0.0
-
         # Entry tracking for ROE% computation
         self._last_entry_size:  int   = 0
         self._last_entry_price: float = 0.0
@@ -142,14 +136,6 @@ class HPMSStrategy:
                 if close_reason:
                     return None
 
-                # Track unrealized peak price for trailing logic
-                if self._orders._position_side == "long":
-                    self._unrealized_peak_price = max(self._unrealized_peak_price, current_price)
-                else:
-                    if self._unrealized_peak_price == 0:
-                        self._unrealized_peak_price = current_price
-                    self._unrealized_peak_price = min(self._unrealized_peak_price, current_price)
-
                 signal = self._engine.on_bar_close(closes, volumes, timestamp)
                 if signal:
                     # KDE grace period: skip energy spike check for 2 bars after
@@ -163,49 +149,61 @@ class HPMSStrategy:
                     config_spike = getattr(self._config, "TRADE_DH_DT_EXIT_SPIKE", 0.15)
                     exit_spike = max(adaptive_spike, config_spike)
 
-                    # ── Adaptive hold evaluation ─────────────────────────────
-                    adaptive_hold = self._engine.evaluate_adaptive_hold(
-                        side=self._orders._position_side,
-                        entry_price=self._orders.entry_price,
-                        current_price=current_price,
-                        tp_price=self._orders._tp_price,
-                        sl_price=self._orders._sl_price,
-                        bars_held=self._orders.bars_held,
-                        unrealized_peak_price=self._unrealized_peak_price,
-                        config=self._config,
-                    )
+                    # ── Trailing stop management ─────────────────────────────
+                    if getattr(self._config, "TRAILING_ENABLED", True):
+                        trail = self._engine.compute_trailing_stop(
+                            side=self._orders._position_side,
+                            entry_price=self._orders.entry_price,
+                            current_price=current_price,
+                            current_sl=self._orders._sl_price,
+                            tp_price=self._orders._tp_price,
+                            entry_fee_usd=self._orders._entry_fee_usd,
+                            position_size=self._orders._position_size,
+                            contract_value=getattr(self._config, "TRADE_CONTRACT_VALUE", 0.001),
+                            bars_held=self._orders.bars_held,
+                            config=self._config,
+                        )
+                        if trail.get("new_sl") is not None:
+                            updated = self._orders.update_sl_price(trail["new_sl"])
+                            if updated:
+                                self._push(
+                                    f"🔄 *SL Trailed* → `${trail['new_sl']:,.1f}` "
+                                    f"({trail['phase']}) bar={self._orders.bars_held}"
+                                )
 
+                    # ── Absolute safety ceiling ──────────────────────────────
+                    abs_max = getattr(self._config, "TRAILING_ABSOLUTE_MAX_BARS", 120)
+                    if self._orders.bars_held >= abs_max:
+                        # Only force exit if profitable (SL handles losses)
+                        is_long = self._orders._position_side == "long"
+                        if is_long:
+                            pnl = current_price - self._orders.entry_price
+                        else:
+                            pnl = self._orders.entry_price - current_price
+                        if pnl > 0:
+                            reason = f"ABSOLUTE_MAX: {self._orders.bars_held}>={abs_max} (profitable)"
+                            logger.info(f"Safety ceiling exit: {reason}")
+                            self._orders.close_position(
+                                reason=reason, current_price=current_price
+                            )
+                            self._consecutive_energy_spikes = 0
+                            return None
+                        # else: let trailing SL or exchange SL handle it
+
+                    # ── Energy spike check ───────────────────────────────────
                     exit_reason = self._risk.check_exit_conditions(
                         dH_dt=signal.dH_dt,
                         dH_dt_spike=exit_spike,
                         bars_held=self._orders.bars_held,
-                        max_hold=0,  # unused when adaptive_hold_result is provided
-                        adaptive_hold_result=adaptive_hold,
                     )
                     if exit_reason:
-                        # Adaptive hold exits and legacy MAX_HOLD exit immediately
-                        if any(tag in exit_reason for tag in (
-                            "ADAPTIVE_MAX_HOLD", "HOLD_SCORE_EXIT",
-                            "TRAILING_PEAK_DD", "ABSOLUTE_MAX", "LEGACY_MAX_HOLD",
-                            "MAX_HOLD",
-                        )):
-                            self._consecutive_energy_spikes = 0
-                            logger.info(
-                                f"Adaptive exit triggered: {exit_reason} "
-                                f"(score={adaptive_hold.get('score', 'N/A')})"
-                            )
-                            self._orders.close_position(
-                                reason=exit_reason, current_price=current_price
-                            )
-                        elif in_kde_grace:
-                            # Skip energy spike during KDE grace period
+                        if in_kde_grace:
                             logger.debug(
                                 f"Energy spike suppressed (KDE grace, "
                                 f"bars_since_kde={bars_since_kde}): {exit_reason}"
                             )
                             self._consecutive_energy_spikes = 0
                         else:
-                            # Require 2 consecutive energy spikes to confirm exit
                             self._consecutive_energy_spikes += 1
                             if self._consecutive_energy_spikes >= 2:
                                 logger.info(f"Force-exit triggered (confirmed): {exit_reason}")
@@ -334,9 +332,7 @@ class HPMSStrategy:
                 entry_fee = getattr(self._orders, "_entry_fee_usd", 0.0)
 
                 self._risk.on_trade_open(side, actual_entry, size, margin_used)
-                self._current_tp_distance = abs(signal.tp_price - actual_entry)
                 self._consecutive_energy_spikes = 0
-                self._unrealized_peak_price = actual_entry  # reset peak tracker
                 self._last_entry_size  = size
                 self._last_entry_price = actual_entry
                 self._last_margin_used = margin_used

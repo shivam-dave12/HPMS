@@ -942,8 +942,7 @@ class HPMSEngine:
         return max(threshold, 0.10)
 
     def get_dynamic_max_hold(self, tp_distance: float, current_price: float) -> int:
-        """Legacy wrapper — returns the ATR-based max hold estimate.
-        Callers should prefer evaluate_adaptive_hold() for exit decisions."""
+        """Legacy ATR-based max hold estimate (retained for fallback use)."""
         if not self._state.close_history or len(self._state.close_history) < 5:
             return 8
         closes = np.array(self._state.close_history[-20:])
@@ -954,235 +953,203 @@ class HPMSEngine:
         max_hold = int(math.ceil(bars_to_tp * 1.5))
         return max(3, min(max_hold, 30))
 
-    # ─── ADAPTIVE HOLD EVALUATOR ──────────────────────────────────────────────
+    # ─── TRAILING STOP COMPUTATION ──────────────────────────────────────────
 
-    def evaluate_adaptive_hold(
+    def compute_trailing_stop(
         self,
         side: str,
         entry_price: float,
         current_price: float,
+        current_sl: float,
         tp_price: float,
-        sl_price: float,
+        entry_fee_usd: float,
+        position_size: int,
+        contract_value: float,
         bars_held: int,
-        unrealized_peak_price: float,
         config,
     ) -> dict:
         """
-        Multi-factor adaptive hold evaluation.
+        Compute the new trailing stop price.
 
-        Instead of a simple bar countdown, this scores the position across
-        multiple dimensions and returns a structured verdict:
+        Design principles:
+          1. SL can ONLY improve (ratchet) — never moves backward.
+          2. Breakeven is computed from ACTUAL exchange fees (entry + estimated
+             exit), so the breakeven SL guarantees zero loss after all fees.
+          3. Activation requires the trade to move past BOTH the fee breakeven
+             point AND a % of the TP distance — whichever is larger.
+          4. Trail distance is wide enough (3× ATR) to survive normal
+             1-minute pullbacks.
+          5. A warmup period prevents SL modification in the first N bars.
 
+        Fee math (example):
+          entry_fee_usd = $0.039 (actual from Delta API)
+          exit_fee_est  = $0.039 (same rate)
+          total_fees    = $0.078
+          For 1 contract (0.001 BTC): need $78 price move to cover fees
+          breakeven SL  = entry ± ($78 × 1.1 safety margin)
+
+        Returns:
             {
-                "should_exit": bool,
-                "reason": str | None,
-                "score": float,          # composite score (-1 = strong exit, +1 = strong hold)
-                "factors": dict,         # individual factor scores for diagnostics
-                "extended_max": int,     # the effective max hold (for logging)
+                "new_sl":            float | None,
+                "phase":             str,
+                "atr":               float,
+                "trail_dist":        float,
+                "tp_progress":       float,
+                "fee_breakeven_move": float,   # price move needed to cover fees
             }
-
-        Factors considered:
-          1. PnL trajectory — profitable & improving → hold
-          2. Momentum alignment — recent bars moving with trade → hold
-          3. TP proximity — close to target → hold (let it reach)
-          4. Peak drawdown — gave back too much of unrealized gains → exit
-          5. ATR-based time budget — has enough ATR runway left → hold
-          6. Regime — trending regime extends hold, choppy contracts it
-          7. Price velocity — accelerating toward TP → hold
-          8. Absolute ceiling — hard safety cap
         """
-        result = {
-            "should_exit": False,
-            "reason": None,
-            "score": 0.0,
-            "factors": {},
-            "extended_max": 0,
-        }
-
-        # ── Minimum hold protection ──────────────────────────────────────
-        min_bars = getattr(config, "HOLD_MIN_BARS", 3)
-        if bars_held < min_bars:
-            result["reason"] = f"MIN_HOLD ({bars_held}/{min_bars})"
-            result["score"] = 1.0
-            return result
-
-        # ── Hard absolute ceiling ────────────────────────────────────────
-        abs_max = getattr(config, "HOLD_ABSOLUTE_MAX_BARS", 60)
-        if bars_held >= abs_max:
-            result["should_exit"] = True
-            result["reason"] = f"ABSOLUTE_MAX: {bars_held}>={abs_max}"
-            result["score"] = -1.0
-            return result
-
         is_long = side == "long"
-        closes = list(self._state.close_history) if self._state.close_history else []
-        if len(closes) < 5:
-            # Not enough data — fall back to legacy max hold
-            legacy = self.get_dynamic_max_hold(abs(tp_price - entry_price), current_price)
-            if bars_held >= legacy:
-                result["should_exit"] = True
-                result["reason"] = f"LEGACY_MAX_HOLD: {bars_held}>={legacy}"
-                result["score"] = -0.6
+        result = {
+            "new_sl": None,
+            "phase": "INITIAL",
+            "atr": 0.0,
+            "trail_dist": 0.0,
+            "tp_progress": 0.0,
+            "fee_breakeven_move": 0.0,
+        }
+
+        # ── Warmup: don't touch SL for first N bars ─────────────────────
+        warmup = getattr(config, "TRAILING_WARMUP_BARS", 2)
+        if bars_held < warmup:
+            result["phase"] = "WARMUP"
             return result
 
-        closes_arr = np.array(closes[-30:])
-        atr_per_bar = float(np.mean(np.abs(np.diff(closes_arr))))
-        if atr_per_bar <= 0:
-            atr_per_bar = 1e-8
+        # ── Compute ATR ──────────────────────────────────────────────────
+        closes = list(self._state.close_history) if self._state.close_history else []
+        atr_lookback = getattr(config, "TRAILING_ATR_LOOKBACK", 14)
+        if len(closes) < 5:
+            return result
 
-        # ── Factor 1: Unrealized PnL direction (weight 0.25) ─────────────
-        if is_long:
-            pnl_pct = (current_price - entry_price) / entry_price
+        closes_arr = np.array(closes[-max(atr_lookback + 1, 20):])
+        if len(closes_arr) < 3:
+            return result
+
+        atr = float(np.mean(np.abs(np.diff(closes_arr[-atr_lookback:]))))
+        if atr <= 0:
+            atr = abs(tp_price - entry_price) * 0.05
+        result["atr"] = round(atr, 2)
+
+        # ── Fee breakeven computation (from actual exchange fees) ────────
+        # entry_fee_usd: exact fee paid on entry (from Delta API paid_commission)
+        # exit_fee_est:  estimate exit fee at same rate
+        # total: what the trade must earn in gross PnL to break even
+        exit_fee_est = entry_fee_usd  # same fee rate on exit
+        total_round_trip_fees = entry_fee_usd + exit_fee_est
+
+        # Convert fee $ to price-move needed:
+        #   gross_pnl = price_move × position_size × contract_value
+        #   price_move = total_fees / (position_size × contract_value)
+        if position_size > 0 and contract_value > 0:
+            fee_breakeven_move = total_round_trip_fees / (position_size * contract_value)
         else:
-            pnl_pct = (entry_price - current_price) / entry_price
+            fee_breakeven_move = atr * 2.0  # conservative fallback
 
-        # Score: +1 if profitable, scaled linearly, capped
-        pnl_score = max(-1.0, min(1.0, pnl_pct / 0.003))  # ±0.3% = full score
-        result["factors"]["pnl_direction"] = round(pnl_score, 3)
+        # Safety margin on top of fees (covers slippage on SL trigger)
+        fee_margin = getattr(config, "TRAILING_BE_FEE_MARGIN", 1.1)
+        fee_breakeven_with_margin = fee_breakeven_move * fee_margin
+        result["fee_breakeven_move"] = round(fee_breakeven_move, 2)
 
-        # ── Factor 2: Momentum alignment (weight 0.20) ───────────────────
-        mom_bars = getattr(config, "HOLD_FAVORABLE_MOMENTUM_BARS", 3)
-        recent = closes_arr[-mom_bars:] if len(closes_arr) >= mom_bars else closes_arr
-        if len(recent) >= 2:
-            price_changes = np.diff(recent)
-            if is_long:
-                favorable = float(np.sum(price_changes > 0)) / len(price_changes)
-            else:
-                favorable = float(np.sum(price_changes < 0)) / len(price_changes)
-            mom_score = favorable * 2 - 1  # 0% favorable → -1, 100% → +1
-        else:
-            mom_score = 0.0
-        result["factors"]["momentum"] = round(mom_score, 3)
-
-        # ── Factor 3: TP proximity (weight 0.20) ─────────────────────────
-        tp_dist = abs(tp_price - current_price)
+        # ── TP distance & progress ───────────────────────────────────────
         entry_to_tp = abs(tp_price - entry_price)
-        if entry_to_tp > 0:
-            tp_progress = 1.0 - (tp_dist / entry_to_tp)  # 0 = at entry, 1 = at TP
-        else:
-            tp_progress = 0.0
-        tp_proximity_pct = getattr(config, "HOLD_TP_PROXIMITY_PCT", 0.25)
-        if tp_progress >= (1.0 - tp_proximity_pct):
-            tp_score = 1.0  # very close to TP — strongly hold
-        else:
-            tp_score = tp_progress * 2 - 1  # linear: 0 progress → -1, 0.5 → 0, 1.0 → +1
-        result["factors"]["tp_proximity"] = round(tp_score, 3)
+        if entry_to_tp <= 0:
+            return result
 
-        # ── Factor 4: Peak drawdown (weight 0.15) ────────────────────────
         if is_long:
-            peak_pnl = (unrealized_peak_price - entry_price) / entry_price
-            curr_pnl = pnl_pct
+            favorable_move = current_price - entry_price
         else:
-            peak_pnl = (entry_price - unrealized_peak_price) / entry_price if unrealized_peak_price < entry_price else 0.0
-            curr_pnl = pnl_pct
+            favorable_move = entry_price - current_price
 
-        dd_from_peak_pct = getattr(config, "HOLD_DRAWDOWN_FROM_PEAK_PCT", 0.35)
-        trailing_activation = getattr(config, "HOLD_TRAILING_ACTIVATION_PCT", 0.40)
+        tp_progress = favorable_move / entry_to_tp  # <0 = losing, 0 = flat, 1 = at TP
+        result["tp_progress"] = round(tp_progress, 4)
 
-        # Only activate trailing drawdown check if we reached meaningful profit
-        if entry_to_tp > 0 and peak_pnl > 0:
-            peak_progress = peak_pnl * entry_price / entry_to_tp  # what fraction of TP was reached
-            if peak_progress >= trailing_activation:
-                if peak_pnl > 0:
-                    retracement = (peak_pnl - curr_pnl) / peak_pnl
-                else:
-                    retracement = 0.0
-                if retracement > dd_from_peak_pct:
-                    dd_score = -1.0  # gave back too much
-                else:
-                    dd_score = 1.0 - (retracement / dd_from_peak_pct)  # proportional
-            else:
-                dd_score = 0.0  # not yet activated
-        else:
-            dd_score = 0.0
-        result["factors"]["peak_drawdown"] = round(dd_score, 3)
-
-        # ── Factor 5: ATR time budget (weight 0.10) ──────────────────────
-        bars_needed_for_tp = tp_dist / atr_per_bar if atr_per_bar > 0 else 999
-        base_max = getattr(config, "TRADE_MAX_HOLD_BARS", 8)
-        profit_extend = getattr(config, "HOLD_PROFIT_EXTEND_FACTOR", 2.5)
-
-        # If profitable, extend the time budget significantly
-        if pnl_pct > 0:
-            effective_max = max(base_max, int(math.ceil(bars_needed_for_tp * profit_extend)))
-        else:
-            effective_max = max(base_max, int(math.ceil(bars_needed_for_tp * 1.5)))
-        effective_max = min(effective_max, abs_max)
-        result["extended_max"] = effective_max
-
-        time_remaining_pct = 1.0 - (bars_held / effective_max)
-        time_score = max(-1.0, min(1.0, time_remaining_pct * 2 - 1))
-        result["factors"]["time_budget"] = round(time_score, 3)
-
-        # ── Factor 6: Regime (weight 0.05) ────────────────────────────────
-        regime = getattr(self._state, "current_regime", None)
-        if regime == RegimeType.TRENDING:
-            regime_score = 0.5  # trending → bias toward holding
-        elif regime == RegimeType.CHOPPY:
-            regime_score = -0.5  # choppy → bias toward exiting
-        else:
-            regime_score = 0.0
-        result["factors"]["regime"] = round(regime_score, 3)
-
-        # ── Factor 7: Price velocity (weight 0.05) ───────────────────────
-        if len(closes_arr) >= 4:
-            velocity = float(closes_arr[-1] - closes_arr[-3]) / (2 * atr_per_bar)
-            if not is_long:
-                velocity = -velocity
-            vel_score = max(-1.0, min(1.0, velocity))
-        else:
-            vel_score = 0.0
-        result["factors"]["velocity"] = round(vel_score, 3)
-
-        # ── Composite score (weighted sum) ───────────────────────────────
-        weights = {
-            "pnl_direction":  0.25,
-            "momentum":       0.20,
-            "tp_proximity":   0.20,
-            "peak_drawdown":  0.15,
-            "time_budget":    0.10,
-            "regime":         0.05,
-            "velocity":       0.05,
-        }
-        composite = sum(
-            result["factors"].get(k, 0.0) * w for k, w in weights.items()
+        # ── Activation threshold ─────────────────────────────────────────
+        # Must exceed BOTH:
+        #   a) configured % of TP distance (default 40%)
+        #   b) actual fee breakeven + margin
+        # This ensures we never move to "breakeven" at a price that would
+        # still result in a net loss after fees.
+        be_activation_pct = getattr(config, "TRAILING_BE_ACTIVATION_PCT", 0.40)
+        activation_move = max(
+            entry_to_tp * be_activation_pct,
+            fee_breakeven_with_margin,
         )
-        result["score"] = round(composite, 4)
+        activation_progress = activation_move / entry_to_tp
 
-        # ── Decision ─────────────────────────────────────────────────────
-        exit_threshold = getattr(config, "HOLD_SCORE_EXIT_THRESHOLD", -0.50)
+        lock_tp_pct = getattr(config, "TRAILING_LOCK_TP_PCT", 0.75)
+        atr_mult = getattr(config, "TRAILING_ATR_MULTIPLIER", 3.0)
+        lock_atr_mult = getattr(config, "TRAILING_LOCK_ATR_MULTIPLIER", 1.5)
+        min_step = getattr(config, "TRAILING_MIN_STEP_TICKS", 0.5)
 
-        # Hard time exit: only if beyond effective max AND score is negative
-        if bars_held >= effective_max and composite < 0:
-            result["should_exit"] = True
-            result["reason"] = (
-                f"ADAPTIVE_MAX_HOLD: {bars_held}>={effective_max} "
-                f"score={composite:+.3f}"
+        if favorable_move < activation_move:
+            # ── INITIAL: haven't moved past fee breakeven yet ────────────
+            result["phase"] = "INITIAL"
+            elog.log(
+                "ENGINE_TRAIL",
+                phase="INITIAL",
+                bars=bars_held,
+                progress=round(tp_progress, 4),
+                favorable_move=round(favorable_move, 2),
+                activation_move=round(activation_move, 2),
+                fee_be=round(fee_breakeven_move, 2),
+                fee_be_margin=round(fee_breakeven_with_margin, 2),
+                atr=round(atr, 2),
             )
-        # Score-based early exit: composite strongly negative
-        elif composite <= exit_threshold and bars_held >= min_bars:
-            result["should_exit"] = True
-            result["reason"] = (
-                f"HOLD_SCORE_EXIT: score={composite:+.3f}<={exit_threshold} "
-                f"bar={bars_held}"
-            )
-        # Trailing peak drawdown forced exit
-        elif dd_score <= -0.99 and bars_held >= min_bars:
-            result["should_exit"] = True
-            result["reason"] = (
-                f"TRAILING_PEAK_DD: retraced >{dd_from_peak_pct:.0%} "
-                f"of peak profit, bar={bars_held}"
-            )
+            return result
+
+        # ── Past activation — compute breakeven floor from actual fees ───
+        # The SL floor guarantees: if SL is hit, gross PnL >= total fees.
+        # floor = entry + fee_breakeven_with_margin (long)
+        # floor = entry - fee_breakeven_with_margin (short)
+        be_floor = fee_breakeven_with_margin
+
+        if tp_progress >= lock_tp_pct:
+            # Phase LOCK: close to TP, tighten trail
+            trail_distance = atr * lock_atr_mult
+            result["phase"] = "LOCK"
+        elif tp_progress >= activation_progress:
+            # Phase TRAILING: standard wide trail
+            trail_distance = atr * atr_mult
+            result["phase"] = "TRAILING"
+        else:
+            # Phase BREAKEVEN: just entered the zone
+            trail_distance = favorable_move
+            result["phase"] = "BREAKEVEN"
+
+        result["trail_dist"] = round(trail_distance, 2)
+
+        # ── Compute candidate SL ─────────────────────────────────────────
+        if is_long:
+            # Trail below current price, floor at entry + fee breakeven
+            trail_sl = current_price - trail_distance
+            floor_sl = entry_price + be_floor
+            candidate_sl = max(trail_sl, floor_sl)
+
+            # Ratchet: only move UP
+            if candidate_sl > current_sl + min_step:
+                result["new_sl"] = round(candidate_sl, 1)
+        else:
+            # Trail above current price, ceiling at entry - fee breakeven
+            trail_sl = current_price + trail_distance
+            ceiling_sl = entry_price - be_floor
+            candidate_sl = min(trail_sl, ceiling_sl)
+
+            # Ratchet: only move DOWN
+            if candidate_sl < current_sl - min_step:
+                result["new_sl"] = round(candidate_sl, 1)
 
         elog.log(
-            "ENGINE_HOLD_EVAL",
-            bars_held=bars_held,
-            score=result["score"],
-            should_exit=result["should_exit"],
-            reason=result.get("reason"),
-            effective_max=effective_max,
-            pnl_pct=round(pnl_pct, 6),
-            factors=result["factors"],
+            "ENGINE_TRAIL",
+            phase=result["phase"],
+            bars=bars_held,
+            progress=round(tp_progress, 4),
+            atr=round(atr, 2),
+            trail_dist=round(trail_distance, 2),
+            current_sl=round(current_sl, 1),
+            new_sl=result["new_sl"],
+            candidate=round(candidate_sl, 1) if candidate_sl else None,
+            fee_be=round(fee_breakeven_move, 2),
+            fee_be_margin=round(fee_breakeven_with_margin, 2),
+            total_fees=round(total_round_trip_fees, 4),
         )
 
         return result

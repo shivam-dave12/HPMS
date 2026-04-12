@@ -59,20 +59,30 @@ SIGNAL_ACCELERATION_CHECK = True    # ALWAYS ON — second derivative confirmati
 # ═══════════════════════════════════════════════════════════════════════════════
 TRADE_TP_PCT              = 0.0035  # MAX TP cap (actual TP proportional to predicted move)
 TRADE_SL_PCT              = 0.0018  # MAX SL cap (actual SL based on ATR)
-TRADE_MAX_HOLD_BARS       = 8       # base max hold — dynamically adjusted by ATR
 
-# ── Adaptive Hold Manager ────────────────────────────────────────────────
-# Replaces the naive bar-countdown with a multi-factor context-aware system.
-# The hold manager scores the position each bar and only forces exit when
-# continuing is net-negative across ALL factors.
-HOLD_ABSOLUTE_MAX_BARS       = 60      # hard ceiling — no trade ever exceeds this
-HOLD_MIN_BARS                = 3       # minimum hold before any evaluation
-HOLD_PROFIT_EXTEND_FACTOR    = 2.5     # multiply base hold when trade is profitable & trending
-HOLD_DRAWDOWN_FROM_PEAK_PCT  = 0.35    # exit if unrealized PnL retraces >35% from peak
-HOLD_FAVORABLE_MOMENTUM_BARS = 3       # lookback for momentum alignment check
-HOLD_TP_PROXIMITY_PCT        = 0.25    # within 25% of TP distance → never time-exit
-HOLD_SCORE_EXIT_THRESHOLD    = -0.50   # composite score below this → force exit
-HOLD_TRAILING_ACTIVATION_PCT = 0.40    # trailing logic activates after reaching 40% of TP
+# ── Trailing Stop System (replaces time-based max hold) ──────────────
+# Principle: SL only ever moves in the FAVORABLE direction.
+# The ONLY way to lose is the original SL being hit before breakeven.
+# Once breakeven activates, worst case is flat. After that, only profits.
+#
+# Phase 1 (INITIAL):     SL = original. Hands off.
+# Phase 2 (BREAKEVEN):   Profit reached activation zone → SL to entry + buffer.
+# Phase 3 (TRAILING):    SL trails behind best price at wide ATR distance.
+# Phase 4 (LOCK):        Within TP proximity → trail tightens to secure profit.
+#
+# The breakeven and trail thresholds are based on TP distance (not fees),
+# ensuring the system works regardless of contract size or fee structure.
+TRAILING_ENABLED              = True
+TRAILING_WARMUP_BARS          = 2       # don't modify SL for first N bars (let trade breathe)
+TRAILING_BE_ACTIVATION_PCT    = 0.40    # activate breakeven after reaching 40% of TP distance
+TRAILING_BE_FEE_MARGIN        = 1.1     # breakeven SL = entry + (round_trip_fees × this) — 10% safety over exact fees
+TRAILING_ATR_LOOKBACK         = 14      # bars for ATR calculation
+TRAILING_ATR_MULTIPLIER       = 3.0     # trail distance = ATR × this (wide = survive pullbacks)
+TRAILING_LOCK_TP_PCT          = 0.75    # within 75% of TP → switch to tight trail
+TRAILING_LOCK_ATR_MULTIPLIER  = 1.5     # tighter trail when close to TP
+TRAILING_MIN_STEP_TICKS       = 0.5     # minimum SL move in price (avoid API spam)
+TRAILING_ABSOLUTE_MAX_BARS    = 120     # hard safety ceiling (2 hours) — exits ONLY if profitable
+
 TRADE_DH_DT_EXIT_SPIKE    = 0.25    # exit if |dH/dt| spikes above this (adaptive)
 TRADE_USE_BRACKET_ORDERS  = True    # use Delta bracket orders for atomic SL/TP
 TRADE_ORDER_TYPE           = "market"  # "market" | "limit"
