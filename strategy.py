@@ -316,24 +316,43 @@ class HPMSStrategy:
             )
             side = "long" if signal.signal_type == SignalType.LONG else "short"
 
-            # ── Pre-flight margin check ───────────────────────────────────────
-            # Avoid burning an API round-trip on a guaranteed-fail order.
-            # margin_needed = notional / leverage = price * contract_value / leverage
+            # ── Pre-flight margin safety clamp ────────────────────────────────
+            # compute_size() now enforces the margin cap internally, so this
+            # block should never trigger in normal operation.  It is retained
+            # as a belt-and-suspenders guard: if, for any reason, the computed
+            # size would exceed 95% of available equity when converted to margin,
+            # we clamp size down to the maximum safe value rather than skipping
+            # the signal entirely.  A valid signal is NEVER discarded due to size.
             contract_value = getattr(self._orders, "_contract_value", 0.001)
             leverage       = getattr(self._config, "RISK_LEVERAGE", 10)
             margin_needed  = (current_price * contract_value * size) / max(leverage, 1)
+
             if margin_needed > equity * 0.95:
+                # Compute the largest size that fits within 95% of equity
+                safe_size = max(1, int(equity * 0.95 * leverage / (current_price * contract_value)))
                 logger.warning(
-                    "MARGIN_PREFLIGHT FAIL: need $%.2f for %d contract(s) @ "
-                    "%.0fx but equity=$%.2f — skipping entry",
-                    margin_needed, size, leverage, equity,
+                    "MARGIN_PREFLIGHT: clamping size %d→%d "
+                    "(need $%.2f, have $%.2f @ %dx) — trade PROCEEDS at safe size",
+                    size, safe_size, margin_needed, equity, leverage,
                 )
-                self._push(
-                    f"⚠️ *Margin too low* — need `${margin_needed:.2f}` for `{size}c` "
-                    f"@ `{leverage}x` lev, have `${equity:.2f}`\n"
-                    f"Use /leverage to raise leverage or deposit funds."
-                )
-                return signal
+                size = safe_size
+                margin_needed = (current_price * contract_value * size) / max(leverage, 1)
+
+                # If even 1 contract exceeds margin, the account is too small
+                # to open any position — skip with an actionable message.
+                if margin_needed > equity * 0.95:
+                    logger.warning(
+                        "MARGIN_PREFLIGHT: even 1 contract requires $%.2f "
+                        "but equity=$%.2f — cannot trade, deposit required",
+                        margin_needed, equity,
+                    )
+                    self._push(
+                        f"⚠️ *Cannot open position* — 1 contract costs "
+                        f"`${margin_needed:.2f}` margin but available equity is "
+                        f"`${equity:.2f}` @ `{leverage}x` leverage.\n"
+                        f"Deposit funds or reduce leverage to continue trading."
+                    )
+                    return signal
 
             # ── EXECUTE ENTRY ─────────────────────────────────────────────────
             result = self._orders.open_position(

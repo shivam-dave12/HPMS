@@ -237,46 +237,117 @@ class RiskManager:
                      confidence: float = 1.0,
                      norm_vol: float = 0.0) -> int:
         """
-        Compute position size — institutional: confidence-weighted, volatility-normalized.
+        Compute position size — margin-bounded, confidence-weighted, vol-normalised.
 
-        Size = base_risk_size × confidence_scale × vol_scale
+        Sizing hierarchy (each step can only reduce the result, never increase it):
 
-        confidence_scale: higher confidence → larger position (0.5x to 1.5x)
-        vol_scale: higher volatility → smaller position (inverse vol targeting)
+        1. MARGIN CAP  — hard physical ceiling: how many contracts can exchange
+                         margin support at current equity and leverage.
+                         max_by_margin = floor(equity × leverage / (price × cv))
+                         This is computed first and is never violated.
 
-        sl_pct: if > 0, uses true risk-based sizing (Kelly-style).
+        2. RISK BUDGET — Kelly-style: how many contracts keep the dollar loss on
+                         a SL hit within equity_pct% of equity.
+                         base_size = (equity × equity_pct%) / (price × sl_pct × cv)
+                         When sl_pct = 0, falls back to notional-based sizing.
+
+        3. CONFIDENCE  — scale the risk-budget size proportionally to signal
+                         confidence, bounded to [50%, 100%] of the margin cap.
+                         conf_scale ∈ [0.50, 1.00] applied to the margin cap target.
+
+        4. VOL SCALE   — inverse-vol targeting: reduces size in high-vol regimes.
+
+        5. HARD CAPS   — max_pos_contracts, max_pos_usd (from config).
+
+        Why the old code was wrong
+        ──────────────────────────
+        Previously compute_size had no margin cap.  The sl_pct path computed
+        contracts purely from the risk budget and then capped at max_pos_contracts
+        (100).  When sl_pct was small (tight SL relative to a volatile instrument),
+        the risk-budget formula produced more contracts than the available margin
+        could support.  The result was passed to strategy.py, where the preflight
+        check detected the over-sizing and skipped the entire signal — even though
+        the signal itself was valid.  Every signal that fired with a tight SL and
+        high confidence was silently discarded.
+
+        The fix: compute the margin cap first, apply it as a hard ceiling, then
+        use confidence to scale within [50%, 100%] of that ceiling.  The preflight
+        check in strategy.py becomes a pure safety net that should never trigger.
         """
         with self._lock:
-            risk_usd = equity_usd * (self._equity_pct / 100.0)
+            if price <= 0 or contract_value <= 0 or equity_usd <= 0:
+                return 1
 
-            # ── Confidence scaling (0.5x at 40% conf, 1.0x at 70%, 1.5x at 100%) ──
-            conf_scale = max(0.5, min(1.5, confidence / 0.70))
+            # ── Step 1: Margin cap — never violate available margin ───────────
+            # The exchange requires margin = notional / leverage per contract.
+            # We use 95% of available equity to leave a small buffer.
+            max_by_margin = max(
+                1,
+                int(equity_usd * 0.95 * self._leverage / (price * contract_value))
+            )
 
-            # ── Volatility normalization ──────────────────────────────────────
-            # Target: normalize risk across vol regimes.
-            # norm_vol = ATR% (e.g. 0.001 = 0.1% per bar)
-            # vol_target = 0.001 (baseline 1m ATR%)
+            # ── Step 2: Confidence scaling within margin cap ──────────────────
+            # conf_scale ∈ [0.50, 1.00]: at minimum confidence trade half the
+            # margin cap; at maximum confidence use the full cap.
+            # Deliberately capped at 1.0 (not 1.5) because the margin cap is
+            # already the physical limit — we cannot go above it.
+            conf_scale = max(0.50, min(1.00, confidence / 0.70 * 0.70))
+            # Simplified: conf_scale = confidence clamped to [0.50, 1.00]
+            conf_scale = max(0.50, min(1.00, confidence))
+
+            # ── Step 3: Volatility normalisation ─────────────────────────────
             vol_scale = 1.0
             if norm_vol > 0:
-                vol_target = 0.001  # baseline: 0.1% per bar
-                vol_scale = min(2.0, max(0.3, vol_target / norm_vol))
+                vol_target = 0.001   # baseline: 0.1% per bar
+                vol_scale  = min(1.0, max(0.3, vol_target / norm_vol))
+                # Capped at 1.0 upward — never increases beyond margin cap
 
-            adjusted_risk = risk_usd * conf_scale * vol_scale
+            # ── Step 4: Risk-budget sizing (Kelly-style) ──────────────────────
+            # Independently computes the number of contracts such that a full
+            # SL hit costs at most equity_pct% of equity.
+            risk_usd = equity_usd * (self._equity_pct / 100.0)
 
-            if sl_pct > 0 and price > 0:
+            if sl_pct > 0:
                 per_contract_sl_loss = price * sl_pct * contract_value
-                contracts = int(adjusted_risk / per_contract_sl_loss) if per_contract_sl_loss > 0 else 0
+                risk_budget_contracts = (
+                    int(risk_usd / per_contract_sl_loss)
+                    if per_contract_sl_loss > 0 else max_by_margin
+                )
             else:
-                notional = min(adjusted_risk * self._leverage, self._max_pos_usd)
-                per_contract = contract_value * price if price > 0 else 1.0
-                contracts = int(notional / per_contract) if per_contract > 0 else 0
+                # Fallback: notional-based sizing
+                notional = min(risk_usd * self._leverage, self._max_pos_usd)
+                per_contract_notional = contract_value * price
+                risk_budget_contracts = (
+                    int(notional / per_contract_notional)
+                    if per_contract_notional > 0 else 0
+                )
 
-            contracts = min(contracts, self._max_pos_contracts)
+            # ── Step 5: Combine all constraints ──────────────────────────────
+            # Target = margin_cap × confidence × vol_scale, further bounded by
+            # the risk budget (we never risk more per-trade than equity_pct%).
+            target = int(max_by_margin * conf_scale * vol_scale)
+            contracts = min(target, risk_budget_contracts, self._max_pos_contracts)
+
+            # Notional cap: never exceed max_pos_usd total exposure
+            max_by_notional = int(self._max_pos_usd / (price * contract_value)) if price > 0 else contracts
+            contracts = min(contracts, max_by_notional)
+
+            # Floor at 1 — always take at least one contract if cleared to trade
             contracts = max(contracts, 1)
 
+            # Final sanity: enforce margin cap one last time (guards against any
+            # edge case where the intermediate arithmetic drifted above it)
+            contracts = min(contracts, max_by_margin)
+
             logger.debug(
-                f"Size: base_risk=${risk_usd:.2f} conf_scale={conf_scale:.2f} "
-                f"vol_scale={vol_scale:.2f} → {contracts}c"
+                "Size: equity=$%.2f lev=%dx max_margin=%dc "
+                "risk_budget=%dc conf=%.0f%% conf_scale=%.2f "
+                "vol_scale=%.2f → %dc "
+                "(margin_req=$%.2f)",
+                equity_usd, self._leverage, max_by_margin,
+                risk_budget_contracts, confidence * 100, conf_scale,
+                vol_scale, contracts,
+                price * contract_value * contracts / self._leverage,
             )
             return contracts
 
