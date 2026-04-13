@@ -60,22 +60,48 @@ SIGNAL_ACCELERATION_CHECK = True    # ALWAYS ON — second derivative confirmati
 TRADE_TP_PCT              = 0.0055  # MAX TP cap (widened to allow fee-aware R:R to work)
 TRADE_SL_PCT              = 0.0018  # MAX SL cap (actual SL based on ATR)
 
-# ── Trailing Stop System (replaces time-based max hold) ──────────────
-# Principle: SL only ever moves in the FAVORABLE direction.
-# The ONLY way to lose is the original SL being hit before breakeven.
-# Once breakeven activates, worst case is flat. After that, only profits.
+# ── Trailing Stop System ─────────────────────────────────────────────────────
 #
-# Phase 1 (INITIAL):     SL = original. Hands off.
-# Phase 2 (BREAKEVEN):   Profit reached activation zone → SL to entry + buffer.
-# Phase 3 (TRAILING):    SL trails behind best price at wide ATR distance.
-# Phase 4 (LOCK):        Within TP proximity → trail tightens to secure profit.
+# Design principle: the SL only ever moves in the FAVORABLE direction (ratchet).
+# The only way to lose is the original SL being hit before activation.
+# Once activation fires, worst outcome is flat (breakeven). After that, only
+# locked profits.
 #
-# The breakeven and trail thresholds are based on TP distance (not fees),
-# ensuring the system works regardless of contract size or fee structure.
+# Phase lifecycle:
+#   WARMUP    bars_held < TRAILING_WARMUP_BARS       SL unchanged (trade breathing)
+#   INITIAL   favorable_move < activation_move       SL unchanged (trade not in profit yet)
+#   BREAKEVEN activation reached but fee floor       SL moves to entry + fee_breakeven × margin
+#             overrides ATR trail                    (guarantees net-zero or positive on exit)
+#   TRAILING  activation reached, ATR trail          SL = current_price − ATR × multiplier
+#             is binding constraint                  (wide trail to survive pullbacks)
+#   LOCK      tp_progress ≥ TRAILING_LOCK_TP_PCT     SL = current_price − ATR × lock_multiplier
+#                                                    (tight trail to secure accumulated profit)
+#
+# Activation threshold (TRAILING_BE_ACTIVATION_PCT)
+# ──────────────────────────────────────────────────
+# Controls when trailing begins as a fraction of TP distance.
+# Concerns separation: this is purely a TP-progress trigger — it does NOT
+# need to exceed the fee breakeven (that constraint is applied separately as
+# a floor on the candidate SL price once trailing is active).
+#
+# Value choice rationale (0.20):
+#   TP distance on BTC micro-scalp ≈ $390 (0.55% × ~$71,000)
+#   activation_move = $390 × 0.20 = $78
+#   fee_breakeven   ≈ $75–83 (round-trip fees / position notional)
+#
+#   At 0.20 activation the trail fires at roughly the same point where the
+#   fee floor becomes meaningful. The fee floor then acts as the binding SL
+#   constraint until the ATR trail pulls ahead of it, giving the system the
+#   maximum available range to protect profit.
+#
+#   Previous value of 0.40 required $156 favorable move (≈40% of TP) before
+#   trailing started — trades that peaked below $156 gain and reversed were
+#   never protected. The activation gate was the bottleneck, not the fee floor.
+#
 TRAILING_ENABLED              = True
 TRAILING_WARMUP_BARS          = 2       # don't modify SL for first N bars (let trade breathe)
-TRAILING_BE_ACTIVATION_PCT    = 0.40    # activate breakeven after reaching 40% of TP distance
-TRAILING_BE_FEE_MARGIN        = 1.1     # breakeven SL = entry + (round_trip_fees × this) — 10% safety over exact fees
+TRAILING_BE_ACTIVATION_PCT    = 0.20    # activate trailing after 20% of TP distance (was 0.40)
+TRAILING_BE_FEE_MARGIN        = 1.1     # breakeven SL = entry + (round_trip_fees × this)
 TRAILING_ATR_LOOKBACK         = 14      # bars for ATR calculation
 TRAILING_ATR_MULTIPLIER       = 3.0     # trail distance = ATR × this (wide = survive pullbacks)
 TRAILING_LOCK_TP_PCT          = 0.75    # within 75% of TP → switch to tight trail

@@ -2,7 +2,7 @@
 order_manager.py — Delta Exchange Order Execution Manager
 ==========================================================
 Handles atomic order placement (bracket or separate SL/TP), position tracking,
-forced exits, and order state reconciliation.
+forced exits, trailing-stop SL amendment, and order state reconciliation.
 
 ALL fees and PnL are sourced exclusively from the Delta Exchange API — no
 estimates, no fallback calculations.
@@ -13,6 +13,29 @@ estimates, no fallback calculations.
 
 If the API does not return a fee value, the fee is recorded as $0 and an error
 is logged.  No local fee estimation is ever performed.
+
+Bracket SL/TP leg resolution — Delta API response notes
+────────────────────────────────────────────────────────
+Delta Exchange does NOT include leg order IDs in the bracket entry response at
+the top level.  The response contains `bracket_stop_loss_price` and
+`bracket_take_profit_price` (the prices), but the leg order IDs are either
+nested under a `bracket_order` sub-object or must be recovered via a follow-up
+GET /orders query.
+
+Resolution is attempted in four passes (each only runs if the previous failed):
+
+  Pass 1  — `bracket_stop_loss_order_id` at the top level of the raw response
+  Pass 2  — `stop_loss_order.order_id` in the raw response (some API versions)
+  Pass 3  — `bracket_order` sub-object, checking common field names for the
+             stop-loss leg ID
+  Pass 4  — REST fallback: query open orders and match by stop price, order side,
+             and reduce_only flag.  A 500 ms pause allows the exchange to
+             propagate the bracket legs before the query fires.
+
+If all four passes fail, a WARNING is logged.  Trailing-stop amendment then
+uses a lazy-recovery path inside `update_sl_price` — every time an amendment
+is attempted and `_sl_order_id` is still None, the REST fallback is retried
+exactly once.  This guards against transient propagation delays at entry time.
 """
 
 from __future__ import annotations
@@ -42,8 +65,9 @@ class OrderManager:
     Manages order lifecycle on Delta Exchange.
 
     - Entry: market or limit with bracket SL/TP
-    - Exit: forced close, SL/TP hit detection, max-hold timeout
-    - Reconciliation: poll position state to detect fills
+    - Exit: forced close, SL/TP hit detection, absolute safety ceiling
+    - Trailing: cancel old SL bracket leg, place new stop order at amended price
+    - Reconciliation: poll position state to detect exchange-side fills
 
     All financial figures (fees, PnL) come from the exchange API,
     never from local estimation.
@@ -55,7 +79,7 @@ class OrderManager:
         self._lock   = threading.RLock()
         self._contract_value = contract_value  # BTC per contract (Delta BTCUSD = 0.001)
 
-        # Active state
+        # Active position state
         self._position_side:    Optional[str] = None   # "long" | "short" | None
         self._position_size:    int   = 0
         self._entry_price:      float = 0.0   # actual fill price from API
@@ -110,6 +134,127 @@ class OrderManager:
     def set_on_close(self, cb: Callable):
         self._on_close_cb = cb
 
+    # ─── BRACKET LEG ID RECOVERY ─────────────────────────────────────────────
+
+    def _extract_bracket_leg_ids(
+        self,
+        raw: dict,
+        sl_price: float,
+        tp_price: float,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """
+        Resolve SL and TP bracket leg order IDs from the entry order response.
+
+        Four-pass resolution strategy (see module docstring for rationale):
+
+          Pass 1: top-level `bracket_stop_loss_order_id` / `bracket_take_profit_order_id`
+          Pass 2: nested `stop_loss_order` / `take_profit_order` dicts
+          Pass 3: nested `bracket_order` sub-object
+          Pass 4: REST recovery via open orders (with 500 ms propagation pause)
+
+        Returns (sl_order_id, tp_order_id). Either may be None if unresolvable.
+        """
+        # ── Pass 1: top-level named fields ────────────────────────────────
+        sl_id = raw.get("bracket_stop_loss_order_id")
+        tp_id = raw.get("bracket_take_profit_order_id")
+
+        # ── Pass 2: nested stop_loss_order / take_profit_order dicts ──────
+        if not sl_id and isinstance(raw.get("stop_loss_order"), dict):
+            sl_id = raw["stop_loss_order"].get("order_id") or raw["stop_loss_order"].get("id")
+        if not tp_id and isinstance(raw.get("take_profit_order"), dict):
+            tp_id = raw["take_profit_order"].get("order_id") or raw["take_profit_order"].get("id")
+
+        # ── Pass 3: bracket_order sub-object ──────────────────────────────
+        # Delta may nest the leg references under a `bracket_order` key.
+        # The sub-object field names vary by API version — check all known names.
+        if (not sl_id or not tp_id) and isinstance(raw.get("bracket_order"), dict):
+            bo = raw["bracket_order"]
+            if not sl_id:
+                sl_id = (
+                    bo.get("stop_loss_order_id")
+                    or bo.get("sl_order_id")
+                    or bo.get("bracket_stop_loss_order_id")
+                    or (bo.get("stop_loss_order") or {}).get("order_id")
+                    or (bo.get("stop_loss_order") or {}).get("id")
+                )
+            if not tp_id:
+                tp_id = (
+                    bo.get("take_profit_order_id")
+                    or bo.get("tp_order_id")
+                    or bo.get("bracket_take_profit_order_id")
+                    or (bo.get("take_profit_order") or {}).get("order_id")
+                    or (bo.get("take_profit_order") or {}).get("id")
+                )
+
+        # ── Pass 4: REST recovery ──────────────────────────────────────────
+        # If either leg is still unresolved, pause briefly so the exchange can
+        # propagate the bracket legs, then search open orders by stop price.
+        if not sl_id or not tp_id:
+            time.sleep(0.5)
+            if not sl_id:
+                sl_id = self._find_open_stop_order(target_price=sl_price)
+                if sl_id:
+                    logger.info(f"Bracket SL leg recovered via open_orders: id={sl_id}")
+            if not tp_id:
+                tp_id = self._find_open_stop_order(target_price=tp_price)
+                if tp_id and tp_id != sl_id:
+                    logger.info(f"Bracket TP leg recovered via open_orders: id={tp_id}")
+                elif tp_id == sl_id:
+                    # Same order matched both prices — clear the ambiguous TP match
+                    tp_id = None
+
+        return (str(sl_id) if sl_id else None, str(tp_id) if tp_id else None)
+
+    def _find_open_stop_order(self, target_price: float) -> Optional[str]:
+        """
+        Query open orders and return the order ID of the stop order whose
+        `stop_price` is closest to `target_price`, subject to:
+          - |stop_price - target_price| ≤ 1.0 (1 price unit tolerance)
+          - reduce_only = True  (all bracket legs are reduce-only)
+
+        Returns None if no qualifying order is found or on any API error.
+        """
+        try:
+            resp = self._api.get_open_orders(symbol=self._symbol)
+            if not resp.get("success"):
+                return None
+
+            orders = resp.get("result", [])
+            if isinstance(orders, dict):
+                orders = (
+                    orders.get("result")
+                    or orders.get("data")
+                    or orders.get("orders")
+                    or []
+                )
+
+            best_id:   Optional[str] = None
+            best_dist: float = float("inf")
+
+            for o in (orders if isinstance(orders, list) else []):
+                raw_o = o.get("_raw", o)
+
+                # Must be reduce-only (all bracket legs are)
+                if not raw_o.get("reduce_only"):
+                    continue
+
+                stop = _safe_float(raw_o.get("stop_price"), 0.0)
+                if stop <= 0:
+                    continue
+
+                dist = abs(stop - target_price)
+                if dist <= 1.0 and dist < best_dist:
+                    oid = raw_o.get("order_id") or raw_o.get("id")
+                    if oid:
+                        best_id   = str(oid)
+                        best_dist = dist
+
+            return best_id
+
+        except Exception as e:
+            logger.debug(f"_find_open_stop_order error: {e}")
+            return None
+
     # ─── ENTRY ────────────────────────────────────────────────────────────────
 
     def open_position(
@@ -160,7 +305,15 @@ class OrderManager:
 
                 result_data = resp.get("result", {})
                 raw = result_data.get("_raw", result_data)
-                order_id = result_data.get("order_id", "")
+
+                # Delta Exchange uses "id" in some API versions, "order_id" in others.
+                order_id = str(
+                    result_data.get("order_id")
+                    or result_data.get("id")
+                    or raw.get("order_id")
+                    or raw.get("id")
+                    or ""
+                )
 
                 # ── Extract EXACT entry price from API ────────────────────────
                 # average_fill_price is the actual fill price from the exchange.
@@ -201,24 +354,28 @@ class OrderManager:
                 self._entry_bar      = 0
                 self._entry_fee_usd  = actual_entry_fee
 
-                # Capture bracket leg IDs
+                # ── Resolve bracket leg IDs ───────────────────────────────────
                 if use_bracket and order_type == "market":
-                    sl_id = raw.get("bracket_stop_loss_order_id")
-                    if not sl_id and isinstance(raw.get("stop_loss_order"), dict):
-                        sl_id = raw["stop_loss_order"].get("order_id")
-                    tp_id = raw.get("bracket_take_profit_order_id")
-                    if not tp_id and isinstance(raw.get("take_profit_order"), dict):
-                        tp_id = raw["take_profit_order"].get("order_id")
-                    self._sl_order_id = str(sl_id) if sl_id else None
-                    self._tp_order_id = str(tp_id) if tp_id else None
-                    if self._sl_order_id or self._tp_order_id:
+                    sl_id, tp_id = self._extract_bracket_leg_ids(raw, sl_price, tp_price)
+                    self._sl_order_id = sl_id
+                    self._tp_order_id = tp_id
+
+                    if self._sl_order_id and self._tp_order_id:
                         logger.info(
-                            f"Bracket legs captured: SL={self._sl_order_id} TP={self._tp_order_id}"
+                            f"Bracket legs resolved: SL={self._sl_order_id} "
+                            f"TP={self._tp_order_id}"
+                        )
+                    elif self._sl_order_id:
+                        logger.warning(
+                            f"Bracket SL resolved (id={self._sl_order_id}) "
+                            f"but TP leg ID not found — TP will rely on "
+                            f"exchange auto-cancel"
                         )
                     else:
                         logger.warning(
-                            "Bracket order placed but leg IDs not found in response — "
-                            "force-exit will rely on exchange auto-cancel. "
+                            "Bracket leg IDs could not be resolved after all "
+                            "four recovery passes. Trailing-stop will retry "
+                            "lazy recovery on each amendment attempt. "
                             f"Response keys: {list(raw.keys())}"
                         )
 
@@ -254,7 +411,10 @@ class OrderManager:
                 product_id=self._product_id,
             )
             if sl_resp.get("success"):
-                self._sl_order_id = sl_resp["result"].get("order_id")
+                res = sl_resp.get("result", {})
+                self._sl_order_id = str(
+                    res.get("order_id") or res.get("id") or ""
+                ) or None
                 logger.info(f"SL order placed: {self._sl_order_id} @ {sl_price:.1f}")
             else:
                 logger.error(f"SL order failed: {sl_resp.get('error')}")
@@ -271,7 +431,10 @@ class OrderManager:
                 product_id=self._product_id,
             )
             if tp_resp.get("success"):
-                self._tp_order_id = tp_resp["result"].get("order_id")
+                res = tp_resp.get("result", {})
+                self._tp_order_id = str(
+                    res.get("order_id") or res.get("id") or ""
+                ) or None
                 logger.info(f"TP order placed: {self._tp_order_id} @ {tp_price:.1f}")
             else:
                 logger.error(f"TP order failed: {tp_resp.get('error')}")
@@ -368,36 +531,81 @@ class OrderManager:
 
     def update_sl_price(self, new_sl_price: float) -> bool:
         """
-        Move the stop-loss to a new (better) price.
+        Move the stop-loss to a new (improved) price.
 
         Rules enforced:
-          - Long:  new SL must be >= current SL (can only move UP)
-          - Short: new SL must be <= current SL (can only move DOWN)
-          - Must have an active SL order to replace
+          - Long:  new SL must be > current SL (can only move UP, ratchet)
+          - Short: new SL must be < current SL (can only move DOWN, ratchet)
+          - Minimum move of TRAILING_MIN_STEP_TICKS is enforced by the caller
+            (compute_trailing_stop); this method enforces the direction rule
+            only and applies no additional minimum-step guard.
 
-        Returns True if SL was successfully updated on the exchange.
+        Lazy SL order ID recovery:
+          If `_sl_order_id` was not resolved at entry time (Delta bracket API
+          returned no leg IDs), a single REST recovery attempt is made here
+          before giving up. This handles propagation delays that would have
+          caused Pass 4 in _extract_bracket_leg_ids to run before the bracket
+          legs appeared in the open-orders feed.
+
+        Returns True if the SL was successfully amended on the exchange,
+        False on any failure (direction check, no ID, API error).
         """
         with self._lock:
-            if not self._position_side or not self._sl_order_id:
+            if not self._position_side:
                 return False
+
+            # ── Lazy SL order ID recovery ─────────────────────────────────────
+            # Runs at most once per trailing attempt when _sl_order_id is None.
+            # This covers the case where Pass 4 in _extract_bracket_leg_ids ran
+            # before the bracket leg appeared in the open-orders endpoint.
+            if not self._sl_order_id:
+                logger.debug(
+                    "update_sl_price: _sl_order_id is None — attempting lazy "
+                    "REST recovery before trail update"
+                )
+                recovered = self._find_open_stop_order(target_price=self._sl_price)
+                if recovered:
+                    self._sl_order_id = recovered
+                    logger.info(
+                        f"Lazy SL order ID recovery succeeded: "
+                        f"id={self._sl_order_id} @ {self._sl_price:.1f}"
+                    )
+                else:
+                    logger.warning(
+                        f"update_sl_price: SL order ID still unresolvable for "
+                        f"{self._position_side} position at entry "
+                        f"{self._entry_price:.1f} — trail update skipped. "
+                        f"Current SL ${self._sl_price:.1f} remains unchanged "
+                        f"on the exchange."
+                    )
+                    return False
 
             new_sl_price = round(new_sl_price, 1)
 
-            # Enforce ratchet: SL can only improve
+            # ── Direction ratchet ─────────────────────────────────────────────
+            # SL can only ever improve (move toward breakeven / profit).
             if self._position_side == "long" and new_sl_price <= self._sl_price:
                 return False
             if self._position_side == "short" and new_sl_price >= self._sl_price:
                 return False
 
-            old_sl = self._sl_price
+            old_sl    = self._sl_price
             old_sl_id = self._sl_order_id
             exit_side = "sell" if self._position_side == "long" else "buy"
 
             try:
-                # Cancel old SL
-                self._api.cancel_order(old_sl_id)
+                # Cancel the existing SL order
+                cancel_resp = self._api.cancel_order(old_sl_id)
+                if not cancel_resp.get("success"):
+                    # Log but still attempt to place the new SL — the old one
+                    # may have already been filled or auto-cancelled.
+                    logger.warning(
+                        f"SL cancel returned non-success for id={old_sl_id}: "
+                        f"{cancel_resp.get('error')} — "
+                        f"proceeding with new SL placement"
+                    )
 
-                # Place new SL
+                # Place the new SL at the amended price
                 sl_resp = self._api.place_stop_market_order(
                     symbol=self._symbol,
                     side=exit_side,
@@ -406,38 +614,54 @@ class OrderManager:
                     reduce_only=True,
                     product_id=self._product_id,
                 )
+
                 if sl_resp.get("success"):
-                    self._sl_order_id = sl_resp["result"].get("order_id")
-                    self._sl_price = new_sl_price
+                    res = sl_resp.get("result", {})
+                    new_id = str(
+                        res.get("order_id") or res.get("id") or ""
+                    ) or None
+                    self._sl_order_id = new_id
+                    self._sl_price    = new_sl_price
                     logger.info(
                         f"SL TRAILED: {old_sl:.1f} → {new_sl_price:.1f} "
-                        f"({self._position_side}) id={self._sl_order_id}"
+                        f"({self._position_side}) new_id={self._sl_order_id}"
                     )
                     return True
+
+                # ── New SL placement failed: restore the old SL ───────────────
+                logger.error(
+                    f"SL trail failed (new order): {sl_resp.get('error')} "
+                    f"— attempting to restore old SL @ {old_sl:.1f}"
+                )
+                restore = self._api.place_stop_market_order(
+                    symbol=self._symbol,
+                    side=exit_side,
+                    size=self._position_size,
+                    stop_price=old_sl,
+                    reduce_only=True,
+                    product_id=self._product_id,
+                )
+                if restore.get("success"):
+                    res = restore.get("result", {})
+                    self._sl_order_id = str(
+                        res.get("order_id") or res.get("id") or ""
+                    ) or None
+                    self._sl_price = old_sl
+                    logger.info(f"SL restored @ {old_sl:.1f} id={self._sl_order_id}")
                 else:
-                    # Failed to place new SL — try to restore the old one
+                    # Worst case: no active SL on the exchange.
+                    # Clear the stale ID so lazy recovery fires on the next bar.
+                    self._sl_order_id = None
                     logger.error(
-                        f"SL trail failed (new order): {sl_resp.get('error')} "
-                        f"— attempting to restore old SL @ {old_sl:.1f}"
+                        f"SL RESTORE FAILED: {restore.get('error')} — "
+                        f"POSITION UNPROTECTED. SL ID cleared; lazy recovery "
+                        f"will be attempted on the next bar."
                     )
-                    restore = self._api.place_stop_market_order(
-                        symbol=self._symbol,
-                        side=exit_side,
-                        size=self._position_size,
-                        stop_price=old_sl,
-                        reduce_only=True,
-                        product_id=self._product_id,
-                    )
-                    if restore.get("success"):
-                        self._sl_order_id = restore["result"].get("order_id")
-                        logger.info(f"SL restored @ {old_sl:.1f}")
-                    else:
-                        logger.error(f"SL RESTORE FAILED: {restore.get('error')} — POSITION UNPROTECTED")
-                    return False
+                return False
 
             except Exception as e:
-                logger.error(f"SL trail exception: {e}")
-                # Try to restore
+                logger.error(f"SL trail exception: {e}", exc_info=True)
+                # Attempt restore on exception
                 try:
                     restore = self._api.place_stop_market_order(
                         symbol=self._symbol,
@@ -448,10 +672,17 @@ class OrderManager:
                         product_id=self._product_id,
                     )
                     if restore.get("success"):
-                        self._sl_order_id = restore["result"].get("order_id")
+                        res = restore.get("result", {})
+                        self._sl_order_id = str(
+                            res.get("order_id") or res.get("id") or ""
+                        ) or None
                         self._sl_price = old_sl
-                except Exception:
-                    logger.error("SL RESTORE ALSO FAILED — POSITION UNPROTECTED")
+                except Exception as restore_err:
+                    self._sl_order_id = None
+                    logger.error(
+                        f"SL RESTORE ALSO FAILED: {restore_err} — "
+                        f"POSITION UNPROTECTED. SL ID cleared."
+                    )
                 return False
 
     def _cancel_sl_tp(self):
@@ -522,8 +753,8 @@ class OrderManager:
 
                 # ── EXACT fee from WS fill data ──────────────────────────────
                 # WS fills carry the actual post-fill commission.
-                # Try paid_commission first, then commission (fill-record field),
-                # then c_val. Never use the order-level 'commission' estimate.
+                # Try paid_commission first, then commission (fill-record field).
+                # Never use the order-level 'commission' estimate.
                 exit_fee = _safe_float(
                     data.get("paid_commission") or data.get("commission") or data.get("c_val"), 0.0
                 )
@@ -574,6 +805,8 @@ class OrderManager:
 
     def _fetch_order_fee(self, order_id: str) -> float:
         """Fetch actual paid commission from order details or its fills."""
+        if not order_id:
+            return 0.0
         try:
             resp = self._api.get_order(order_id)
             if resp.get("success"):
@@ -601,7 +834,6 @@ class OrderManager:
                         )
                         if total_comm > 0:
                             return total_comm
-                        # paid_commission in fill = actual charged; commission = estimate
                         paid = _safe_float(f.get("paid_commission"), 0.0)
                         if paid > 0:
                             return paid
@@ -796,6 +1028,8 @@ class OrderManager:
                 "side":           self._position_side,
                 "size":           self._position_size,
                 "entry_price":    self._entry_price,
+                "current_sl":     self._sl_price,
+                "current_tp":     self._tp_price,
                 "bars_held":      self._entry_bar,
                 "entry_time":     self._entry_time,
                 "sl_order":       self._sl_order_id,
