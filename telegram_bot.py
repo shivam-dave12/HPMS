@@ -292,7 +292,7 @@ class TelegramBot:
         await self._app.updater.start_polling(drop_pending_updates=True)
 
         self._running = True
-        logger.info("Telegram bot online")
+        logger.info("Telegram bot online — polling for commands, push notifications active")
         self._ready.set()  # unblock TelegramBot.start()
 
         # Keep alive until stop() is called
@@ -370,73 +370,83 @@ class TelegramBot:
             time.sleep(60)
 
     def _build_periodic_report(self) -> str:
-        """Build a rich periodic status report with clear system intent."""
+        """Build a compact periodic status report with clear intent summary."""
         try:
             s     = self._strategy.get_status() if self._strategy else {}
             risk  = s.get("risk", {})
             pos   = s.get("position", {})
+            sig   = s.get("last_signal", {})
             price = self._data.get_last_price() if self._data else 0
             p     = risk.get("params", {})
 
-            # ── Status icons ──────────────────────────────────────────────────
-            strat_on  = s.get("enabled", False)
-            is_halted = risk.get("is_halted", False)
-            net_pnl   = risk.get("daily_pnl", 0)
+            # ── Strategy / risk status ────────────────────────────────────────
+            strat_on   = s.get("enabled", False)
+            is_halted  = risk.get("is_halted", False)
+            halt_icon  = "🔴" if is_halted  else "🟢"
+            strat_icon = "▶️" if strat_on   else "⏸"
 
-            strat_icon = "🟢" if strat_on else "⏸"
-            risk_icon  = "🚨" if is_halted else "🛡"
-            pnl_icon   = "💰" if net_pnl >= 0 else "🔻"
-
-            # ── Position block ────────────────────────────────────────────────
+            # ── Position summary ──────────────────────────────────────────────
             if pos.get("in_position"):
-                side = pos["side"].upper()
-                side_icon = "📈" if side == "LONG" else "📉"
-                pos_txt = (
-                    f"{side_icon} *{side}*  {pos['size']}c @ `${pos['entry_price']:,.1f}`\n"
-                    f"   Held `{pos['bars_held']}` bars"
+                side_icon = "🟢" if pos["side"] == "long" else "🔴"
+                pos_txt   = (
+                    f"{side_icon} {pos['side'].upper()}  "
+                    f"`{pos['size']}c` @ `${pos['entry_price']:,.1f}`  "
+                    f"({pos['bars_held']} bars held)"
                 )
             else:
-                pos_txt = "⬜ Flat — watching for setup"
+                pos_txt = "⬜ Flat — awaiting signal"
 
-            # ── What is the engine thinking right now? ────────────────────────
-            last_sig = s.get("last_signal", {})
-            sig_type = last_sig.get("type") or "—"
-            sig_conf = last_sig.get("confidence") or 0
-            if sig_type in ("LONG", "SHORT"):
-                thinking = f"🎯 Signal: *{sig_type}* @ `{sig_conf:.0%}` conf"
+            # ── P&L summary ───────────────────────────────────────────────────
+            net_pnl   = risk.get("daily_pnl", 0)
+            pnl_icon  = "💰" if net_pnl >= 0 else "🔻"
+            pnl_limit = p.get("max_daily_loss", 0)
+            pnl_used  = f"{abs(net_pnl) / pnl_limit * 100:.0f}%" if pnl_limit else "—"
+
+            # ── Last signal intent ────────────────────────────────────────────
+            sig_type = sig.get("type") or "—"
+            sig_conf = sig.get("confidence") or 0
+            if sig_type not in ("—", "FLAT", None):
+                sig_txt = f"`{sig_type}`  conf=`{sig_conf:.0%}`"
             elif sig_type == "FLAT":
-                thinking = f"👀 Engine output: *FLAT* — no momentum edge detected"
+                sig_txt = "`FLAT` — engine sees no edge this bar"
             else:
-                thinking = "⏳ Engine still warming up — building phase-space history"
+                sig_txt = "`—` warming up"
 
-            # ── Risk limit gauges ─────────────────────────────────────────────
-            loss_limit = p.get("max_daily_loss", 200)
-            loss_used  = max(0.0, -net_pnl)
-            pnl_bar    = _pct_bar(loss_used, 0, loss_limit, width=12)
-
-            trades_today = risk.get("trades_today", 0)
-            max_trades   = p.get("max_daily_trades", "?")
-            trd_bar      = _pct_bar(trades_today, 0, (max_trades or 50), width=12)
-
-            halt_note = ""
+            # ── Risk gate summary ─────────────────────────────────────────────
             if is_halted:
-                halt_note = f"\n🚨 *HALT:* `{_md_safe(risk.get('halt_reason', ''))}`  — /resume to clear"
+                risk_txt = "🚨 HALTED — `" + risk.get("halt_reason", "unknown") + "`"
+            else:
+                cd = risk.get("cooldown_remaining", 0)
+                risk_txt = "✅ Clear" if cd == 0 else f"⏱ Cooldown `{cd:.0f}s` remaining"
+
+            # ── Data health ───────────────────────────────────────────────────
+            dm_ok = self._data.is_ready if self._data else False
+            try:
+                price_fresh = self._data.is_price_fresh(max_stale_seconds=30) if self._data else False
+            except Exception:
+                price_fresh = False
+            data_txt = ("🟢 Ready & fresh" if (dm_ok and price_fresh)
+                        else ("🟡 Ready, price stale" if dm_ok else "🔴 Not ready"))
 
             return (
-                f"📡 *HPMS Pulse*  ·  `{price:,.1f}`\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"{strat_icon} Strategy: `{'ACTIVE' if strat_on else 'STOPPED'}`    "
-                f"{risk_icon} Risk: `{'HALTED' if is_halted else 'OK'}`\n\n"
-                f"*Position:*\n{pos_txt}\n\n"
-                f"*Engine:*\n{thinking}\n\n"
-                f"{pnl_icon} *P&L Today:*  `${net_pnl:+.2f}` "
-                f"(peak `${risk.get('session_high_pnl', 0):+.2f}`)\n"
-                f"  Loss used:  `[{pnl_bar}]`  `${loss_used:.2f}` / `${loss_limit}`\n"
-                f"  Trades:     `[{trd_bar}]`  `{trades_today}` / `{max_trades}`\n"
-                f"  Consec ↓:   `{risk.get('consecutive_losses', 0)}` in a row\n"
-                f"  Bars seen:  `{s.get('bar_count', 0)}`"
-                f"{halt_note}\n\n"
-                f"_/thinking for full decision stack · /status for dashboard_"
+                "📡 *HPMS Periodic Report*\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"{strat_icon} Strategy: `{'ON' if strat_on else 'OFF'}`   "
+                f"{halt_icon} Risk: `{'HALTED' if is_halted else 'OK'}`\n"
+                f"💹 Price:    `${price:,.1f}`   Data: {data_txt}\n"
+                f"📍 Position: {pos_txt}\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"{pnl_icon} *P&L Today*\n"
+                f"  Net: `${net_pnl:+.2f}`  "
+                f"High: `${risk.get('session_high_pnl', 0):+.2f}`  "
+                f"Limit used: `{pnl_used}`\n"
+                f"  Trades: `{risk.get('trades_today', 0)}`/`{p.get('max_daily_trades', '?')}`   "
+                f"Consec losses: `{risk.get('consecutive_losses', 0)}`\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔬 Last signal: {sig_txt}\n"
+                f"🛡 Risk gate:   {risk_txt}\n"
+                f"📊 Bars seen:  `{s.get('bar_count', 0)}`\n"
+                "_/thinking for full decision stack  · /status for dashboard_"
             )
         except Exception as e:
             return f"⚠️ Periodic report error: {e}"
@@ -535,66 +545,46 @@ class TelegramBot:
             price = self._data.get_last_price() if self._data else 0
             dm_ok = self._data.is_ready if self._data else False
 
-            # ── Position ──────────────────────────────────────────────────────
-            if pos.get("in_position"):
-                side_icon = "📈" if pos["side"] == "long" else "📉"
-                pos_txt = (
-                    f"{side_icon} *{pos['side'].upper()}*  "
-                    f"`{pos['size']}c` @ `${pos['entry_price']:,.1f}`  "
-                    f"({pos['bars_held']} bars held)"
-                )
-            else:
-                pos_txt = "⬜ Flat — no open position"
+            pos_txt = (
+                f"{'🟢' if pos['side']=='long' else '🔴'} {pos['side'].upper()} "
+                f"`{pos['size']}c` @ `${pos['entry_price']:,.1f}` "
+                f"({pos['bars_held']} bars held)"
+                if pos.get("in_position") else "⬜ Flat — no open position"
+            )
 
-            # ── Risk status ───────────────────────────────────────────────────
-            if risk.get("is_halted"):
-                halt_txt = f"🚨 *HALTED*  reason: `{risk.get('halt_reason', '')}`"
-            else:
-                halt_txt = "🛡 OK — gates clear"
+            halt_txt = (
+                f"🔴 HALTED: `{risk.get('halt_reason', '')}`"
+                if risk.get("is_halted") else "🟢 Clear — trades allowed"
+            )
 
-            # ── What the engine last decided ──────────────────────────────────
             sig_type = sig.get("type") or "—"
             sig_conf = sig.get("confidence") or 0
             sig_dq   = sig.get("delta_q") or 0
-            sig_why  = sig.get("reason") or "no signal yet"
-
-            if sig_type in ("LONG", "SHORT"):
-                sig_summary = f"🎯 *{sig_type}*  conf `{sig_conf:.1%}`  Δq `{sig_dq:+.5f}`"
-            elif sig_type == "FLAT":
-                sig_summary = f"👀 FLAT — engine sees no edge this bar"
-            else:
-                sig_summary = "⏳ Warming up — not enough bars yet"
-
-            sig_summary += f"\n  Reason: `{sig_why[:90]}`"
-
-            # ── P&L gauges ────────────────────────────────────────────────────
-            net_pnl    = risk.get("daily_pnl", 0)
-            loss_limit = risk.get("params", {}).get("max_daily_loss", 200)
-            pnl_bar    = _pct_bar(max(0.0, -net_pnl), 0, loss_limit)
-            pnl_icon   = "💰" if net_pnl >= 0 else "🔻"
+            sig_comp = sig.get("compute_us") or 0
+            sig_why  = sig.get("reason") or "—"
 
             await update.message.reply_text(
                 f"📊 *HPMS Dashboard*\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Strategy:  `{'▶ ACTIVE' if s.get('enabled') else '⏸ STOPPED'}`\n"
-                f"Data feed: `{'🟢 Live' if dm_ok else '🔴 Not Ready'}`\n"
-                f"Risk:      {halt_txt}\n"
-                f"Price:     `${price:,.1f}`\n\n"
-                f"*Position:*\n{pos_txt}\n\n"
-                f"*Engine decision (last bar):*\n{sig_summary}\n"
-                f"Compute: `{sig.get('compute_us', 0):.0f}µs`    "
+                f"Strategy:  `{'▶ ON — entering new trades' if s.get('enabled') else '⏸ OFF — no new entries'}`\n"
+                f"Data feed: `{'🟢 Ready' if dm_ok else '🔴 Not Ready'}`\n"
+                f"Risk gate: {halt_txt}\n"
+                f"Price:     `${price:,.1f}`\n"
+                f"Position:  {pos_txt}\n"
                 f"Bars seen: `{s.get('bar_count', 0)}`\n\n"
-                f"{pnl_icon} *Today's P&L:*\n"
-                f"  Gross: `${risk.get('daily_gross_pnl', 0):+.4f}`\n"
-                f"  Fees:  `$-{risk.get('daily_fees', 0):.4f}`\n"
-                f"  *Net:  `${net_pnl:+.4f}`*  "
-                f"(peak `${risk.get('session_high_pnl', 0):+.4f}`)\n"
-                f"  Loss vs limit:  [{pnl_bar}]\n"
-                f"  Trades: `{risk.get('trades_today', 0)}`"
-                f"/{risk.get('params', {}).get('max_daily_trades', '?')}"
-                f"   Consec ↓: `{risk.get('consecutive_losses', 0)}`\n"
-                f"  Cooldown: `{risk.get('cooldown_remaining', 0):.0f}s`\n\n"
-                f"_/thinking for decision stack · /risk for gate details_",
+                f"💰 *Today's P&L*\n"
+                f"Gross:      `${risk.get('daily_gross_pnl', 0):+.4f}`\n"
+                f"Fees paid:  `$-{risk.get('daily_fees', 0):.4f}`\n"
+                f"*Net:       `${risk.get('daily_pnl', 0):+.4f}`* "
+                f"(session high `${risk.get('session_high_pnl', 0):+.4f}`)\n"
+                f"Trades:     `{risk.get('trades_today', 0)}`/"
+                f"`{risk.get('params', {}).get('max_daily_trades', '?')}`\n"
+                f"Consec ↓:  `{risk.get('consecutive_losses', 0)}` in a row\n"
+                f"Cooldown:   `{risk.get('cooldown_remaining', 0):.0f}s` remaining\n\n"
+                f"🔬 *Last Signal*\n"
+                f"Type: `{sig_type}`   Conf: `{sig_conf:.1%}`\n"
+                f"Δq: `{sig_dq:+.5f}`   Compute: `{sig_comp:.0f}µs`\n"
+                f"Reason: `{sig_why[:80]}`",
                 parse_mode="Markdown",
             )
         except Exception as e:
@@ -620,36 +610,40 @@ class TelegramBot:
         if not await self._guard(update):
             return
         try:
-            lines = [f"🧠 *HPMS — What I'm Thinking*"]
+            lines = [f"🧠 *HPMS Decision Stack*"]
             price = self._data.get_last_price() if self._data else 0
             if price:
-                lines.append(f"Current price: `${price:,.1f}`")
+                lines.append(f"Market price at query time: `${price:,.1f}`")
             lines.append("")
 
             # ── LAYER 1: Phase-space ─────────────────────────────────────────
-            lines.append("*── LAYER 1: PHASE-SPACE STATE ──*")
-            lines.append("_This tells us where the market is in Hamiltonian space._")
+            lines.append(
+                "*━━ LAYER 1: PHASE-SPACE STATE*\n"
+                "_Where is the market in phase space right now?_"
+            )
             ps = self._engine.get_phase_state() if self._engine else None
             if ps:
-                p_dir   = "rising ⬆️" if ps.p > 0.0001 else ("falling ⬇️" if ps.p < -0.0001 else "flat ➡️")
+                p_arrow = "⬆️" if ps.p > 0 else ("⬇️" if ps.p < 0 else "➡️")
                 dH_max  = getattr(self._config, "SIGNAL_DH_DT_MAX", 0.05) if self._config else 0.05
                 dH_ok   = abs(ps.dH_dt) <= dH_max
-                dH_note = "✅ energy conserved — system is stable" if dH_ok \
-                    else "❌ energy leaking — chaotic regime, no trade"
+                dH_icon = "🟢" if dH_ok else "🔴"
                 lines += [
-                    f"  q (phase position): `{ps.q:+.6f}`",
-                    f"  p (momentum):       `{ps.p:+.6f}`  → market is {p_dir}",
-                    f"  H (total energy):   `{ps.H:.6f}`"
-                    f"   K=`{ps.kinetic:.4f}` V=`{ps.potential:.4f}`",
-                    f"  dH/dt (stability):  `{ps.dH_dt:.6f}`  {dH_note}",
-                    f"  _(threshold |dH/dt| ≤ {dH_max} for a trade to qualify)_",
+                    f"  q (normalised price position): `{ps.q:+.6f}`",
+                    f"  p (momentum):                  `{ps.p:+.6f}` {p_arrow}",
+                    f"  H (total energy):              `{ps.H:.6f}`",
+                    f"    ├ K kinetic  `{ps.kinetic:.4f}`  (speed of price move)",
+                    f"    └ V potential `{ps.potential:.4f}`  (landscape curvature)",
+                    f"  dH/dt (EMA, energy drift):     `{ps.dH_dt:.6f}` {dH_icon} "
+                    f"(limit ±{dH_max} — beyond this the market is too non-conservative to trade)",
                 ]
             else:
-                lines.append("  ⏳ *Not ready* — engine is still warming up (need more bars)")
+                lines.append("  ⏳ Engine not yet ready — still warming up on historical bars")
 
             # ── LAYER 2: KDE landscape ───────────────────────────────────────
-            lines.append("\n*── LAYER 2: POTENTIAL LANDSCAPE V(q) ──*")
-            lines.append("_KDE turns price history into a probability landscape the engine navigates._")
+            lines.append(
+                "\n*━━ LAYER 2: POTENTIAL LANDSCAPE V(q)*\n"
+                "_Has the engine built a probability density map of price positions?_"
+            )
             d = self._engine.get_diagnostics() if self._engine else {}
             ep = self._engine.get_params() if self._engine else {}
 
@@ -659,19 +653,19 @@ class TelegramBot:
             hist_len    = d.get("history_len", 0)
             bw          = ep.get("kde_bandwidth", "?")
             grid        = ep.get("kde_grid_points", "?")
-            needed      = ep.get("lookback", "?")
 
-            kde_status  = "✅ Built and ready" if built else "❌ Not yet built — need more history"
             lines += [
-                f"  Status:    {kde_status}",
-                f"  Bandwidth: `{bw}`   Grid: `{grid}` points",
-                f"  Rebuild:   every `{rebuild_int}` bars  (last built `{bars_since}` bars ago)",
-                f"  History:   `{hist_len}` bars available  (need ≥ `{needed}` to build)",
+                f"  Built:     {_gate(built)}  {'(landscape ready — V(q) can be computed)' if built else '(waiting for enough history)'}",
+                f"  Bandwidth: `{bw}`  Grid: `{grid}` pts  (KDE resolution)",
+                f"  Rebuild:   every `{rebuild_int}` bars  (last: `{bars_since}` bars ago)",
+                f"  History:   `{hist_len}` bars in buffer  (need ≥ `{ep.get('lookback', '?')}` to build)",
             ]
 
             # ── LAYER 3: Signal gates ────────────────────────────────────────
-            lines.append("\n*── LAYER 3: SIGNAL QUALITY GATES ──*")
-            lines.append("_Engine checks three criteria before declaring a valid signal._")
+            lines.append(
+                "\n*━━ LAYER 3: SIGNAL GATES*\n"
+                "_Do the Hamiltonian indicators meet the entry thresholds?_"
+            )
             sig = self._strategy._last_signal if self._strategy else None
             if sig:
                 cfg = self._config
@@ -686,33 +680,27 @@ class TelegramBot:
                 dq_bar  = _pct_bar(abs(sig.predicted_delta_q), 0, dq_thresh * 3)
                 dH_bar  = _pct_bar(abs(sig.dH_dt), 0, dH_thresh * 2)
 
-                gate_all_ok = dq_ok and dH_ok and mom_ok
-
                 lines += [
-                    f"  {_gate(dq_ok)} *Displacement Δq* — did price move far enough?",
-                    f"       `{sig.predicted_delta_q:+.6f}`  (need |Δq| ≥ {dq_thresh})",
-                    f"       [{dq_bar}]  {'✔ sufficient move' if dq_ok else '✘ move too small — signal suppressed'}",
-                    f"",
-                    f"  {_gate(dH_ok)} *Energy stability dH/dt* — is the system well-behaved?",
-                    f"       `{abs(sig.dH_dt):.6f}`  (must be ≤ {dH_thresh})",
-                    f"       [{dH_bar}]  {'✔ stable energy' if dH_ok else '✘ energy diverging — too chaotic'}",
-                    f"",
-                    f"  {_gate(mom_ok)} *Momentum p_final* — is there directional conviction?",
-                    f"       `{abs(sig.predicted_p_final):.6f}`  (need |p| ≥ {mom_thresh})",
-                    f"       {'✔ momentum confirmed' if mom_ok else '✘ momentum too weak — no edge'}",
-                    f"",
-                    f"  → Signal: *{sig.signal_type.name}*  "
-                    f"confidence `{sig.confidence:.1%}`  "
-                    f"({'all gates passed 🟢' if gate_all_ok else 'one or more gates failed 🔴'})",
-                    f"  → Reason: `{_md_safe(sig.reason[:100])}`",
-                    f"  → Computed in `{sig.compute_time_us:.0f}µs`",
+                    f"  {_gate(dq_ok)} Δq (predicted move):    `{sig.predicted_delta_q:+.6f}` "
+                    f"(need ±{dq_thresh} — is the projected displacement large enough?)\n"
+                    f"             [{dq_bar}]",
+                    f"  {_gate(dH_ok)} |dH/dt| (energy drift):  `{abs(sig.dH_dt):.6f}` "
+                    f"(max {dH_thresh} — is energy approximately conserved?)\n"
+                    f"             [{dH_bar}]",
+                    f"  {_gate(mom_ok)} |p_final| (end momentum): `{abs(sig.predicted_p_final):.6f}` "
+                    f"(min {mom_thresh} — does momentum persist through the horizon?)",
+                    f"\n  ➤ Signal:   *{sig.signal_type.name}*  conf=`{sig.confidence:.1%}`",
+                    f"  ➤ Reason:   `{_md_safe(sig.reason[:100])}`",
+                    f"  ➤ Compute:  `{sig.compute_time_us:.0f}µs`",
                 ]
             else:
-                lines.append("  ⏳ *No signal yet* — waiting for enough bars to run the engine")
+                lines.append("  ⏳ No signal computed yet — engine needs more bars to warm up")
 
             # ── LAYER 4: Risk gate ───────────────────────────────────────────
-            lines.append("\n*── LAYER 4: RISK GATE ──*")
-            lines.append("_Even a valid signal is blocked if risk limits are breached._")
+            lines.append(
+                "\n*━━ LAYER 4: RISK GATE*\n"
+                "_Would the risk manager allow a trade right now?_"
+            )
             if self._risk:
                 can_trade, reason = self._risk.can_trade()
                 rs = self._risk.get_status()
@@ -721,56 +709,51 @@ class TelegramBot:
                 auto_rem = rs.get("auto_resume_remaining", 0)
                 eff_cd = p.get("effective_cooldown", p.get("cooldown", "?"))
 
-                halt_line = "No — trading is permitted"
+                halt_line = "No"
                 if rs.get("is_halted"):
-                    halt_line = "🚨 YES — " + _md_safe(rs.get("halt_reason", ""))
+                    halt_line = "Yes — " + _md_safe(rs.get("halt_reason", ""))
                     if auto_rem > 0:
-                        halt_line += f"  (auto-resume in {auto_rem:.0f}s)"
+                        halt_line += f" (auto-resume in {auto_rem:.0f}s)"
 
                 lines += [
-                    f"  {_gate(can_trade)} *Can trade right now?*  → `{reason}`",
-                    f"  Halt active:  `{halt_line}`",
-                    f"  Cooldown:     `{cd:.0f}s` remaining  (effective cooldown: `{eff_cd}s`)",
-                    f"  Daily PnL:    `${rs.get('daily_pnl', 0):+.2f}`  / loss limit `${p.get('max_daily_loss', '?')}`",
-                    f"  Trades today: `{rs.get('trades_today', 0)}` / max `{p.get('max_daily_trades', '?')}`",
-                    f"  Consec loss:  `{rs.get('consecutive_losses', 0)}` in a row "
-                    f"/ max `{p.get('max_consec_losses', '?')}`",
+                    f"  {_gate(can_trade)} Can trade: `{reason}`",
+                    f"  Halted:    `{halt_line}`",
+                    f"  Cooldown:  `{cd:.0f}s` remaining (effective threshold: `{eff_cd}s`)",
+                    f"  Daily PnL: `${rs.get('daily_pnl', 0):+.2f}` "
+                    f"/ limit `${p.get('max_daily_loss', '?')}`",
+                    f"  Trades:    `{rs.get('trades_today', 0)}` "
+                    f"/ max `{p.get('max_daily_trades', '?')}` today",
+                    f"  Consec ↓:  `{rs.get('consecutive_losses', 0)}` "
+                    f"/ max `{p.get('max_consec_losses', '?')}` "
+                    f"(soft weight: `{p.get('soft_loss_weight', '?')}`)",
                 ]
             else:
                 lines.append("  ⚠️ Risk manager unavailable")
 
-            # ── LAYER 5: Filter gate ─────────────────────────────────────────
-            lines.append("\n*── LAYER 5: MARKET CONDITION FILTERS ──*")
-            lines.append("_Microstructure checks — spread, volume, volatility must be suitable._")
+            # ── LAYER 5: Filter gate (from last bar data) ────────────────────
+            lines.append(
+                "\n*━━ LAYER 5: MARKET FILTER GATE*\n"
+                "_Are current market conditions suitable for entry?_"
+            )
             lines.append(self._build_filter_inline())
 
             # ── VERDICT ─────────────────────────────────────────────────────
-            lines.append("\n*── VERDICT ──*")
+            lines.append("\n*━━ VERDICT*")
             if self._orders and self._orders.is_in_position:
                 pos = self._orders.get_status()
-                side_icon = "📈" if pos["side"] == "long" else "📉"
                 lines.append(
-                    f"  {side_icon} *Currently in a trade* — monitoring for TP/SL/exit conditions\n"
-                    f"  {pos['side'].upper()} `{pos['size']}c` @ `${pos['entry_price']:,.1f}`  "
-                    f"({pos['bars_held']} bars held)"
+                    f"  📍 *Already in position* — {pos['side'].upper()} `{pos['size']}c` "
+                    f"@ `${pos['entry_price']:,.1f}`  ({pos['bars_held']} bars)\n"
+                    f"  _Watching for TP/SL or max-hold exit conditions._"
                 )
             elif sig and sig.signal_type.name != "FLAT":
                 can_trade = self._risk.can_trade()[0] if self._risk else False
                 if can_trade:
-                    lines.append(
-                        "  🎯 *Signal present + risk gate open*\n"
-                        "  → Waiting for market filters to clear before entry"
-                    )
+                    lines.append("  🎯 *Signal present + risk OK — awaiting filter confirmation to fire*")
                 else:
-                    lines.append(
-                        "  ⏳ *Signal present but risk gate is blocking*\n"
-                        "  → Use /risk to see what's holding us back"
-                    )
+                    lines.append(f"  ⏳ *Signal present but risk gate is blocking entry*")
             else:
-                lines.append(
-                    "  👀 *Watching — no actionable signal this bar*\n"
-                    "  → Engine sees the market as directionless or too risky right now"
-                )
+                lines.append("  👀 *No trade this bar* — engine sees no significant edge")
 
             try:
                 await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -872,9 +855,9 @@ class TelegramBot:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _build_filter_inline(self) -> str:
-        """Build filter gate lines (used by /filter and /thinking)."""
+        """Build filter gate lines with pass/fail + threshold context (used by /filter and /thinking)."""
         if not self._data or not self._config:
-            return "  ⚠️ Data/config unavailable"
+            return "  ⚠️ Data or config unavailable — cannot evaluate filters"
 
         lines = []
         cfg   = self._config
@@ -889,7 +872,10 @@ class TelegramBot:
                 spread_pct = (ba - bb) / bb * 100 if bb else 0
                 max_sp     = getattr(cfg, "FILTER_SPREAD_MAX_PCT", 0.05)
                 sp_ok      = spread_pct <= max_sp
-                lines.append(f"  {_gate(sp_ok)} Spread:   `{spread_pct:.3f}%` (max {max_sp}%)")
+                note = "✓ tight enough" if sp_ok else "✗ too wide for safe entry"
+                lines.append(
+                    f"  {_gate(sp_ok)} Spread:  `{spread_pct:.3f}%` / max `{max_sp}%`  _{note}_"
+                )
             except Exception:
                 lines.append("  ⚠️ Spread: n/a")
 
@@ -900,7 +886,10 @@ class TelegramBot:
             last_vol = candles[-1].get("v", 0)
             min_vol  = getattr(cfg, "FILTER_MIN_VOLUME_1M", 10.0)
             vol_ok   = last_vol >= min_vol
-            lines.append(f"  {_gate(vol_ok)} Volume:   `{last_vol:.1f}` (min {min_vol})")
+            note = "✓ sufficient" if vol_ok else "✗ insufficient liquidity"
+            lines.append(
+                f"  {_gate(vol_ok)} Volume:  `{last_vol:.1f}` / min `{min_vol}`  _{note}_"
+            )
 
         if len(candles) >= 10 and price:
             try:
@@ -909,14 +898,20 @@ class TelegramBot:
                 vol_min = getattr(cfg, "FILTER_VOLATILITY_MIN_PCT", 0.01)
                 vol_max = getattr(cfg, "FILTER_VOLATILITY_MAX_PCT", 2.0)
                 vol_ok  = vol_min <= atr_pct <= vol_max
+                if atr_pct < vol_min:
+                    note = "✗ too quiet — no edge"
+                elif atr_pct > vol_max:
+                    note = "✗ too volatile — risk too high"
+                else:
+                    note = "✓ good volatility regime"
                 lines.append(
-                    f"  {_gate(vol_ok)} ATR:      `{atr_pct:.3f}%` "
-                    f"(range {vol_min}%–{vol_max}%)"
+                    f"  {_gate(vol_ok)} ATR 10b: `{atr_pct:.3f}%` "
+                    f"(range `{vol_min}%`–`{vol_max}%`)  _{note}_"
                 )
             except Exception:
                 pass
 
-        return "\n".join(lines) if lines else "  ⏳ Not enough data"
+        return "\n".join(lines) if lines else "  ⏳ Not enough data to evaluate filters yet"
 
     async def _cmd_filter(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not await self._guard(update):
@@ -947,58 +942,42 @@ class TelegramBot:
             can_trade, reason = self._risk.can_trade()
             gate_icon = "🟢" if can_trade else "🔴"
 
-            # ── Loss gauge: how much of the daily limit have we burned? ───────
-            net_pnl   = rs.get("daily_pnl", 0)
-            loss_limit = p.get("max_daily_loss", 200)
-            loss_used  = max(0.0, -net_pnl)
-            pnl_bar = _pct_bar(loss_used, 0, loss_limit)
-            loss_pct = (loss_used / loss_limit * 100) if loss_limit else 0
-
-            # ── Trade count gauge ─────────────────────────────────────────────
-            trades_today = rs.get("trades_today", 0)
-            max_trades   = p.get("max_daily_trades", 50)
-            trd_bar = _pct_bar(trades_today, 0, (max_trades or 50))
+            pnl_bar = _pct_bar(
+                max(0.0, -rs.get("daily_pnl", 0)), 0, p.get("max_daily_loss", 200)
+            )
+            trd_bar = _pct_bar(
+                rs.get("trades_today", 0), 0, p.get("max_daily_trades", 50)
+            )
 
             auto_resume = rs.get("auto_resume_remaining", 0)
-            halt_info = "No — trading permitted"
+            halt_info = "No"
             if rs.get("is_halted"):
-                halt_info = "🚨 YES — " + rs.get("halt_reason", "")
+                halt_info = "Yes — " + rs.get("halt_reason", "")
                 if auto_resume > 0:
-                    halt_info += f"\n           (auto-resume in {auto_resume:.0f}s)"
+                    halt_info += f" (auto-resume in {auto_resume:.0f}s)"
 
             eff_cd = p.get("effective_cooldown", p.get("cooldown", "?"))
-
-            # ── Blocking summary ──────────────────────────────────────────────
-            if can_trade:
-                gate_summary = "🟢 *All gates clear — new entries allowed*"
-            else:
-                gate_summary = f"🔴 *Blocked:* `{reason}`"
 
             await update.message.reply_text(
                 f"🛡 *Risk Gate Status*\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"{gate_summary}\n\n"
-                f"*Halt:*      `{halt_info}`\n"
-                f"*Cooldown:* `{cd:.0f}s` remaining  (effective `{eff_cd}s`)\n\n"
-                f"*Daily Loss Used:*\n"
-                f"  `${loss_used:.2f}` of `${loss_limit}` limit  ({loss_pct:.1f}%)\n"
-                f"  `[{pnl_bar}]`\n"
-                f"  Net PnL today: `${net_pnl:+.2f}`\n\n"
-                f"*Trades Used:*\n"
-                f"  `{trades_today}` of `{max_trades}` allowed today\n"
-                f"  `[{trd_bar}]`\n\n"
-                f"*Other counters:*\n"
-                f"  Consec losses: `{rs.get('consecutive_losses', 0)}` / max `{p.get('max_consec_losses', '?')}`\n"
-                f"  Session high:  `${rs.get('session_high_pnl', 0):+.2f}`\n\n"
-                f"*Position limits:*\n"
-                f"  Max pos USD:   `${p.get('max_pos_usd','?')}`\n"
-                f"  Max contracts: `{p.get('max_pos_contracts','?')}c`\n"
-                f"  Leverage:      `{p.get('leverage','?')}x`\n"
-                f"  Max drawdown:  `{p.get('max_dd_pct','?')}%`\n"
-                f"  Equity/trade:  `{p.get('equity_pct','?')}%`\n"
-                f"  Auto-resume:   `{p.get('auto_resume_sec','?')}s`\n"
-                f"  Soft loss wt:  `{p.get('soft_loss_weight','?')}`\n\n"
-                f"_/resetrisk to clear lockout  ·  /resume to resume from halt_",
+                f"{gate_icon} *Can trade: `{reason}`*\n\n"
+                f"Halted:     `{halt_info}`\n"
+                f"Cooldown:   `{cd:.0f}s` remaining (effective `{eff_cd}s`)\n\n"
+                f"Daily PnL:   `${rs.get('daily_pnl', 0):+.2f}` / limit `${p.get('max_daily_loss', '?')}`\n"
+                f"             [{pnl_bar}]\n"
+                f"Trades:      `{rs.get('trades_today', 0)}` / max `{p.get('max_daily_trades', '?')}`\n"
+                f"             [{trd_bar}]\n"
+                f"Consec ↓:   `{rs.get('consecutive_losses', 0)}` / max `{p.get('max_consec_losses', '?')}`\n"
+                f"Sess. high: `${rs.get('session_high_pnl', 0):+.2f}`\n\n"
+                f"*Limits:*\n"
+                f"  Max pos:   `${p.get('max_pos_usd','?')}` / `{p.get('max_pos_contracts','?')}c`\n"
+                f"  Leverage:  `{p.get('leverage','?')}x`\n"
+                f"  Max DD:    `{p.get('max_dd_pct','?')}%`\n"
+                f"  Equity%:   `{p.get('equity_pct','?')}%` per trade\n"
+                f"  Auto-resume: `{p.get('auto_resume_sec','?')}s`\n"
+                f"  Soft loss wt: `{p.get('soft_loss_weight','?')}`\n\n"
+                f"_/resetrisk to clear lockout  /resume to resume from halt_",
                 parse_mode="Markdown",
             )
         except Exception as e:
@@ -1013,44 +992,20 @@ class TelegramBot:
             return
         s = self._strategy._last_signal if self._strategy else None
         if not s:
-            await update.message.reply_text(
-                "⏳ *No signal yet*\n\n"
-                "The engine is still warming up — it needs enough bars to build\n"
-                "the KDE landscape and compute phase-space trajectories.\n\n"
-                "_Use /diag to check how many bars have been processed._"
-            )
+            await update.message.reply_text("No signal computed yet — warming up")
             return
-
-        sig_name = s.signal_type.name
-        if sig_name == "LONG":
-            dir_line = "📈 *LONG* — engine predicts upward displacement"
-        elif sig_name == "SHORT":
-            dir_line = "📉 *SHORT* — engine predicts downward displacement"
-        else:
-            dir_line = "⬜ *FLAT* — no directional edge, engine is neutral"
-
-        dq_abs = abs(s.predicted_delta_q)
-        cfg = self._config
-        dq_thresh = getattr(cfg, "SIGNAL_DELTA_Q_THRESHOLD", 0.0022) if cfg else 0.0022
-        dq_bar = _pct_bar(dq_abs, 0, dq_thresh * 3)
-
         await update.message.reply_text(
-            f"🔬 *Last Engine Signal*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"{dir_line}\n"
-            f"Confidence:     `{s.confidence:.1%}`\n"
-            f"Reason:         `{s.reason}`\n\n"
-            f"*Phase-space metrics:*\n"
-            f"  Predicted Δq:  `{s.predicted_delta_q:+.6f}`  (need |Δq| ≥ {dq_thresh})\n"
-            f"                 [{dq_bar}]\n"
-            f"  p_final:       `{s.predicted_p_final:.6f}`  (residual momentum)\n"
-            f"  H (energy):    `{s.current_H:.6f}`\n"
-            f"  dH/dt:         `{s.dH_dt:.6f}`  (stability indicator)\n\n"
-            f"*Execution levels:*\n"
-            f"  Entry: `${s.entry_price:,.1f}`\n"
-            f"  TP:    `${s.tp_price:,.1f}`  (+`${abs(s.tp_price - s.entry_price):.1f}`)\n"
-            f"  SL:    `${s.sl_price:,.1f}`  (-`${abs(s.sl_price - s.entry_price):.1f}`)\n\n"
-            f"  Computed in `{s.compute_time_us:.0f}µs`",
+            f"🔬 *Last Signal*\n\n"
+            f"Type:       *{s.signal_type.name}*\n"
+            f"Confidence: `{s.confidence:.1%}`\n"
+            f"Predicted Δq: `{s.predicted_delta_q:+.6f}`\n"
+            f"p_final:    `{s.predicted_p_final:.6f}`\n"
+            f"H (energy):  `{s.current_H:.6f}`\n"
+            f"dH/dt:       `{s.dH_dt:.6f}`\n"
+            f"Entry: `${s.entry_price:,.1f}`\n"
+            f"TP:    `${s.tp_price:,.1f}` | SL: `${s.sl_price:,.1f}`\n"
+            f"Compute: `{s.compute_time_us:.0f}µs`\n"
+            f"Reason: `{s.reason}`",
             parse_mode="Markdown",
         )
 
@@ -1059,34 +1014,20 @@ class TelegramBot:
             return
         ps = self._engine.get_phase_state() if self._engine else None
         if not ps:
-            await update.message.reply_text(
-                "⏳ *Engine not ready yet*\n\n"
-                "Phase-space coordinates are computed after the KDE landscape\n"
-                "is built\\. This requires enough price bars to fill the lookback window\\.\n\n"
-                "_Use /diag to check progress\\._"
-            )
+            await update.message.reply_text("Engine not ready yet — need more bars")
             return
         dH_max  = getattr(self._config, "SIGNAL_DH_DT_MAX", 0.05) if self._config else 0.05
         dH_ok   = abs(ps.dH_dt) <= dH_max
-
-        p_desc = "rising — bullish momentum" if ps.p > 0.0001 \
-            else ("falling — bearish momentum" if ps.p < -0.0001 else "flat — no net momentum")
-        h_desc = "conserved ✅ — market in a predictable regime" if dH_ok \
-            else "diverging ❌ — chaotic regime, signal quality low"
-
         await update.message.reply_text(
-            f"🌀 *Phase-Space State*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"*q (phase position):*  `{ps.q:+.6f}`\n"
-            f"  _How far price has displaced in normalised space_\n\n"
-            f"*p (momentum):*        `{ps.p:+.6f}`\n"
-            f"  _Direction & strength: {p_desc}_\n\n"
-            f"*H (total energy):*    `{ps.H:.6f}`\n"
-            f"  _Kinetic:   `{ps.kinetic:.6f}`  (motion energy)_\n"
-            f"  _Potential: `{ps.potential:.6f}`  (landscape energy)_\n\n"
-            f"*dH/dt (EMA):*         `{ps.dH_dt:.6f}`\n"
-            f"  _Stability check — {h_desc}_\n"
-            f"  _Threshold: |dH/dt| must be ≤ `{dH_max}` for a valid signal_",
+            f"🌀 *Phase-Space State*\n\n"
+            f"q (position):   `{ps.q:+.6f}`\n"
+            f"p (momentum):   `{ps.p:+.6f}`\n"
+            f"H (energy):     `{ps.H:.6f}`\n"
+            f"  K (kinetic):  `{ps.kinetic:.6f}`\n"
+            f"  V (potential):`{ps.potential:.6f}`\n"
+            f"dH/dt (EMA):    `{ps.dH_dt:.6f}` "
+            f"{'🟢 conserved' if dH_ok else '🔴 non-conserved'}\n"
+            f"  threshold:    max `{dH_max}`",
             parse_mode="Markdown",
         )
 
@@ -1216,38 +1157,22 @@ class TelegramBot:
             return
         r = self._risk.get_status() if self._risk else {}
         p = r.get("params", {})
-        net_pnl   = r.get("daily_pnl", 0)
+        net_pnl  = r.get("daily_pnl", 0)
         gross_pnl = r.get("daily_gross_pnl", 0)
-        fees      = r.get("daily_fees", 0)
-        pnl_max   = p.get("max_daily_loss", 200)
-        loss_used = max(0.0, -net_pnl)
-        pnl_bar   = _pct_bar(loss_used, 0, pnl_max)
-        loss_pct  = (loss_used / pnl_max * 100) if pnl_max else 0
-        pnl_icon  = "💰" if net_pnl >= 0 else "🔻"
-        sess_high = r.get("session_high_pnl", 0)
-
-        status_note = ""
-        if r.get("is_halted"):
-            status_note = f"\n\n🚨 *Risk halted:* `{r.get('halt_reason', '')}`"
-        elif loss_pct > 75:
-            status_note = "\n\n⚠️ *Close to daily loss limit — trade carefully*"
-        elif loss_pct > 50:
-            status_note = "\n\n⚠️ Over 50% of daily loss limit used"
-
+        fees     = r.get("daily_fees", 0)
+        pnl_max  = p.get("max_daily_loss", 200)
+        pnl_bar  = _pct_bar(max(0.0, -net_pnl), 0, pnl_max)
+        pnl_icon = "💰" if net_pnl >= 0 else "🔻"
         await update.message.reply_text(
-            f"{pnl_icon} *Daily P&L Summary*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Gross P&L:    `${gross_pnl:+.4f}`\n"
+            f"{pnl_icon} *Daily P&L*\n\n"
+            f"Gross PnL:    `${gross_pnl:+.4f}`\n"
             f"Total fees:   `$-{fees:.4f}`\n"
-            f"*Net P&L:     `${net_pnl:+.4f}`*\n\n"
-            f"Session high: `${sess_high:+.4f}`\n"
-            f"Drawdown from peak: `${min(0.0, net_pnl - sess_high):+.4f}`\n\n"
-            f"*Loss limit used:*\n"
-            f"  `${loss_used:.2f}` of `${pnl_max}` ({loss_pct:.1f}%)\n"
-            f"  `[{pnl_bar}]`\n\n"
-            f"Trades today:   `{r.get('trades_today', 0)}` / `{p.get('max_daily_trades', '?')}`\n"
-            f"Consec losses:  `{r.get('consecutive_losses', 0)}` / `{p.get('max_consec_losses', '?')}`"
-            f"{status_note}",
+            f"*Net PnL:     `${net_pnl:+.4f}`* / limit `$-{pnl_max}`\n"
+            f"              [{pnl_bar}]\n"
+            f"Session high: `${r.get('session_high_pnl', 0):+.4f}`\n"
+            f"Trades:       `{r.get('trades_today', 0)}` / `{p.get('max_daily_trades', '?')}`\n"
+            f"Consec losses:`{r.get('consecutive_losses', 0)}` / `{p.get('max_consec_losses', '?')}`\n"
+            f"Halted:       `{'Yes — ' + r.get('halt_reason', '') if r.get('is_halted') else 'No'}`",
             parse_mode="Markdown",
         )
 

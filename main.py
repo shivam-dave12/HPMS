@@ -47,215 +47,76 @@ logger = logging.getLogger("hpms")
 
 class _ColoredFormatter(logging.Formatter):
     """
-    Rich, color-coded terminal formatter with structured elog event rendering.
+    Rich, color-coded terminal formatter.
 
-    For regular log lines:
-        12:34:56.789 INF HPMS     Your message here
+    Layout:
+      HH:MM:SS.mmm  ▸  LVL  MODULE    message…
 
-    For elog structured JSON events (from logger_core.elog):
-        12:34:56.789 DBG ENGINE   🎯 ENGINE_SIGNAL   signal=LONG  conf=0.870  Δq=+0.00231
-        12:34:56.790 DBG ENGINE   ⏭  ENGINE_SKIP     reason=FLAT  conf=0.120
-
-    For SYSTEM_ milestone events a banner is drawn:
-        ════════════════════════════════════
-        🚀  SYSTEM_START   mode=LIVE  symbol=BTCUSD
-        ════════════════════════════════════
+    Level colors:  DEBUG=cyan  INFO=green  WARNING=yellow  ERROR=red  CRITICAL=magenta
+    Module column: always 8 chars wide, dimmed for readability.
+    Continuation lines are indented to align under the message.
     """
 
-    # ── ANSI codes ─────────────────────────────────────────────────────────────
     _RESET   = "\033[0m"
     _BOLD    = "\033[1m"
     _DIM     = "\033[2m"
     _ITALIC  = "\033[3m"
-    # Foreground colors
-    _BLACK   = "\033[30m"
-    _RED     = "\033[31m"
-    _GREEN   = "\033[32m"
-    _YELLOW  = "\033[33m"
-    _BLUE    = "\033[34m"
-    _MAGENTA = "\033[35m"
-    _CYAN    = "\033[36m"
-    _WHITE   = "\033[37m"
-    _GREY    = "\033[90m"
-    # Bright variants
-    _BRED    = "\033[91m"
-    _BGREEN  = "\033[92m"
-    _BYELLOW = "\033[93m"
-    _BBLUE   = "\033[94m"
-    _BMAGENTA= "\033[95m"
-    _BCYAN   = "\033[96m"
 
-    # ── Level display ──────────────────────────────────────────────────────────
+    # (color, bold-label, dim-label)
     _LEVELS = {
-        logging.DEBUG:    ("\033[36m",   "DBG"),   # cyan
-        logging.INFO:     ("\033[32m",   "INF"),   # green
-        logging.WARNING:  ("\033[33m",   "WRN"),   # yellow
-        logging.ERROR:    ("\033[91m",   "ERR"),   # bright red
-        logging.CRITICAL: ("\033[95m",   "CRT"),   # bright magenta
+        logging.DEBUG:    ("\033[36m",  "DBG", "·"),   # cyan
+        logging.INFO:     ("\033[32m",  "INF", "▸"),   # green
+        logging.WARNING:  ("\033[33m",  "WRN", "▲"),   # yellow
+        logging.ERROR:    ("\033[31m",  "ERR", "✖"),   # red
+        logging.CRITICAL: ("\033[35m",  "CRT", "★"),   # magenta
     }
 
-    # ── Short logger names ─────────────────────────────────────────────────────
+    # Short display names for known loggers
     _NAME_MAP = {
         "hpms":                         "HPMS",
-        "hpms.elog":                    "ELOG",
         "strategy":                     "STRAT",
         "hpms_engine":                  "ENGINE",
         "risk_manager":                 "RISK",
         "order_manager":                "ORDER",
         "telegram_bot":                 "TG",
         "logger_core":                  "ELOG",
+        "hpms.elog":                    "ELOG",
         "exchanges.delta.api":          "DAPI",
         "exchanges.delta.data_manager": "DATA",
         "exchanges.delta.websocket":    "WS",
     }
 
-    # ── Value highlighting rules — applied to elog event fields ───────────────
-    # Certain field values get distinct colors so critical info pops visually.
-    _VALUE_HIGHLIGHTS = {
-        # Signal direction
-        "LONG":     "\033[92m",   # bright green
-        "SHORT":    "\033[91m",   # bright red
-        "FLAT":     "\033[90m",   # grey
-        # Health
-        "ready":    "\033[92m",
-        "True":     "\033[92m",
-        "False":    "\033[91m",
-        "HALTED":   "\033[91m",
-        "OK":       "\033[92m",
-        "LIVE":     "\033[92m",
-        "DRY-RUN":  "\033[93m",
-        "TESTNET":  "\033[93m",
-        # Errors / warnings
-        "error":    "\033[91m",
-        "failed":   "\033[91m",
-        "build_failed": "\033[91m",
-    }
-
-    # Fields that should be omitted from the one-liner (they're in the header)
-    _SKIP_FIELDS = {"event"}
-
-    # ── Field renaming for compact display ────────────────────────────────────
-    _FIELD_ALIAS = {
-        "signal":             "sig",
-        "confidence":         "conf",
-        "predicted_delta_q":  "Δq",
-        "predicted_p_final":  "p_fin",
-        "compute_time_us":    "µs",
-        "component":          "comp",
-        "status":             "stat",
-        "reason":             "why",
-        "network":            "net",
-        "testnet":            "testnet",
-        "dry_run":            "dry",
-    }
-
-    # ── Events that print a full banner ───────────────────────────────────────
-    _BANNER_EVENTS = {
-        "SYSTEM_START", "SYSTEM_SHUTDOWN", "RISK_HALT", "RISK_RESUME",
-    }
-
-    def _colorize_value(self, val_str: str) -> str:
-        """Apply highlight color if the value matches a known keyword."""
-        stripped = val_str.strip("'\"")
-        for keyword, color in self._VALUE_HIGHLIGHTS.items():
-            if stripped == keyword or stripped.lower() == keyword.lower():
-                return color + val_str + self._RESET
-        return val_str
-
-    def _fmt_kv(self, key: str, val) -> str:
-        """Format a single key=value pair with optional color."""
-        alias = self._FIELD_ALIAS.get(key, key)
-        val_str = str(val)
-        # Truncate very long strings
-        if len(val_str) > 60:
-            val_str = val_str[:57] + "…"
-        val_colored = self._colorize_value(val_str)
-        return f"{self._DIM}{alias}{self._RESET}={self._BOLD}{val_colored}{self._RESET}"
-
-    def _render_elog(self, data: dict, ts_header: str, level_color: str, lvl: str, short_name: str) -> str:
-        """Render a structured elog JSON event as a rich, readable terminal line."""
-        import sys
-        try:
-            from logger_core import event_meta
-            emoji, label = event_meta(data["event"])
-        except Exception:
-            emoji, label = "•", data.get("event", "?").lower()
-
-        event_name = data.get("event", "?")
-        is_banner  = event_name in self._BANNER_EVENTS
-
-        # Build key=value pairs (skip "event" key)
-        kv_parts = [
-            self._fmt_kv(k, v)
-            for k, v in data.items()
-            if k not in self._SKIP_FIELDS
-        ]
-        kv_line = "  ".join(kv_parts)
-
-        # Event name display: colored by category
-        if event_name.startswith("ENGINE_"):
-            ev_color = self._CYAN
-        elif event_name.startswith("RISK_"):
-            ev_color = self._YELLOW
-        elif event_name.startswith("ORDER_"):
-            ev_color = self._BLUE
-        elif event_name.startswith("SYSTEM_"):
-            ev_color = self._BGREEN
-        else:
-            ev_color = self._GREY
-
-        ev_display = (
-            f"{ev_color}{self._BOLD}{event_name:<26}{self._RESET}"
-        )
-
-        if is_banner:
-            # Full-width banner for milestone events
-            width = 62
-            banner_line = "═" * width
-            body = f"  {emoji}  {ev_display}  {kv_line}"
-            return (
-                f"\n{self._BGREEN}{banner_line}{self._RESET}\n"
-                f"{ts_header}{ev_display} {kv_line}\n"
-                f"{self._BGREEN}{banner_line}{self._RESET}"
-            )
-        else:
-            # Compact one-liner
-            return f"{ts_header}{emoji}  {ev_display}  {kv_line}"
+    # Indent width = timestamp(12) + space(1) + bullet(1) + space(2) + lvl(3) + space(2) + name(8) + space(2)
+    _INDENT = " " * 31
 
     def format(self, record: logging.LogRecord) -> str:
-        import json as _json
-
-        color, lvl = self._LEVELS.get(record.levelno, ("", "???"))
+        color, lvl, bullet = self._LEVELS.get(record.levelno, ("", "???", "·"))
         short_name = self._NAME_MAP.get(record.name, record.name.split(".")[-1][:8])
+
         ts = self.formatTime(record, "%H:%M:%S")
         ms = f"{record.msecs:03.0f}"
 
-        ts_header = (
+        # ── Highlight WARNING / ERROR lines with a leading accent bar ─────────
+        accent = ""
+        if record.levelno >= logging.WARNING:
+            accent = f"{color}▌{self._RESET} "
+
+        header = (
             f"{self._DIM}{ts}.{ms}{self._RESET} "
-            f"{color}{self._BOLD}{lvl}{self._RESET} "
+            f"{color}{bullet}{self._RESET}  "
+            f"{color}{self._BOLD}{lvl}{self._RESET}  "
             f"{self._DIM}{short_name:<8}{self._RESET}  "
+            f"{accent}"
         )
 
         msg = record.getMessage()
+        # Indent continuation lines to align under the message start
+        msg_indented = msg.replace("\n", "\n" + self._INDENT)
 
-        # ── Try to parse as elog JSON ──────────────────────────────────────────
-        # elog messages from hpms.elog are always valid JSON objects with "event".
-        if record.name == "hpms.elog" and msg.startswith("{"):
-            try:
-                data = _json.loads(msg)
-                if "event" in data:
-                    rendered = self._render_elog(data, ts_header, color, lvl, short_name)
-                    if record.exc_info:
-                        rendered += "\n" + self.formatException(record.exc_info)
-                    return rendered
-            except (_json.JSONDecodeError, Exception):
-                pass  # Fall through to plain rendering below
-
-        # ── Plain log line ─────────────────────────────────────────────────────
-        msg_indented = msg.replace("\n", "\n" + " " * 26)
         if record.exc_info:
-            msg_indented += "\n" + self.formatException(record.exc_info)
-        return ts_header + msg_indented
+            msg_indented += "\n" + self._INDENT + self.formatException(record.exc_info)
+
+        return header + msg_indented
 
 
 def setup_logging():
@@ -268,11 +129,11 @@ def setup_logging():
     root.addHandler(ch)
 
     # ── hpms.elog: ALWAYS at DEBUG regardless of LOG_LEVEL ───────────────────
-    # elog emits structured JSON for every engine calculation (ENGINE_PHASE_STATE,
+    # elog emits structured one-liners for every engine calculation (ENGINE_PHASE_STATE,
     # ENGINE_CRITERIA, ENGINE_TRAJECTORY, ENGINE_KDE_REBUILD, ENGINE_SIGNAL,
     # ENGINE_SKIP).  Without an explicit DEBUG level on this logger the
-    # isEnabledFor(DEBUG) guard inside _ELog.log() evaluates False at INFO,
-    # silently dropping all per-bar diagnostics.
+    # isEnabledFor(DEBUG) guard evaluates False at INFO, silently dropping all
+    # per-bar diagnostics.
     logging.getLogger("hpms.elog").setLevel(logging.DEBUG)
 
     # ── Silence noisy third-party loggers ────────────────────────────────────
@@ -308,7 +169,8 @@ class DryRunAPI:
             return getattr(self._real, name)
 
         def fake(*args, **kwargs):
-            elog.log("SYSTEM_START", component="DryRunAPI", call=name)
+            elog.log("SYSTEM_START", component="DryRunAPI",
+                     call=name, note="simulated_no_exchange_hit")
             return {
                 "success": True,
                 "result":  {"order_id": "dry_" + str(int(time.time() * 1000)), "status": "simulated"},
@@ -353,24 +215,27 @@ class HPMSRunner:
         elog.log("SYSTEM_START", component="HPMSRunner",
                  mode=mode_str, network=net_str, symbol=config.DELTA_SYMBOL)
 
-        banner = (
-            "\n╔══════════════════════════════════════════════════════════╗\n"
-            "║        HPMS — Hamiltonian Phase-Space Micro-Scalping     ║\n"
-            "╠══════════════════════════════════════════════════════════╣\n"
-            "║  Mode    : " + f"{mode_str:<46}" + "║\n"
-            "║  Network : " + f"{net_str:<46}" + "║\n"
-            "║  Symbol  : " + f"{config.DELTA_SYMBOL:<46}" + "║\n"
-            "╚══════════════════════════════════════════════════════════╝"
-        )
-        logger.info(banner)
+        # ── Startup banner ────────────────────────────────────────────────────
+        logger.info("╔══════════════════════════════════════════════════════════╗")
+        logger.info("║   HPMS — Hamiltonian Phase-Space Micro-Scalping          ║")
+        logger.info("╠══════════════════════════════════════════════════════════╣")
+        logger.info("║   Mode    : " + mode_str.ljust(46) + "║")
+        logger.info("║   Network : " + net_str.ljust(46)  + "║")
+        logger.info("║   Symbol  : " + config.DELTA_SYMBOL.ljust(46) + "║")
+        logger.info("║   Leverage: " + (str(config.RISK_LEVERAGE) + "x").ljust(46) + "║")
+        logger.info("╚══════════════════════════════════════════════════════════╝")
 
         # ── 0. Validate critical config ───────────────────────────────────────
         if not config.TELEGRAM_BOT_TOKEN:
-            elog.error("SYSTEM_START", error="TELEGRAM_BOT_TOKEN missing", component="config")
-            logger.error("TELEGRAM NOT CONFIGURED: TELEGRAM_BOT_TOKEN is empty")
+            elog.error("SYSTEM_START", error="TELEGRAM_BOT_TOKEN missing",
+                       action="telegram_notifications_disabled", component="config")
+            logger.error("TELEGRAM NOT CONFIGURED — TELEGRAM_BOT_TOKEN is empty; "
+                         "all push notifications will be silently dropped")
         if not config.TELEGRAM_CHAT_ID:
-            elog.error("SYSTEM_START", error="TELEGRAM_CHAT_ID missing", component="config")
-            logger.error("TELEGRAM NOT CONFIGURED: TELEGRAM_CHAT_ID is empty")
+            elog.error("SYSTEM_START", error="TELEGRAM_CHAT_ID missing",
+                       action="telegram_notifications_disabled", component="config")
+            logger.error("TELEGRAM NOT CONFIGURED — TELEGRAM_CHAT_ID is empty; "
+                         "set this to your chat/group ID to receive alerts")
 
         # ── 1. Exchange API ───────────────────────────────────────────────────
         if self._testnet:
@@ -383,14 +248,18 @@ class HPMSRunner:
         )
         self._api = DryRunAPI(real_api) if self._dry_run else real_api
         elog.log("SYSTEM_START", component="DeltaAPI",
-                 testnet=config.DELTA_TESTNET, dry_run=self._dry_run)
+                 testnet=config.DELTA_TESTNET, dry_run=self._dry_run,
+                 note="orders_simulated" if self._dry_run else "live_orders_enabled")
 
         # ── 2. Data Manager ──────────────────────────────────────────────────
         self._data_mgr = DeltaDataManager()
         if not self._data_mgr.start():
-            elog.error("SYSTEM_START", error="DataManager failed to start")
+            elog.error("SYSTEM_START", error="DataManager failed to start",
+                       action="aborting_startup",
+                       note="check exchange connectivity and API credentials")
             return False
-        elog.log("SYSTEM_START", component="DeltaDataManager", status="ready")
+        elog.log("SYSTEM_START", component="DeltaDataManager", status="ready",
+                 note="websocket_streams_active")
 
         # ── 3. HPMS Engine ────────────────────────────────────────────────────
         self._engine = HPMSEngine(
@@ -476,9 +345,11 @@ class HPMSRunner:
         try:
             self._api.set_leverage(symbol=config.DELTA_SYMBOL, leverage=config.RISK_LEVERAGE)
             elog.log("RISK_PARAM_UPDATE", key="leverage",
-                     value=config.RISK_LEVERAGE, source="startup")
+                     value=config.RISK_LEVERAGE, source="startup",
+                     note="confirmed_on_exchange")
         except Exception as e:
-            elog.error("SYSTEM_START", error=str(e), stage="set_leverage")
+            elog.error("SYSTEM_START", error=str(e), stage="set_leverage",
+                       note="leverage_may_differ_from_config")
 
         # ── 9. Start Telegram ─────────────────────────────────────────────────
         self._telegram.start()
@@ -486,23 +357,36 @@ class HPMSRunner:
         # ── 10. Start strategy (sets STATE.trading_enabled = True) ────────────
         self._strategy.start()
 
-        elog.log("SYSTEM_START", component="HPMSRunner", status="fully_operational")
+        elog.log("SYSTEM_START", component="HPMSRunner", status="fully_operational",
+                 mode=mode_str, network=net_str)
 
-        # Startup notification — built with concatenation, no f-string ternaries
-        mode_icon = "🟡" if self._dry_run else ("🟠" if self._testnet else "🟢")
+        # ── Startup notification ───────────────────────────────────────────────
+        mode_icon    = "🧪" if self._dry_run else "⚡"
+        network_icon = "🔬" if self._testnet  else "🌐"
         self._telegram.send_message(
-            mode_icon + " *HPMS System Online*\n"
+            "🚀 *HPMS System Online*\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Mode:       `" + mode_str + "`\n"
-            "Network:    `" + net_str + "`\n"
-            "Symbol:     `" + config.DELTA_SYMBOL + "`\n"
-            "Leverage:   `" + str(config.RISK_LEVERAGE) + "x`\n"
-            "Integrator: `" + str(config.HPMS_INTEGRATOR) + "`\n\n"
-            "*Engine Config:*\n"
-            "  τ=" + str(config.HPMS_TAU) +
-            "  lookback=" + str(config.HPMS_LOOKBACK) +
-            "  horizon=" + str(config.HPMS_PREDICTION_HORIZON) + "\n\n"
-            "_Strategy is now active\\. Use /status for live state\\._"
+            + mode_icon    + " Mode:        `" + mode_str                          + "`\n"
+            + network_icon + " Network:     `" + net_str                           + "`\n"
+            "📊 Symbol:     `" + config.DELTA_SYMBOL                               + "`\n"
+            "🔢 Leverage:   `" + str(config.RISK_LEVERAGE)                         + "x`\n"
+            "⚙️ Integrator: `" + str(config.HPMS_INTEGRATOR)                       + "`\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🔬 *Engine Config*\n"
+            "  τ=`"         + str(config.HPMS_TAU)                 + "`  "
+            "lookback=`"    + str(config.HPMS_LOOKBACK)            + "`  "
+            "horizon=`"     + str(config.HPMS_PREDICTION_HORIZON)  + "`\n"
+            "  KDE bw=`"    + str(config.HPMS_KDE_BANDWIDTH)       + "`  "
+            "rebuild=`"     + str(config.HPMS_KDE_REBUILD_INTERVAL) + "` bars\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🛡 *Risk Limits*\n"
+            "  Max loss/day: `$" + str(config.RISK_MAX_DAILY_LOSS_USD) + "`  "
+            "Max trades: `"       + str(config.RISK_MAX_DAILY_TRADES)  + "`\n"
+            "  Cooldown: `"       + str(config.RISK_COOLDOWN_SECONDS)  + "s`  "
+            "Equity/trade: `"     + str(config.RISK_EQUITY_PCT_PER_TRADE) + "%`\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "_Warming up engine with REST candle history…_\n"
+            "_Use /status for the live dashboard or /thinking for decision detail._"
         )
 
         self._main_loop()
@@ -524,8 +408,10 @@ class HPMSRunner:
         try:
             candles = self._data_mgr.get_candles("1m", limit=300)
             if not candles:
-                logger.warning("[WARM_START] DataManager returned no candles — "
-                               "engine will wait for first live bar")
+                logger.warning(
+                    "[WARM_START] DataManager returned no candles — "
+                    "engine will start cold and wait for the first live bar to close"
+                )
                 return
 
             # ── Auto-detect timestamp key ─────────────────────────────────────
@@ -544,18 +430,21 @@ class HPMSRunner:
                 if v > ts_best:
                     ts_best = v
                     ts_key  = k
-            logger.info("[WARM_START] timestamp key detected: '%s' → %s", ts_key, ts_best)
+            logger.info(
+                "[WARM_START] Timestamp key auto-detected: field='%s'  value=%s",
+                ts_key, ts_best,
+            )
 
             # ── Rolling warm-up: feed candles one window at a time ────────────
             # The engine needs on_bar_close called with the FULL slice ending at
             # bar N, not just the last bar.  We call it once per bar in the
             # second half of the warmup so the H-EMA history fills up properly.
-            n       = len(candles)
+            n     = len(candles)
             # Process the last 30 bars as rolling windows so dH/dt history builds
-            start   = max(1, n - 30)
+            start = max(1, n - 30)
             logger.info(
-                "[WARM_START] replaying bars %d–%d of %d warmup candles "
-                "(ts_key='%s' last_price=%.1f)",
+                "[WARM_START] Replaying bars %d–%d of %d REST candles "
+                "(ts_key='%s'  last_close=%.1f) — building H-EMA history…",
                 start, n, n, ts_key, last_c.get("c", 0),
             )
             for i in range(start, n + 1):
@@ -563,14 +452,15 @@ class HPMSRunner:
 
             last_ts = float(last_c.get(ts_key, 0))
             logger.info(
-                "[WARM_START] done — engine primed over %d bar replay. "
-                "last_ts=%.0f  main loop now watching for ts > %.0f",
+                "[WARM_START] ✓ Engine primed — replayed %d bars.  "
+                "last_ts=%.0f  Main loop will fire on next ts > %.0f",
                 n - start + 1, last_ts, last_ts,
             )
             return
 
         except Exception as e:
-            logger.error("[WARM_START] exception: %s", e, exc_info=True)
+            logger.error("[WARM_START] Warmup failed — engine will start cold: %s",
+                         e, exc_info=True)
             return
 
     def _main_loop(self):
@@ -599,8 +489,9 @@ class HPMSRunner:
         # This is drift-free and works regardless of the exchange API format.
         last_bar_minute = int(time.time() / 60)
         logger.info(
-            "[LOOP] starting live poll — minute-boundary bar detection "
-            "(current minute=%d)", last_bar_minute,
+            "[LOOP] Live poll started — using wall-clock minute-boundary bar detection.  "
+            "current_minute=%d  (fires once per 60-second bar close)",
+            last_bar_minute,
         )
 
         while not self._shutdown.is_set():
@@ -611,8 +502,9 @@ class HPMSRunner:
                 if not candles:
                     if poll_n % 20 == 1:
                         logger.debug(
-                            "[LOOP] poll #%d — DataManager returned no candles "
-                            "(waiting for WS data)", poll_n
+                            "[LOOP] poll #%d — no candles from DataManager yet "
+                            "(WebSocket buffer is still filling up; this clears once the "
+                            "first live bar is received)", poll_n
                         )
                 else:
                     current_minute = int(time.time() / 60)
@@ -627,8 +519,8 @@ class HPMSRunner:
                         time.sleep(0.20)
                         candles = self._data_mgr.get_candles("1m", limit=300)
                         logger.info(
-                            "[LOOP] ▶ new 1m bar | minute=%d close=%.1f "
-                            "candles=%d poll=#%d",
+                            "[LOOP] ▶ Bar closed  minute=%d  close=%.1f  "
+                            "candles=%d  poll=#%d — invoking strategy…",
                             current_minute, last_close, len(candles), poll_n,
                         )
                         last_bar_minute = current_minute
@@ -637,8 +529,8 @@ class HPMSRunner:
                         if poll_n % 20 == 1:
                             secs_to_next = 60 - (time.time() % 60)
                             logger.debug(
-                                "[LOOP] poll #%d — waiting for bar close "
-                                "(%.0fs remaining) close=%.1f",
+                                "[LOOP] poll #%d — waiting for bar close  "
+                                "%.0fs remaining  last_close=%.1f",
                                 poll_n, secs_to_next, last_close,
                             )
 
@@ -649,44 +541,69 @@ class HPMSRunner:
                 self._shutdown.wait(0.5)
 
             except Exception as e:
-                logger.error("[LOOP] unhandled exception (will retry in 5s): %s",
-                             e, exc_info=True)
-                elog.error("SYSTEM_MAIN_LOOP", error=str(e), stage="main_loop")
+                logger.error(
+                    "[LOOP] Unhandled exception in main loop (will retry in 5s): %s",
+                    e, exc_info=True,
+                )
+                elog.error("SYSTEM_MAIN_LOOP", error=str(e), stage="main_loop",
+                           note="retrying_after_5s")
                 time.sleep(5)
 
     def _health_check(self):
         if not self._data_mgr.is_ready:
-            elog.warn("SYSTEM_HEALTH", issue="DataManager_not_ready")
+            elog.warn("SYSTEM_HEALTH", issue="DataManager_not_ready",
+                      action="restarting_websocket_streams",
+                      note="signal_processing_paused_until_streams_recover")
             self._telegram.send_message(
-                "⚠️ *Health Alert — Data Stream Down*\n\n"
-                "DataManager is not ready\\. Restarting WebSocket streams now\\.\n"
-                "_Check exchange connectivity if this persists\\._"
+                "⚠️ *Health Alert: Data Feed Down*\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "DataManager is reporting *not ready* — WebSocket streams appear "
+                "to have dropped.\n\n"
+                "🔄 *Action:* Automatically restarting streams now.\n"
+                "_No new signals will fire until the feed recovers._\n"
+                "_Use /market to verify data once reconnected._"
             )
             self._data_mgr.restart_streams()
 
         if not self._data_mgr.is_price_fresh(max_stale_seconds=120):
-            elog.warn("SYSTEM_HEALTH", issue="price_stale_gt_120s")
+            elog.warn("SYSTEM_HEALTH", issue="price_stale_gt_120s",
+                      action="alerting_operator",
+                      note="last_price_is_more_than_120s_old_no_new_signals_safe")
             self._telegram.send_message(
-                "⚠️ *Health Alert — Price Data Stale*\n\n"
-                "Last price tick is >120s old\\.\n"
-                "No new entries will be placed until feed recovers\\.\n"
-                "_Check exchange WebSocket connection\\._"
+                "⚠️ *Health Alert: Stale Price Data*\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "Last price tick is *>120 seconds old* — the exchange feed "
+                "may be degraded or the WebSocket has silently disconnected.\n\n"
+                "🔎 *What this means:* Signal generation is safe-halted until "
+                "fresh data arrives.  No trades will be entered.\n"
+                "_Check /market for data status, or /price for the last known price._"
             )
 
     def shutdown(self):
-        elog.log("SYSTEM_SHUTDOWN", component="HPMSRunner")
+        elog.log("SYSTEM_SHUTDOWN", component="HPMSRunner",
+                 note="graceful_shutdown_initiated")
         self._shutdown.set()
 
         if self._strategy:
             self._strategy.stop()
         if self._orders and self._orders.is_in_position:
-            elog.warn("SYSTEM_SHUTDOWN", note="closing_open_position")
+            elog.warn("SYSTEM_SHUTDOWN", note="closing_open_position_before_exit",
+                      action="market_close_at_current_price")
             price = self._data_mgr.get_last_price() if self._data_mgr else 0
             self._orders.close_position(reason="SHUTDOWN", current_price=price)
         if self._data_mgr:
             self._data_mgr.stop()
         if self._telegram:
-            self._telegram.send_message("*HPMS System Shutdown*")
+            net_str  = "TESTNET" if self._testnet  else "MAINNET"
+            self._telegram.send_message(
+                "🛑 *HPMS System Shutdown*\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "Mode:    `" + STATE.mode + "`\n"
+                "Network: `" + net_str    + "`\n\n"
+                "_All positions have been handled.  "
+                "System is now offline._\n"
+                "_Restart with `python main.py` when ready._"
+            )
             self._telegram.stop()
 
 
@@ -716,7 +633,8 @@ def main():
     except KeyboardInterrupt:
         runner.shutdown()
     except Exception as e:
-        elog.error("SYSTEM_SHUTDOWN", error=str(e), stage="fatal")
+        elog.error("SYSTEM_SHUTDOWN", error=str(e), stage="fatal",
+                   note="unhandled_exception_forced_exit")
         runner.shutdown()
         sys.exit(1)
 
