@@ -36,6 +36,28 @@ If all four passes fail, a WARNING is logged.  Trailing-stop amendment then
 uses a lazy-recovery path inside `update_sl_price` — every time an amendment
 is attempted and `_sl_order_id` is still None, the REST fallback is retried
 exactly once.  This guards against transient propagation delays at entry time.
+
+Trailing-stop SL amendment strategy (two-tier)
+───────────────────────────────────────────────
+Tier 1 — Atomic edit  PUT /v2/orders  ← ALWAYS TRIED FIRST
+  Amends the stop_price of the existing SL order in-place via the Delta
+  Exchange edit endpoint.  No unprotected window.  Works for bracket child
+  SL legs AND standalone stop_market_orders.
+
+  WHY THIS IS REQUIRED FOR BRACKET ORDERS:
+  Delta Exchange returns `bad_schema` when a new standalone stop_market_order
+  is POST-ed while a bracket take-profit leg is still open on the same position.
+  The correct operation is to edit the existing bracket SL in-place; the bracket
+  TP leg is unaffected.
+
+Tier 2 — Cancel + replace  POST /v2/orders  ← FALLBACK ONLY
+  Used when Tier 1 fails (order already filled, ID stale, etc.).
+  Carries a short unprotected window; always attempts restore on failure.
+
+Emergency protection:
+  If `_sl_order_id` cannot be recovered AND Tier 2 placement fails, an
+  emergency stop_market_order is placed at the last known `_sl_price`.
+  The position is NEVER intentionally left without stop-loss coverage.
 """
 
 from __future__ import annotations
@@ -205,12 +227,27 @@ class OrderManager:
 
         return (str(sl_id) if sl_id else None, str(tp_id) if tp_id else None)
 
-    def _find_open_stop_order(self, target_price: float) -> Optional[str]:
+    def _find_open_stop_order(
+        self,
+        target_price: float,
+        tolerance: float = 2.0,
+    ) -> Optional[str]:
         """
-        Query open orders and return the order ID of the stop order whose
-        `stop_price` is closest to `target_price`, subject to:
-          - |stop_price - target_price| ≤ 1.0 (1 price unit tolerance)
-          - reduce_only = True  (all bracket legs are reduce-only)
+        Query open orders and return the order ID of the stop-loss order whose
+        stop_price is closest to ``target_price``.
+
+        Delta Exchange bracket child orders arrive with:
+          - order_type  = "market_order"  (NOT "stop_market_order")
+          - stop_order_type = "stop_loss_order"
+          - reduce_only = True
+
+        Standalone stop-market orders placed by this bot have:
+          - order_type  = "stop_market_order"
+          - reduce_only = True
+
+        Both patterns are matched. ``tolerance`` is the maximum allowed
+        price-distance (default 2.0 ticks) to guard against matching the
+        wrong leg on a position with multiple conditional orders.
 
         Returns None if no qualifying order is found or on any API error.
         """
@@ -234,16 +271,37 @@ class OrderManager:
             for o in (orders if isinstance(orders, list) else []):
                 raw_o = o.get("_raw", o)
 
-                # Must be reduce-only (all bracket legs are)
-                if not raw_o.get("reduce_only"):
+                otype      = str(raw_o.get("order_type",      "")).lower()
+                stop_otype = str(raw_o.get("stop_order_type", "")).lower()
+                reduce     = raw_o.get("reduce_only", False)
+
+                # Pattern A: standalone stop-market (placed by update_sl_price)
+                is_standalone_stop = (
+                    otype in ("stop_market_order", "stop_market")
+                    and reduce
+                )
+                # Pattern B: Delta bracket child SL leg
+                is_bracket_sl = (
+                    stop_otype == "stop_loss_order"
+                    and reduce
+                )
+                # Pattern C: bracket SL with explicit stop_market type
+                is_bracket_sl_market = (
+                    otype in ("market_order", "market")
+                    and stop_otype == "stop_loss_order"
+                )
+
+                if not (is_standalone_stop or is_bracket_sl or is_bracket_sl_market):
                     continue
 
-                stop = _safe_float(raw_o.get("stop_price"), 0.0)
+                stop = _safe_float(
+                    raw_o.get("stop_price") or raw_o.get("trigger_price"), 0.0
+                )
                 if stop <= 0:
                     continue
 
                 dist = abs(stop - target_price)
-                if dist <= 1.0 and dist < best_dist:
+                if dist <= tolerance and dist < best_dist:
                     oid = raw_o.get("order_id") or raw_o.get("id")
                     if oid:
                         best_id   = str(oid)
@@ -533,79 +591,137 @@ class OrderManager:
         """
         Move the stop-loss to a new (improved) price.
 
-        Rules enforced:
-          - Long:  new SL must be > current SL (can only move UP, ratchet)
-          - Short: new SL must be < current SL (can only move DOWN, ratchet)
-          - Minimum move of TRAILING_MIN_STEP_TICKS is enforced by the caller
-            (compute_trailing_stop); this method enforces the direction rule
-            only and applies no additional minimum-step guard.
+        Amendment strategy (two-tier, most reliable first):
+        ─────────────────────────────────────────────────
+        Tier 1 — Atomic edit via PUT /v2/orders  ← PREFERRED
+          Amends the stop_price of the existing SL order in-place.
+          • No unprotected window (order stays live during amendment).
+          • Works for BOTH standalone stop_market_orders AND bracket
+            child SL legs — Delta Exchange accepts PUT /v2/orders for
+            both types.
+          • Avoids `bad_schema` that arises when POSTing a new standalone
+            stop_market_order while a bracket take-profit leg is still
+            active on the same position (Delta rejects the duplicate).
 
-        Lazy SL order ID recovery:
-          If `_sl_order_id` was not resolved at entry time (Delta bracket API
-          returned no leg IDs), a single REST recovery attempt is made here
-          before giving up. This handles propagation delays that would have
-          caused Pass 4 in _extract_bracket_leg_ids to run before the bracket
-          legs appeared in the open-orders feed.
+        Tier 2 — Cancel + replace  ← FALLBACK only
+          Used when Tier 1 fails (e.g. order already filled/cancelled).
+          Carries a small unprotected window between cancel and re-place,
+          but is the only option when the original order ID is gone.
 
-        Returns True if the SL was successfully amended on the exchange,
-        False on any failure (direction check, no ID, API error).
+        Emergency protection:
+          If _sl_order_id is None AND lazy REST recovery fails, an
+          emergency stop is placed at the original _sl_price before
+          returning False.  This ensures the position is never left
+          fully unprotected.
+
+        Ratchet rule:
+          SL can only ever improve:
+            Long  → new_sl must be strictly > current_sl
+            Short → new_sl must be strictly < current_sl
         """
         with self._lock:
             if not self._position_side:
                 return False
 
-            # ── Lazy SL order ID recovery ─────────────────────────────────────
-            # Runs at most once per trailing attempt when _sl_order_id is None.
-            # This covers the case where Pass 4 in _extract_bracket_leg_ids ran
-            # before the bracket leg appeared in the open-orders endpoint.
+            exit_side = "sell" if self._position_side == "long" else "buy"
+
+            # ── Step 1: Ensure we have a live SL order ID ──────────────────────
             if not self._sl_order_id:
                 logger.debug(
-                    "update_sl_price: _sl_order_id is None — attempting lazy "
-                    "REST recovery before trail update"
+                    "update_sl_price: _sl_order_id is None — lazy REST recovery"
                 )
                 recovered = self._find_open_stop_order(target_price=self._sl_price)
                 if recovered:
                     self._sl_order_id = recovered
                     logger.info(
-                        f"Lazy SL order ID recovery succeeded: "
-                        f"id={self._sl_order_id} @ {self._sl_price:.1f}"
+                        f"Lazy SL recovery succeeded: id={self._sl_order_id} "
+                        f"@ {self._sl_price:.1f}"
                     )
                 else:
-                    logger.warning(
-                        f"update_sl_price: SL order ID still unresolvable for "
-                        f"{self._position_side} position at entry "
-                        f"{self._entry_price:.1f} — trail update skipped. "
-                        f"Current SL ${self._sl_price:.1f} remains unchanged "
-                        f"on the exchange."
+                    # No stop on the exchange at all — place emergency protection
+                    logger.error(
+                        f"update_sl_price: SL ID unresolvable for "
+                        f"{self._position_side} @ entry {self._entry_price:.1f}. "
+                        f"Placing EMERGENCY stop @ {self._sl_price:.1f}."
                     )
+                    emerg = self._api.place_stop_market_order(
+                        symbol=self._symbol,
+                        side=exit_side,
+                        size=self._position_size,
+                        stop_price=round(self._sl_price, 1),
+                        reduce_only=True,
+                        product_id=self._product_id,
+                    )
+                    if emerg.get("success"):
+                        res = emerg.get("result", {})
+                        self._sl_order_id = str(
+                            res.get("order_id") or res.get("id") or ""
+                        ) or None
+                        logger.warning(
+                            f"EMERGENCY stop placed @ {self._sl_price:.1f} "
+                            f"id={self._sl_order_id} — position now protected."
+                        )
+                    else:
+                        logger.error(
+                            f"EMERGENCY stop FAILED: {emerg.get('error')} — "
+                            f"POSITION UNPROTECTED. Manual intervention required."
+                        )
+                    # Trail update cannot proceed without a confirmed new ID
                     return False
 
             new_sl_price = round(new_sl_price, 1)
 
-            # ── Direction ratchet ─────────────────────────────────────────────
-            # SL can only ever improve (move toward breakeven / profit).
-            if self._position_side == "long" and new_sl_price <= self._sl_price:
+            # ── Step 2: Direction ratchet ──────────────────────────────────────
+            if self._position_side == "long"  and new_sl_price <= self._sl_price:
                 return False
             if self._position_side == "short" and new_sl_price >= self._sl_price:
                 return False
 
             old_sl    = self._sl_price
             old_sl_id = self._sl_order_id
-            exit_side = "sell" if self._position_side == "long" else "buy"
 
+            # ── Tier 1: Atomic edit (PUT /v2/orders) ───────────────────────────
+            # Preferred: amends stop_price in-place with no unprotected window.
+            # Works for bracket child SL legs AND standalone stop orders.
+            # Delta Exchange docs: id + product_id + stop_price in PUT body.
             try:
-                # Cancel the existing SL order
+                edit_resp = self._api.edit_order(
+                    order_id=old_sl_id,
+                    stop_price=new_sl_price,
+                    product_id=self._product_id,
+                )
+                if edit_resp.get("success"):
+                    raw     = edit_resp.get("result", {})
+                    new_id  = str(raw.get("order_id") or old_sl_id)
+                    self._sl_order_id = new_id
+                    self._sl_price    = new_sl_price
+                    logger.info(
+                        f"SL AMENDED ✓ (atomic): {old_sl:.1f} → {new_sl_price:.1f} "
+                        f"({self._position_side}) id={self._sl_order_id}"
+                    )
+                    return True
+
+                edit_err = edit_resp.get("error", "unknown")
+                logger.warning(
+                    f"edit_order failed ({edit_err}) — "
+                    f"falling back to cancel+replace for SL trail"
+                )
+
+            except Exception as e:
+                logger.warning(
+                    f"edit_order exception ({e}) — "
+                    f"falling back to cancel+replace for SL trail"
+                )
+
+            # ── Tier 2: Cancel + replace (fallback) ────────────────────────────
+            try:
                 cancel_resp = self._api.cancel_order(old_sl_id)
                 if not cancel_resp.get("success"):
-                    # Log but still attempt to place the new SL — the old one
-                    # may have already been filled or auto-cancelled.
                     logger.warning(
-                        f"SL cancel returned non-success for id={old_sl_id}: "
-                        f"{cancel_resp.get('error')} — "
-                        f"proceeding with new SL placement"
+                        f"SL cancel non-success id={old_sl_id}: "
+                        f"{cancel_resp.get('error')} — proceeding with new placement"
                     )
 
-                # Place the new SL at the amended price
                 sl_resp = self._api.place_stop_market_order(
                     symbol=self._symbol,
                     side=exit_side,
@@ -616,22 +732,20 @@ class OrderManager:
                 )
 
                 if sl_resp.get("success"):
-                    res = sl_resp.get("result", {})
-                    new_id = str(
-                        res.get("order_id") or res.get("id") or ""
-                    ) or None
+                    res    = sl_resp.get("result", {})
+                    new_id = str(res.get("order_id") or res.get("id") or "") or None
                     self._sl_order_id = new_id
                     self._sl_price    = new_sl_price
                     logger.info(
-                        f"SL TRAILED: {old_sl:.1f} → {new_sl_price:.1f} "
-                        f"({self._position_side}) new_id={self._sl_order_id}"
+                        f"SL TRAILED ✓ (cancel+replace): {old_sl:.1f} → {new_sl_price:.1f} "
+                        f"({self._position_side}) id={self._sl_order_id}"
                     )
                     return True
 
-                # ── New SL placement failed: restore the old SL ───────────────
+                # New placement failed — attempt to restore old SL
                 logger.error(
-                    f"SL trail failed (new order): {sl_resp.get('error')} "
-                    f"— attempting to restore old SL @ {old_sl:.1f}"
+                    f"SL new order failed: {sl_resp.get('error')} "
+                    f"— restoring @ {old_sl:.1f}"
                 )
                 restore = self._api.place_stop_market_order(
                     symbol=self._symbol,
@@ -647,21 +761,20 @@ class OrderManager:
                         res.get("order_id") or res.get("id") or ""
                     ) or None
                     self._sl_price = old_sl
-                    logger.info(f"SL restored @ {old_sl:.1f} id={self._sl_order_id}")
+                    logger.info(
+                        f"SL restored @ {old_sl:.1f} id={self._sl_order_id}"
+                    )
                 else:
-                    # Worst case: no active SL on the exchange.
-                    # Clear the stale ID so lazy recovery fires on the next bar.
                     self._sl_order_id = None
                     logger.error(
                         f"SL RESTORE FAILED: {restore.get('error')} — "
-                        f"POSITION UNPROTECTED. SL ID cleared; lazy recovery "
-                        f"will be attempted on the next bar."
+                        f"POSITION UNPROTECTED. Will retry emergency stop next bar."
                     )
                 return False
 
             except Exception as e:
                 logger.error(f"SL trail exception: {e}", exc_info=True)
-                # Attempt restore on exception
+                # Last-resort restore attempt
                 try:
                     restore = self._api.place_stop_market_order(
                         symbol=self._symbol,
@@ -677,11 +790,21 @@ class OrderManager:
                             res.get("order_id") or res.get("id") or ""
                         ) or None
                         self._sl_price = old_sl
+                        logger.info(
+                            f"SL restored (exception path) @ {old_sl:.1f} "
+                            f"id={self._sl_order_id}"
+                        )
+                    else:
+                        self._sl_order_id = None
+                        logger.error(
+                            f"SL RESTORE FAILED (exception path): "
+                            f"{restore.get('error')} — POSITION UNPROTECTED."
+                        )
                 except Exception as restore_err:
                     self._sl_order_id = None
                     logger.error(
-                        f"SL RESTORE ALSO FAILED: {restore_err} — "
-                        f"POSITION UNPROTECTED. SL ID cleared."
+                        f"SL RESTORE EXCEPTION: {restore_err} — "
+                        f"POSITION UNPROTECTED."
                     )
                 return False
 
