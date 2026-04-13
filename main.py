@@ -238,11 +238,18 @@ class HPMSRunner:
             H_percentile=config.SIGNAL_H_PERCENTILE,
             min_momentum=config.SIGNAL_MIN_MOMENTUM,
             acceleration_check=config.SIGNAL_ACCELERATION_CHECK,
-            tp_pct=config.TRADE_TP_PCT,
-            sl_pct=config.TRADE_SL_PCT,
             H_ema_span=config.HPMS_H_EMA_SPAN,
             kde_rebuild_interval=config.HPMS_KDE_REBUILD_INTERVAL,
             trajectory_log_depth=config.HPMS_TRAJECTORY_LOG_DEPTH,
+            fib_tp_cap_pct=config.FIB_TP_CAP_PCT,
+            fib_sl_cap_pct=config.FIB_SL_CAP_PCT,
+            fib_sl_atr_buffer=config.FIB_SL_ATR_BUFFER_MULT,
+            fib_min_rr=config.FIB_MIN_RR,
+            fib_swing_min_order=config.FIB_SWING_MIN_ORDER,
+            fib_swing_max_order=config.FIB_SWING_MAX_ORDER,
+            fib_swing_atr_noise=config.FIB_SWING_ATR_NOISE,
+            fib_max_swing_pairs=config.FIB_MAX_SWING_PAIRS,
+            fib_confluence_tol=config.FIB_CONFLUENCE_ATR_TOL,
         )
 
         # ── 4. Risk Manager ──────────────────────────────────────────────────

@@ -25,6 +25,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from scipy.stats import gaussian_kde
 
+from fibonacci import compute_fib_tp_sl, compute_fib_trailing_stop, FibTPSL, FibTrailResult
 from logger_core import elog
 
 logger = logging.getLogger(__name__)
@@ -252,11 +253,18 @@ class HPMSEngine:
         H_percentile:         float = 99.0,
         min_momentum:         float = 0.00005,
         acceleration_check:   bool  = True,
-        tp_pct:               float = 0.0035,
-        sl_pct:               float = 0.0018,
         H_ema_span:           int   = 5,
         kde_rebuild_interval: int   = 3,
         trajectory_log_depth: int   = 20,
+        fib_tp_cap_pct:       float = 0.008,
+        fib_sl_cap_pct:       float = 0.004,
+        fib_sl_atr_buffer:    float = 0.3,
+        fib_min_rr:           float = 2.0,
+        fib_swing_min_order:  int   = 3,
+        fib_swing_max_order:  int   = 10,
+        fib_swing_atr_noise:  float = 0.5,
+        fib_max_swing_pairs:  int   = 6,
+        fib_confluence_tol:   float = 0.3,
     ):
         self._tau                  = tau
         self._lookback             = lookback
@@ -270,15 +278,27 @@ class HPMSEngine:
         self._H_percentile         = H_percentile
         self._min_momentum         = min_momentum
         self._acceleration_check   = acceleration_check  # always True now
-        self._tp_pct               = tp_pct
-        self._sl_pct               = sl_pct
         self._H_ema_span           = H_ema_span
         self._kde_rebuild_interval = kde_rebuild_interval
         self._trajectory_log_depth = trajectory_log_depth
         self._bars_since_kde_build = 0
 
+        # Fibonacci TP/SL parameters
+        self._fib_tp_cap_pct       = fib_tp_cap_pct
+        self._fib_sl_cap_pct       = fib_sl_cap_pct
+        self._fib_sl_atr_buffer    = fib_sl_atr_buffer
+        self._fib_min_rr           = fib_min_rr
+        self._fib_swing_min_order  = fib_swing_min_order
+        self._fib_swing_max_order  = fib_swing_max_order
+        self._fib_swing_atr_noise  = fib_swing_atr_noise
+        self._fib_max_swing_pairs  = fib_max_swing_pairs
+        self._fib_confluence_tol   = fib_confluence_tol
+
         # Fee rate for R:R computation (Delta taker fee ≈ 0.053%)
         self._fee_rate = 0.00053
+
+        # Trailing stop high watermark (reset on each new trade by strategy)
+        self._trail_high_watermark: float = 0.0
 
         self._landscape  = PotentialLandscape(bandwidth=kde_bandwidth, grid_points=kde_grid_points)
         self._integrator = _INTEGRATORS.get(integrator, _rk4_step)
@@ -287,7 +307,9 @@ class HPMSEngine:
         elog.log("SYSTEM_START", component="HPMSEngine",
                  tau=tau, lookback=lookback, horizon=prediction_horizon,
                  integrator=integrator, mass=mass,
-                 delta_q_threshold=delta_q_threshold, dH_dt_max=dH_dt_max)
+                 delta_q_threshold=delta_q_threshold, dH_dt_max=dH_dt_max,
+                 fib_tp_cap=fib_tp_cap_pct, fib_sl_cap=fib_sl_cap_pct,
+                 fib_min_rr=fib_min_rr)
 
     # ─── CONFIGURATION HOT-RELOAD ─────────────────────────────────────────────
 
@@ -304,12 +326,19 @@ class HPMSEngine:
             "H_percentile":         ("_H_percentile",      float),
             "min_momentum":         ("_min_momentum",      float),
             "acceleration_check":   ("_acceleration_check", bool),
-            "tp_pct":               ("_tp_pct",            float),
-            "sl_pct":               ("_sl_pct",            float),
             "integrator":           ("_integrator_name",   str),
             "H_ema_span":           ("_H_ema_span",        int),
             "kde_rebuild_interval": ("_kde_rebuild_interval", int),
             "fee_rate":             ("_fee_rate",            float),
+            "fib_tp_cap_pct":       ("_fib_tp_cap_pct",    float),
+            "fib_sl_cap_pct":       ("_fib_sl_cap_pct",    float),
+            "fib_sl_atr_buffer":    ("_fib_sl_atr_buffer", float),
+            "fib_min_rr":           ("_fib_min_rr",        float),
+            "fib_swing_min_order":  ("_fib_swing_min_order", int),
+            "fib_swing_max_order":  ("_fib_swing_max_order", int),
+            "fib_swing_atr_noise":  ("_fib_swing_atr_noise", float),
+            "fib_max_swing_pairs":  ("_fib_max_swing_pairs", int),
+            "fib_confluence_tol":   ("_fib_confluence_tol", float),
         }
         if key not in _MAP:
             return False
@@ -339,11 +368,18 @@ class HPMSEngine:
             "H_percentile":         self._H_percentile,
             "min_momentum":         self._min_momentum,
             "acceleration_check":   self._acceleration_check,
-            "tp_pct":               self._tp_pct,
-            "sl_pct":               self._sl_pct,
             "H_ema_span":           self._H_ema_span,
             "kde_rebuild_interval": self._kde_rebuild_interval,
             "fee_rate":             self._fee_rate,
+            "fib_tp_cap_pct":       self._fib_tp_cap_pct,
+            "fib_sl_cap_pct":       self._fib_sl_cap_pct,
+            "fib_sl_atr_buffer":    self._fib_sl_atr_buffer,
+            "fib_min_rr":           self._fib_min_rr,
+            "fib_swing_min_order":  self._fib_swing_min_order,
+            "fib_swing_max_order":  self._fib_swing_max_order,
+            "fib_swing_atr_noise":  self._fib_swing_atr_noise,
+            "fib_max_swing_pairs":  self._fib_max_swing_pairs,
+            "fib_confluence_tol":   self._fib_confluence_tol,
         }
 
     # ─── PHASE SPACE RECONSTRUCTION ───────────────────────────────────────────
@@ -862,95 +898,59 @@ class HPMSEngine:
                      traj_factor=round(traj_factor, 3),
                      regime=regime.name)
 
-        # ── Step 8: TP/SL ─────────────────────────────────────────────────────
+        # ── Step 8: Fibonacci TP/SL ───────────────────────────────────────────
         #
-        # Architecture: two-layer exit system
-        # ─────────────────────────────────────
-        # Layer 1 — TRAILING STOP (primary profit exit)
-        #   The trailing stop system rides the move and locks in profit.
-        #   It activates once price has traveled 40% of the TP distance
-        #   favorably, then ratchets the SL upward (LONG) or downward
-        #   (SHORT) as price extends, using ATR-calibrated trail distances.
-        #   This is the mechanism by which the system actually makes money.
+        # Architecture: structural Fibonacci levels from multi-scale swing analysis
+        # ─────────────────────────────────────────────────────────────────────────
+        # SL is placed at a Fibonacci retracement level (0.618, 0.786, etc.)
+        # derived from detected swing highs/lows, with an ATR buffer to sit
+        # just beyond the structural level.
         #
-        # Layer 2 — EXCHANGE TP ORDER (backstop)
-        #   The bracket TP sits wide at the config maximum.  It exists as a
-        #   safety net in case the trailing stop loop misses a bar (network
-        #   outage, process restart).  It is NOT the primary target.
+        # TP is placed at a Fibonacci extension level (1.272 or 1.618 projection
+        # of the originating swing), capped by fib_tp_cap_pct.
         #
-        # Why the predicted move must NOT set the TP
-        # ────────────────────────────────────────────
-        # When TP = predicted_move × 0.85 the TP distance is small (e.g. $65
-        # for a 0.09% predicted move on BTC).  The trailing stop fee floor
-        # (entry ± fee_breakeven_with_margin) is computed in price-space:
-        #   fee_floor = total_fees / (size × contract_value) × safety_margin
-        # For small positions (4–5 contracts, 0.001 BTC/c):
-        #   fee_floor ≈ $75–85 price points
-        # If TP < fee_floor the SL floor exceeds the TP — the trailing stop
-        # tries to place the SL ABOVE the TP on every bar, producing the
-        # nonsensical log:  new_sl=$70,986  TP=$70,968.
-        # The position exits at TP for ~$0.28 gross, ~-$0.02 net (loss).
+        # Trailing uses Fibonacci retracement of the developing move (entry →
+        # high watermark), tightening through the golden ratio schedule as
+        # TP progress increases. Breakeven floor ensures net-zero after fees.
         #
-        # Fix: TP = config max (wide backstop).
-        # With TP = $390 the fee floor ($83) sits at 21% of TP, giving the
-        # trailing stop 79% of the TP range to operate freely.
-        # At +$156 favorable (40% activation): trailing SL moves to +$83
-        #   → guaranteed net-positive if stopped out.
-        # At +$250: SL trails to +$146 above entry → net ~$0.28.
-        # At +$300: LOCK phase, SL to +$248 → net ~$0.69.
-        # The trailing stop — not the TP bracket — captures the profit.
-        #
-        # SL (unchanged): ATR × 1.3 — per-bar noise buffer at entry.
-        #
-        if signal_type != SignalType.FLAT and len(closes_arr) >= 15:
-            recent     = closes_arr[-15:]
-            bar_ranges = np.abs(np.diff(recent))
-            atr_1bar   = (float(np.mean(bar_ranges))
-                          if len(bar_ranges) > 0
-                          else current_price * 0.0005)
+        if signal_type != SignalType.FLAT and len(closes_arr) >= 30:
+            side = "long" if signal_type == SignalType.LONG else "short"
 
-            fee_rt_price          = current_price * self._fee_rate * 2
-            predicted_dollar_move = abs(predicted_pct_move) * current_price
+            fib_result = compute_fib_tp_sl(
+                side=side,
+                current_price=current_price,
+                closes=closes_arr,
+                volumes=volumes_arr,
+                fee_rate=self._fee_rate,
+                min_rr=self._fib_min_rr,
+                sl_atr_buffer_mult=self._fib_sl_atr_buffer,
+                tp_cap_pct=self._fib_tp_cap_pct,
+                sl_cap_pct=self._fib_sl_cap_pct,
+                swing_min_order=self._fib_swing_min_order,
+                swing_max_order=self._fib_swing_max_order,
+                swing_atr_noise=self._fib_swing_atr_noise,
+                max_swing_pairs=self._fib_max_swing_pairs,
+                confluence_tolerance_atr=self._fib_confluence_tol,
+            )
 
-            # ── Take-Profit: wide backstop at config maximum ───────────────
-            # Floor: 3 × ATR ensures TP is never trivially close to entry.
-            # This floor is almost never binding — the config max (~$390 on
-            # BTC) is almost always larger than 3 × ATR (~$105).
-            tp_distance = current_price * self._tp_pct
-            tp_distance = max(tp_distance, atr_1bar * 3.0)
+            tp_price    = fib_result.tp_price
+            sl_price    = fib_result.sl_price
+            tp_distance = fib_result.tp_distance
+            sl_distance = fib_result.sl_distance
+            gross_rr    = fib_result.gross_rr
 
-            # ── Stop-Loss: per-bar ATR buffer ─────────────────────────────
-            # 1.3 × ATR — outside intra-bar noise, inside holding-period risk.
-            # Capped by config sl_pct to prevent oversized stops in high-vol.
-            sl_distance = atr_1bar * 1.3
-            sl_distance = min(sl_distance, current_price * self._sl_pct)
-            sl_distance = max(sl_distance, current_price * 0.0001)
+            fee_rt_price  = current_price * self._fee_rate * 2
+            net_reward    = tp_distance - fee_rt_price
+            net_risk      = sl_distance + fee_rt_price
+            final_net_rr  = net_reward / net_risk if net_risk > 0 else 0.0
 
-            # ── Gross R:R ─────────────────────────────────────────────────
-            # With wide TP this is structurally high (typically 6–10×).
-            # Gate retained as a safety net for pathological edge cases.
-            gross_rr = tp_distance / sl_distance if sl_distance > 0 else 0.0
-
-            # ── Net R:R (informational) ───────────────────────────────────
-            net_reward   = tp_distance - fee_rt_price
-            net_risk     = sl_distance + fee_rt_price
-            final_net_rr = net_reward / net_risk if net_risk > 0 else 0.0
-
-            # ── Fee floor headroom check ──────────────────────────────────
-            # The trailing stop uses a fee breakeven floor in price-space.
-            # For that floor to be meaningful (not exceed TP), we need:
-            #   fee_rt_price × 1.1 < tp_distance
-            # Log a warning if not — should not happen with wide TP.
-            fee_floor_est = fee_rt_price * 1.1
-            fee_headroom  = (tp_distance - fee_floor_est) / tp_distance
-
-            _MIN_GROSS_RR = 1.5
-
-            if gross_rr < _MIN_GROSS_RR:
+            if gross_rr < self._fib_min_rr:
                 signal_type = SignalType.FLAT
                 reason = (
-                    f"FLAT: gross_rr={gross_rr:.2f}<{_MIN_GROSS_RR} "
-                    f"tp=${tp_distance:.0f} sl=${sl_distance:.0f} atr=${atr_1bar:.1f}"
+                    f"FLAT: fib_rr={gross_rr:.2f}<{self._fib_min_rr} "
+                    f"tp=${tp_distance:.0f} sl=${sl_distance:.0f} "
+                    f"tp_fib={fib_result.tp_fib_ratio:.3f} "
+                    f"sl_fib={fib_result.sl_fib_ratio:.3f}"
                 )
                 tp_price = 0.0
                 sl_price = 0.0
@@ -958,39 +958,39 @@ class HPMSEngine:
                          gross_rr=round(gross_rr, 3),
                          tp_dist=round(tp_distance, 1),
                          sl_dist=round(sl_distance, 1),
-                         min_gross_rr=_MIN_GROSS_RR)
-
+                         min_rr=self._fib_min_rr)
             else:
-                if signal_type == SignalType.LONG:
-                    tp_price = current_price + tp_distance
-                    sl_price = current_price - sl_distance
-                else:
-                    tp_price = current_price - tp_distance
-                    sl_price = current_price + sl_distance
-
                 elog.log(
-                    "ENGINE_RR",
+                    "ENGINE_FIB_RR",
+                    tp_price=round(tp_price, 1),
+                    sl_price=round(sl_price, 1),
                     tp_dist=round(tp_distance, 1),
                     sl_dist=round(sl_distance, 1),
                     gross_rr=round(gross_rr, 2),
                     net_rr=round(final_net_rr, 2),
+                    tp_fib_ratio=fib_result.tp_fib_ratio,
+                    sl_fib_ratio=fib_result.sl_fib_ratio,
+                    tp_confluence=fib_result.tp_confluence,
+                    sl_confluence=fib_result.sl_confluence,
                     fee_rt_price=round(fee_rt_price, 1),
-                    predicted_move=round(predicted_dollar_move, 1),
-                    atr_1bar=round(atr_1bar, 1),
-                    fee_headroom_pct=round(fee_headroom * 100.0, 1),
+                    predicted_move=round(abs(predicted_pct_move) * current_price, 1),
+                    levels_above=len(fib_result.levels_above),
+                    levels_below=len(fib_result.levels_below),
                     be_wr_gross=round(1.0 / (1.0 + gross_rr) * 100.0, 1),
                     be_wr_net=(round(1.0 / (1.0 + final_net_rr) * 100.0, 1)
                                if final_net_rr > 0 else 100.0),
                 )
 
         elif signal_type != SignalType.FLAT:
-            # Insufficient candle history — use config percentages as fallback.
+            # Insufficient data for swing detection — cap-based placement
             if signal_type == SignalType.LONG:
-                tp_price = current_price * (1.0 + self._tp_pct)
-                sl_price = current_price * (1.0 - self._sl_pct)
+                tp_price = current_price * (1.0 + self._fib_tp_cap_pct)
+                sl_price = current_price * (1.0 - self._fib_sl_cap_pct)
             else:
-                tp_price = current_price * (1.0 - self._tp_pct)
-                sl_price = current_price * (1.0 + self._sl_pct)
+                tp_price = current_price * (1.0 - self._fib_tp_cap_pct)
+                sl_price = current_price * (1.0 + self._fib_sl_cap_pct)
+            elog.log("ENGINE_FIB_RR", note="insufficient_data_cap_based",
+                     tp_price=round(tp_price, 1), sl_price=round(sl_price, 1))
         else:
             tp_price = 0.0
             sl_price = 0.0
@@ -1122,19 +1122,7 @@ class HPMSEngine:
         threshold = float(np.mean(arr) + multiplier * np.std(arr))
         return max(threshold, 0.10)
 
-    def get_dynamic_max_hold(self, tp_distance: float, current_price: float) -> int:
-        """Legacy ATR-based max hold estimate (retained for fallback use)."""
-        if not self._state.close_history or len(self._state.close_history) < 5:
-            return 8
-        closes = np.array(self._state.close_history[-20:])
-        atr_per_bar = float(np.mean(np.abs(np.diff(closes))))
-        if atr_per_bar <= 0:
-            return 8
-        bars_to_tp = tp_distance / atr_per_bar
-        max_hold = int(math.ceil(bars_to_tp * 1.5))
-        return max(3, min(max_hold, 30))
-
-    # ─── TRAILING STOP COMPUTATION ──────────────────────────────────────────
+    # ─── FIBONACCI TRAILING STOP ────────────────────────────────────────────
 
     def compute_trailing_stop(
         self,
@@ -1150,223 +1138,89 @@ class HPMSEngine:
         config,
     ) -> dict:
         """
-        Compute the new trailing stop price.
+        Compute Fibonacci-level trailing stop with breakeven floor.
 
-        Design principles:
-          1. SL can ONLY improve (ratchet) — never moves backward.
-          2. Breakeven is computed from ACTUAL exchange fees (entry + estimated
-             exit), so the breakeven SL guarantees zero loss after all fees.
-          3. Activation requires the trade to move past BOTH the fee breakeven
-             point AND a % of the TP distance — whichever is larger.
-          4. Trail distance is wide enough (3× ATR) to survive normal
-             1-minute pullbacks.
-          5. A warmup period prevents SL modification in the first N bars.
+        Delegates to fibonacci.compute_fib_trailing_stop(). The trailing SL
+        is placed at the Fibonacci retracement of the developing move (entry →
+        high watermark), with the specific ratio tightening as tp_progress
+        increases through the golden ratio schedule:
 
-        Fee math (example):
-          entry_fee_usd = $0.039 (actual from Delta API)
-          exit_fee_est  = $0.039 (same rate)
-          total_fees    = $0.078
-          For 1 contract (0.001 BTC): need $78 price move to cover fees
-          breakeven SL  = entry ± ($78 × 1.1 safety margin)
+          20% progress → 0.786 retracement (wide, keep 21% of move)
+          40% progress → 0.618 retracement (golden ratio, keep 38%)
+          60% progress → 0.500 retracement (half, keep 50%)
+          75% progress → 0.382 retracement (tight, keep 62%)
+          90% progress → 0.236 retracement (lock, keep 76%)
 
-        Returns:
+        The breakeven floor (entry + round_trip_fees × margin) ensures the
+        SL never sits where a fill would result in a net loss after fees.
+
+        Returns dict matching the interface expected by strategy.py:
             {
                 "new_sl":            float | None,
                 "phase":             str,
-                "atr":               float,
-                "trail_dist":        float,
                 "tp_progress":       float,
-                "fee_breakeven_move": float,   # price move needed to cover fees
+                "fee_breakeven_move": float,
+                "fib_ratio":         float,
+                "high_watermark":    float,
             }
         """
-        is_long = side == "long"
+        warmup = getattr(config, "TRAILING_WARMUP_BARS", 2)
+        be_activation = getattr(config, "TRAILING_BE_ACTIVATION_PCT", 0.20)
+        be_fee_margin = getattr(config, "TRAILING_BE_FEE_MARGIN", 1.1)
+        min_step = getattr(config, "TRAILING_MIN_STEP_TICKS", 0.5)
+        abs_max = getattr(config, "TRAILING_ABSOLUTE_MAX_BARS", 120)
+
+        trail_result = compute_fib_trailing_stop(
+            side=side,
+            entry_price=entry_price,
+            current_price=current_price,
+            current_sl=current_sl,
+            tp_price=tp_price,
+            entry_fee_usd=entry_fee_usd,
+            position_size=position_size,
+            contract_value=contract_value,
+            bars_held=bars_held,
+            warmup_bars=warmup,
+            be_activation_pct=be_activation,
+            be_fee_margin=be_fee_margin,
+            min_step_ticks=min_step,
+            absolute_max_bars=abs_max,
+            high_watermark=self._trail_high_watermark,
+        )
+
+        # Persist high watermark for next bar
+        self._trail_high_watermark = trail_result.high_watermark
+
         result = {
-            "new_sl": None,
-            "phase": "INITIAL",
-            "atr": 0.0,
-            "trail_dist": 0.0,
-            "tp_progress": 0.0,
-            "fee_breakeven_move": 0.0,
+            "new_sl":             trail_result.new_sl,
+            "phase":              trail_result.phase,
+            "tp_progress":        trail_result.tp_progress,
+            "fee_breakeven_move": trail_result.fee_breakeven_move,
+            "fib_ratio":          trail_result.current_fib_ratio,
+            "high_watermark":     trail_result.high_watermark,
         }
 
-        # ── Warmup: don't touch SL for first N bars ─────────────────────
-        warmup = getattr(config, "TRAILING_WARMUP_BARS", 2)
-        if bars_held < warmup:
-            result["phase"] = "WARMUP"
-            return result
-
-        # ── Compute ATR ──────────────────────────────────────────────────
-        closes = list(self._state.close_history) if self._state.close_history else []
-        atr_lookback = getattr(config, "TRAILING_ATR_LOOKBACK", 14)
-        if len(closes) < 5:
-            return result
-
-        closes_arr = np.array(closes[-max(atr_lookback + 1, 20):])
-        if len(closes_arr) < 3:
-            return result
-
-        atr = float(np.mean(np.abs(np.diff(closes_arr[-atr_lookback:]))))
-        if atr <= 0:
-            atr = abs(tp_price - entry_price) * 0.05
-        result["atr"] = round(atr, 2)
-
-        # ── Fee breakeven computation (from actual exchange fees) ────────
-        # entry_fee_usd: exact fee paid on entry (from Delta API paid_commission)
-        # exit_fee_est:  estimate exit fee at same rate
-        # total: what the trade must earn in gross PnL to break even
-        exit_fee_est = entry_fee_usd  # same fee rate on exit
-        total_round_trip_fees = entry_fee_usd + exit_fee_est
-
-        # Convert fee $ to price-move needed:
-        #   gross_pnl = price_move × position_size × contract_value
-        #   price_move = total_fees / (position_size × contract_value)
-        if position_size > 0 and contract_value > 0:
-            fee_breakeven_move = total_round_trip_fees / (position_size * contract_value)
-        else:
-            fee_breakeven_move = atr * 2.0  # conservative fallback
-
-        # Safety margin on top of fees (covers slippage on SL trigger)
-        fee_margin = getattr(config, "TRAILING_BE_FEE_MARGIN", 1.1)
-        fee_breakeven_with_margin = fee_breakeven_move * fee_margin
-        result["fee_breakeven_move"] = round(fee_breakeven_move, 2)
-
-        # ── TP distance & progress ───────────────────────────────────────
-        entry_to_tp = abs(tp_price - entry_price)
-        if entry_to_tp <= 0:
-            return result
-
-        if is_long:
-            favorable_move = current_price - entry_price
-        else:
-            favorable_move = entry_price - current_price
-
-        tp_progress = favorable_move / entry_to_tp  # <0 = losing, 0 = flat, 1 = at TP
-        result["tp_progress"] = round(tp_progress, 4)
-
-        # ── Activation threshold ─────────────────────────────────────────
-        # Must exceed BOTH:
-        #   a) configured % of TP distance (default 40%)
-        #   b) actual fee breakeven + margin
-        # This ensures we never move to "breakeven" at a price that would
-        # still result in a net loss after fees.
-        # ── Activation threshold ─────────────────────────────────────────────
-        #
-        # Separation of concerns
-        # ───────────────────────
-        # Two independent questions are answered here:
-        #
-        # 1. "Has the trade moved far enough to begin trailing?"
-        #    → activation_move = TP_distance × TRAILING_BE_ACTIVATION_PCT
-        #    → This is a TP-progress trigger, position-size invariant, and
-        #      proportional to the trade's expected earning potential.
-        #
-        # 2. "What is the worst SL price we will accept once trailing starts?"
-        #    → floor_sl = entry ± fee_breakeven_with_margin
-        #    → The SL can never be placed where a fill would leave a net loss
-        #      after paying both legs of the exchange fee.
-        #
-        # Previously, (1) and (2) were conflated via:
-        #   activation_move = max(TP × 40%, fee_breakeven)
-        # In the observed fee environment (fee_breakeven ≈ $76, TP ≈ $88) the
-        # fee floor always dominated, requiring >94% of the TP to be earned
-        # before trailing began — making the INITIAL phase effectively permanent.
-        #
-        # The fix: activation uses only TP percentage; the fee floor is applied
-        # exclusively as a constraint on the candidate SL, never on activation.
-        #
-        be_activation_pct = getattr(config, "TRAILING_BE_ACTIVATION_PCT", 0.40)
-        activation_move   = entry_to_tp * be_activation_pct
-
-        lock_tp_pct   = getattr(config, "TRAILING_LOCK_TP_PCT",         0.75)
-        atr_mult      = getattr(config, "TRAILING_ATR_MULTIPLIER",       3.0)
-        lock_atr_mult = getattr(config, "TRAILING_LOCK_ATR_MULTIPLIER",  1.5)
-        min_step      = getattr(config, "TRAILING_MIN_STEP_TICKS",       0.5)
-
-        if favorable_move < activation_move:
-            # ── INITIAL — trade has not earned the right to trail yet ───────
-            result["phase"] = "INITIAL"
-            elog.log(
-                "ENGINE_TRAIL",
-                phase="INITIAL",
-                bars=bars_held,
-                progress=round(tp_progress, 4),
-                favorable_move=round(favorable_move, 2),
-                activation_move=round(activation_move, 2),
-                activation_pct=be_activation_pct,
-                fee_be=round(fee_breakeven_move, 2),
-                fee_be_margin=round(fee_breakeven_with_margin, 2),
-                atr=round(atr, 2),
-            )
-            return result
-
-        # ── Past activation: compute ATR-based trail distance ────────────────
-        if tp_progress >= lock_tp_pct:
-            # LOCK: close to TP — tighten trail to protect accumulated profit.
-            trail_distance = atr * lock_atr_mult
-            phase          = "LOCK"
-        else:
-            # TRAILING: wide ATR trail to survive normal pullbacks.
-            trail_distance = atr * atr_mult
-            phase          = "TRAILING"
-
-        result["trail_dist"] = round(trail_distance, 2)
-
-        # ── Fee-breakeven floor: ensures SL never sits below break-even ──────
-        # Once trailing begins the SL is constrained so that if it is hit, the
-        # gross P&L covers the full round-trip fee (entry already paid + the
-        # estimated exit fee).  The BREAKEVEN phase is reported when this floor
-        # is the binding constraint rather than the ATR trail.
-        be_floor = fee_breakeven_with_margin
-
-        # ── Compute candidate SL and apply ratchet ───────────────────────────
-        if is_long:
-            trail_sl     = current_price - trail_distance
-            floor_sl     = entry_price   + be_floor
-            candidate_sl = max(trail_sl, floor_sl)
-
-            # Phase reporting: BREAKEVEN when the fee floor overrides the trail.
-            if trail_sl < floor_sl:
-                phase = "BREAKEVEN"
-
-            # Ratchet: SL can only move UP for a long position.
-            if candidate_sl > current_sl + min_step:
-                result["new_sl"] = round(candidate_sl, 1)
-
-        else:  # short
-            trail_sl     = current_price + trail_distance
-            ceiling_sl   = entry_price   - be_floor
-            candidate_sl = min(trail_sl, ceiling_sl)
-
-            # Phase reporting: BREAKEVEN when the fee ceiling overrides the trail.
-            if trail_sl > ceiling_sl:
-                phase = "BREAKEVEN"
-
-            # Ratchet: SL can only move DOWN for a short position.
-            if candidate_sl < current_sl - min_step:
-                result["new_sl"] = round(candidate_sl, 1)
-
-        result["phase"] = phase
-
         elog.log(
-            "ENGINE_TRAIL",
-            phase=phase,
+            "ENGINE_FIB_TRAIL",
+            phase=trail_result.phase,
             bars=bars_held,
-            progress=round(tp_progress, 4),
-            favorable_move=round(favorable_move, 2),
-            activation_move=round(activation_move, 2),
-            atr=round(atr, 2),
-            trail_dist=round(trail_distance, 2),
+            progress=trail_result.tp_progress,
+            fib_ratio=trail_result.current_fib_ratio,
+            fib_sl=round(trail_result.fib_sl_price, 1),
             current_sl=round(current_sl, 1),
-            new_sl=result["new_sl"],
-            candidate=round(candidate_sl, 1),
-            fee_be=round(fee_breakeven_move, 2),
-            fee_be_margin=round(fee_breakeven_with_margin, 2),
-            total_fees=round(total_round_trip_fees, 4),
+            new_sl=trail_result.new_sl,
+            fee_be=trail_result.fee_breakeven_move,
+            hwm=round(trail_result.high_watermark, 1),
         )
 
         return result
 
+    def reset_trail_watermark(self):
+        """Reset the trailing high watermark. Called when a new trade opens."""
+        self._trail_high_watermark = 0.0
+
     def reset(self):
         self._state = EngineState()
         self._bars_since_kde_build = 0
+        self._trail_high_watermark = 0.0
         elog.log("SYSTEM_START", component="HPMSEngine", event="state_reset")

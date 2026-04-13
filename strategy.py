@@ -166,9 +166,10 @@ class HPMSStrategy:
                         if trail.get("new_sl") is not None:
                             updated = self._orders.update_sl_price(trail["new_sl"])
                             if updated:
+                                fib_info = f" fib={trail.get('fib_ratio', 0):.3f}" if trail.get("fib_ratio") else ""
                                 self._push(
                                     f"🔄 *SL Trailed* → `${trail['new_sl']:,.1f}` "
-                                    f"({trail['phase']}) bar={self._orders.bars_held}"
+                                    f"({trail['phase']}{fib_info}) bar={self._orders.bars_held}"
                                 )
 
                     # ── Absolute safety ceiling ──────────────────────────────
@@ -377,6 +378,7 @@ class HPMSStrategy:
                 entry_fee = getattr(self._orders, "_entry_fee_usd", 0.0)
 
                 self._risk.on_trade_open(side, actual_entry, size, margin_used)
+                self._engine.reset_trail_watermark()
                 self._consecutive_energy_spikes = 0
                 self._last_entry_size  = size
                 self._last_entry_price = actual_entry

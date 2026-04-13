@@ -55,57 +55,55 @@ SIGNAL_MIN_MOMENTUM       = 0.00005 # minimum |p_pred| at horizon
 SIGNAL_ACCELERATION_CHECK = True    # ALWAYS ON — second derivative confirmation required
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TRADE EXECUTION (v2 — Dynamic TP/SL)
+# TRADE EXECUTION — FIBONACCI TP/SL & TRAILING
 # ═══════════════════════════════════════════════════════════════════════════════
-TRADE_TP_PCT              = 0.0055  # MAX TP cap (widened to allow fee-aware R:R to work)
-TRADE_SL_PCT              = 0.0018  # MAX SL cap (actual SL based on ATR)
+#
+# Architecture: Fibonacci-level TP/SL derived from structural swing analysis
+# ──────────────────────────────────────────────────────────────────────────
+# SL is placed at a Fibonacci retracement level below (LONG) or above (SHORT)
+# the entry, identified from volume-weighted swing highs/lows.  An ATR buffer
+# pushes the SL just beyond the Fibonacci level (institutional practice: SL
+# sits past the structure, not on it).
+#
+# TP is placed at a Fibonacci extension level (1.272 or 1.618 projection of
+# the originating swing), capped by FIB_TP_CAP_PCT.
+#
+# Trailing uses Fibonacci retracement of the developing move (entry → high
+# watermark), tightening through the golden ratio schedule as TP progress
+# increases.  The breakeven floor guarantees net-zero after fees at all times
+# once trailing activates.
 
-# ── Trailing Stop System ─────────────────────────────────────────────────────
+# ── Fibonacci Swing Detection ─────────────────────────────────────────────
+FIB_SWING_MIN_ORDER       = 3       # minimum fractal order (7-bar pattern)
+FIB_SWING_MAX_ORDER       = 10      # maximum fractal order (21-bar pattern)
+FIB_SWING_ATR_NOISE       = 0.5     # min swing range as fraction of ATR (noise filter)
+FIB_MAX_SWING_PAIRS       = 6       # max swing pairs for multi-scale Fib computation
+FIB_CONFLUENCE_ATR_TOL    = 0.3     # confluence clustering tolerance (fraction of ATR)
+
+# ── Fibonacci TP/SL Caps ──────────────────────────────────────────────────
+FIB_TP_CAP_PCT            = 0.008   # max TP distance as fraction of price (0.8%)
+FIB_SL_CAP_PCT            = 0.004   # max SL distance as fraction of price (0.4%)
+FIB_SL_ATR_BUFFER_MULT    = 0.3     # ATR multiplier for SL buffer beyond Fib level
+FIB_MIN_RR                = 2.0     # minimum gross R:R ratio
+
+# ── Fibonacci Trailing Stop ──────────────────────────────────────────────
+# Phase lifecycle (SL only ever ratchets in the favorable direction):
+#   WARMUP      bars_held < warmup_bars         SL unchanged
+#   INITIAL     favorable_move < activation      SL unchanged
+#   BREAKEVEN   trailing active, fee floor binds  SL = entry + fees × margin
+#   FIB_TRAIL   trailing active, Fib SL binds     SL at Fib retracement of move
+#   FIB_LOCK    tp_progress ≥ 75%                 SL at 0.236 retracement (tight)
 #
-# Design principle: the SL only ever moves in the FAVORABLE direction (ratchet).
-# The only way to lose is the original SL being hit before activation.
-# Once activation fires, worst outcome is flat (breakeven). After that, only
-# locked profits.
-#
-# Phase lifecycle:
-#   WARMUP    bars_held < TRAILING_WARMUP_BARS       SL unchanged (trade breathing)
-#   INITIAL   favorable_move < activation_move       SL unchanged (trade not in profit yet)
-#   BREAKEVEN activation reached but fee floor       SL moves to entry + fee_breakeven × margin
-#             overrides ATR trail                    (guarantees net-zero or positive on exit)
-#   TRAILING  activation reached, ATR trail          SL = current_price − ATR × multiplier
-#             is binding constraint                  (wide trail to survive pullbacks)
-#   LOCK      tp_progress ≥ TRAILING_LOCK_TP_PCT     SL = current_price − ATR × lock_multiplier
-#                                                    (tight trail to secure accumulated profit)
-#
-# Activation threshold (TRAILING_BE_ACTIVATION_PCT)
-# ──────────────────────────────────────────────────
-# Controls when trailing begins as a fraction of TP distance.
-# Concerns separation: this is purely a TP-progress trigger — it does NOT
-# need to exceed the fee breakeven (that constraint is applied separately as
-# a floor on the candidate SL price once trailing is active).
-#
-# Value choice rationale (0.20):
-#   TP distance on BTC micro-scalp ≈ $390 (0.55% × ~$71,000)
-#   activation_move = $390 × 0.20 = $78
-#   fee_breakeven   ≈ $75–83 (round-trip fees / position notional)
-#
-#   At 0.20 activation the trail fires at roughly the same point where the
-#   fee floor becomes meaningful. The fee floor then acts as the binding SL
-#   constraint until the ATR trail pulls ahead of it, giving the system the
-#   maximum available range to protect profit.
-#
-#   Previous value of 0.40 required $156 favorable move (≈40% of TP) before
-#   trailing started — trades that peaked below $156 gain and reversed were
-#   never protected. The activation gate was the bottleneck, not the fee floor.
-#
+# Fibonacci trail schedule (tp_progress → retracement ratio):
+#   20% → 0.786 (wide, let trade breathe — keep 21% of move)
+#   40% → 0.618 (golden ratio — keep 38% of move)
+#   60% → 0.500 (half — keep 50% of move)
+#   75% → 0.382 (tight — keep 62% of move)
+#   90% → 0.236 (lock — keep 76% of move)
 TRAILING_ENABLED              = True
-TRAILING_WARMUP_BARS          = 2       # don't modify SL for first N bars (let trade breathe)
-TRAILING_BE_ACTIVATION_PCT    = 0.20    # activate trailing after 20% of TP distance (was 0.40)
+TRAILING_WARMUP_BARS          = 2       # don't modify SL for first N bars
+TRAILING_BE_ACTIVATION_PCT    = 0.20    # activate trailing after 20% of TP distance
 TRAILING_BE_FEE_MARGIN        = 1.1     # breakeven SL = entry + (round_trip_fees × this)
-TRAILING_ATR_LOOKBACK         = 14      # bars for ATR calculation
-TRAILING_ATR_MULTIPLIER       = 3.0     # trail distance = ATR × this (wide = survive pullbacks)
-TRAILING_LOCK_TP_PCT          = 0.75    # within 75% of TP → switch to tight trail
-TRAILING_LOCK_ATR_MULTIPLIER  = 1.5     # tighter trail when close to TP
 TRAILING_MIN_STEP_TICKS       = 0.5     # minimum SL move in price (avoid API spam)
 TRAILING_ABSOLUTE_MAX_BARS    = 120     # hard safety ceiling (2 hours) — exits ONLY if profitable
 
