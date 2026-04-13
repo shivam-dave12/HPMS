@@ -291,8 +291,6 @@ class RiskManager:
             # margin cap; at maximum confidence use the full cap.
             # Deliberately capped at 1.0 (not 1.5) because the margin cap is
             # already the physical limit — we cannot go above it.
-            conf_scale = max(0.50, min(1.00, confidence / 0.70 * 0.70))
-            # Simplified: conf_scale = confidence clamped to [0.50, 1.00]
             conf_scale = max(0.50, min(1.00, confidence))
 
             # ── Step 3: Volatility normalisation ─────────────────────────────

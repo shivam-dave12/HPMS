@@ -1033,15 +1033,21 @@ class DeltaAPI:
         reduce_only: bool = True,
         product_id:  Optional[int] = None,
     ) -> Dict:
-        """Convenience: place a stop-market order (for SL)."""
+        """Convenience: place a stop-market order (for SL).
+
+        stop_order_type='stop_loss_order' is required by Delta Exchange to
+        disambiguate SL from TP conditional orders that share the same base
+        order_type. Omitting it causes bad_schema on every POST.
+        """
         return self.place_order(
-            symbol     = symbol,
-            side       = side,
-            order_type = "stop_market",
-            size       = size,
-            stop_price = stop_price,
-            reduce_only = reduce_only,
-            product_id = product_id,
+            symbol          = symbol,
+            side            = side,
+            order_type      = "stop_market",
+            size            = size,
+            stop_price      = stop_price,
+            reduce_only     = reduce_only,
+            product_id      = product_id,
+            stop_order_type = "stop_loss_order",
         )
 
     def place_take_profit_market_order(

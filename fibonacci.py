@@ -910,14 +910,7 @@ def compute_fib_trailing_stop(
         return result
 
     # ── Determine Fibonacci retracement ratio for current progress ─────────
-    active_fib_ratio = _TRAIL_FIB_SCHEDULE[-1][1]  # tightest by default
-    for threshold, ratio in _TRAIL_FIB_SCHEDULE:
-        if tp_progress < threshold + 0.001:  # small epsilon for floating point
-            # Use the previous (wider) ratio if we haven't reached this threshold
-            break
-        active_fib_ratio = ratio
-
-    # Walk the schedule properly
+    # Walk the schedule: start wide, tighten as tp_progress increases
     active_fib_ratio = _TRAIL_FIB_SCHEDULE[0][1]  # start with widest
     for threshold, ratio in _TRAIL_FIB_SCHEDULE:
         if tp_progress >= threshold:
@@ -963,9 +956,25 @@ def compute_fib_trailing_stop(
     # ── Ratchet: SL can only improve ──────────────────────────────────────
     if is_long:
         if candidate_sl > current_sl + min_step_ticks:
+            # Sanity: a LONG SL at or above current price executes immediately
+            if candidate_sl >= current_price:
+                logger.debug(
+                    "Breakeven SL sanity: candidate_sl=%.1f >= current_price=%.1f "
+                    "for LONG — skipping SL update to avoid immediate execution",
+                    candidate_sl, current_price,
+                )
+                return result   # leave new_sl=None; existing SL stands
             result.new_sl = round(candidate_sl, 1)
     else:
         if candidate_sl < current_sl - min_step_ticks:
+            # Sanity: a SHORT SL at or below current price executes immediately
+            if candidate_sl <= current_price:
+                logger.debug(
+                    "Breakeven SL sanity: candidate_sl=%.1f <= current_price=%.1f "
+                    "for SHORT — skipping SL update to avoid immediate execution",
+                    candidate_sl, current_price,
+                )
+                return result
             result.new_sl = round(candidate_sl, 1)
 
     return result
