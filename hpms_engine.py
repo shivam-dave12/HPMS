@@ -25,7 +25,11 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from scipy.stats import gaussian_kde
 
-from fibonacci import compute_fib_tp_sl, compute_fib_trailing_stop, FibTPSL, FibTrailResult
+from fibonacci import (
+    compute_fib_tp_sl, compute_fib_trailing_stop,
+    format_fib_telegram_section,
+    FibTPSL, FibTrailResult,
+)
 from logger_core import elog
 
 logger = logging.getLogger(__name__)
@@ -85,6 +89,20 @@ class HPMSSignal:
     bars_since_kde:    int   = 0
     regime:            RegimeType = RegimeType.UNKNOWN
     trend_strength:    float = 0.0
+    # ── Fibonacci audit fields (populated for LONG/SHORT signals) ─────────
+    fib_tp_ratio:      float = 0.0   # Fib ratio that placed TP
+    fib_sl_ratio:      float = 0.0   # Fib ratio that placed SL
+    fib_tp_source:     str   = ""    # "FIB" | "FIB_RELAXED" | "ATR_FALLBACK"
+    fib_sl_source:     str   = ""    # same
+    fib_swings:        int   = 0     # swing points detected
+    fib_gross_rr:      float = 0.0   # gross R:R from Fib computation
+    fib_atr:           float = 0.0   # ATR used for Fib sizing
+    fib_tp_confluence: float = 0.0   # TP level confluence score
+    fib_sl_confluence: float = 0.0   # SL level confluence score
+    fib_swing_low:     float = 0.0   # lowest swing in range
+    fib_swing_high:    float = 0.0   # highest swing in range
+    fib_telegram_section: str = ""   # pre-formatted Telegram text for entry msg
+    used_actual_hlv:   bool  = False # True when real OHLCV H/L was used
 
 
 @dataclass
@@ -535,6 +553,8 @@ class HPMSEngine:
         closes:    List[float],
         volumes:   List[float],
         timestamp: float,
+        highs:     Optional[List[float]] = None,
+        lows:      Optional[List[float]] = None,
     ) -> Optional[HPMSSignal]:
         t_start = time.perf_counter_ns()
 
@@ -542,6 +562,13 @@ class HPMSEngine:
         volumes_arr = np.array(volumes, dtype=np.float64) if volumes else np.ones(len(closes_arr))
         if len(volumes_arr) != len(closes_arr):
             volumes_arr = np.ones(len(closes_arr))
+
+        # Real OHLCV highs/lows — convert only when supplied and length-matched
+        highs_arr: Optional[np.ndarray] = None
+        lows_arr:  Optional[np.ndarray] = None
+        if highs and lows and len(highs) == len(closes) and len(lows) == len(closes):
+            highs_arr = np.array(highs, dtype=np.float64)
+            lows_arr  = np.array(lows,  dtype=np.float64)
 
         min_required = max(self._norm_window, self._lookback) + self._tau + 5
         if len(closes_arr) < min_required:
@@ -931,6 +958,8 @@ class HPMSEngine:
                 swing_atr_noise=self._fib_swing_atr_noise,
                 max_swing_pairs=self._fib_max_swing_pairs,
                 confluence_tolerance_atr=self._fib_confluence_tol,
+                highs=highs_arr,
+                lows=lows_arr,
             )
 
             tp_price    = fib_result.tp_price
@@ -960,22 +989,36 @@ class HPMSEngine:
                          sl_dist=round(sl_distance, 1),
                          min_rr=self._fib_min_rr)
             else:
+                # Build compact level lists for the log (price@ratio, nearest first)
+                def _fmt_levels(lvs) -> List[str]:
+                    return [f"{lv.price:,.0f}@{lv.ratio:.3f}" for lv in lvs[:4]]
+
                 elog.log(
                     "ENGINE_FIB_RR",
+                    side=side,
                     tp_price=round(tp_price, 1),
                     sl_price=round(sl_price, 1),
                     tp_dist=round(tp_distance, 1),
                     sl_dist=round(sl_distance, 1),
                     gross_rr=round(gross_rr, 2),
                     net_rr=round(final_net_rr, 2),
+                    # ── Source & ratio audit ───────────────────────────────
                     tp_fib_ratio=fib_result.tp_fib_ratio,
                     sl_fib_ratio=fib_result.sl_fib_ratio,
+                    tp_source=fib_result.tp_source,
+                    sl_source=fib_result.sl_source,
                     tp_confluence=fib_result.tp_confluence,
                     sl_confluence=fib_result.sl_confluence,
+                    # ── Swing / level context ──────────────────────────────
+                    swings_detected=fib_result.swings_detected,
+                    used_actual_hlv=fib_result.used_actual_hlv,
+                    atr=round(fib_result.atr, 2),
+                    swing_range=f"{fib_result.swing_range_low:,.0f}–{fib_result.swing_range_high:,.0f}",
+                    levels_above=_fmt_levels(fib_result.levels_above),
+                    levels_below=_fmt_levels(fib_result.levels_below),
+                    # ── Derived stats ──────────────────────────────────────
                     fee_rt_price=round(fee_rt_price, 1),
                     predicted_move=round(abs(predicted_pct_move) * current_price, 1),
-                    levels_above=len(fib_result.levels_above),
-                    levels_below=len(fib_result.levels_below),
                     be_wr_gross=round(1.0 / (1.0 + gross_rr) * 100.0, 1),
                     be_wr_net=(round(1.0 / (1.0 + final_net_rr) * 100.0, 1)
                                if final_net_rr > 0 else 100.0),
@@ -989,11 +1032,13 @@ class HPMSEngine:
             else:
                 tp_price = current_price * (1.0 - self._fib_tp_cap_pct)
                 sl_price = current_price * (1.0 + self._fib_sl_cap_pct)
+            fib_result = None
             elog.log("ENGINE_FIB_RR", note="insufficient_data_cap_based",
                      tp_price=round(tp_price, 1), sl_price=round(sl_price, 1))
         else:
             tp_price = 0.0
             sl_price = 0.0
+            fib_result = None
 
         # ── Confidence score (regime-aware) ───────────────────────────────────
         if signal_type != SignalType.FLAT:
@@ -1026,6 +1071,13 @@ class HPMSEngine:
         compute_us = (t_end - t_start) / 1000.0
         self._state.signal_count += 1
 
+        # ── Prepare Fibonacci audit data for the signal ───────────────────────
+        _side_str = "long" if signal_type == SignalType.LONG else "short"
+        if fib_result is not None:
+            _fib_tg = format_fib_telegram_section(fib_result, _side_str)
+        else:
+            _fib_tg = ""
+
         # ── INFO-level bar summary ────────────────────────────────────────────
         bar_n = self._state.signal_count
         if signal_type != SignalType.FLAT:
@@ -1056,6 +1108,20 @@ class HPMSEngine:
             bars_since_kde=self._bars_since_kde_build,
             regime=regime,
             trend_strength=trend_strength,
+            # ── Fibonacci audit fields ─────────────────────────────────────
+            fib_tp_ratio      = fib_result.tp_fib_ratio     if fib_result else 0.0,
+            fib_sl_ratio      = fib_result.sl_fib_ratio     if fib_result else 0.0,
+            fib_tp_source     = fib_result.tp_source         if fib_result else "",
+            fib_sl_source     = fib_result.sl_source         if fib_result else "",
+            fib_swings        = fib_result.swings_detected   if fib_result else 0,
+            fib_gross_rr      = fib_result.gross_rr          if fib_result else 0.0,
+            fib_atr           = fib_result.atr               if fib_result else 0.0,
+            fib_tp_confluence = fib_result.tp_confluence     if fib_result else 0.0,
+            fib_sl_confluence = fib_result.sl_confluence     if fib_result else 0.0,
+            fib_swing_low     = fib_result.swing_range_low   if fib_result else 0.0,
+            fib_swing_high    = fib_result.swing_range_high  if fib_result else 0.0,
+            fib_telegram_section = _fib_tg,
+            used_actual_hlv   = fib_result.used_actual_hlv   if fib_result else False,
         )
 
     # ─── DIAGNOSTICS ──────────────────────────────────────────────────────────
@@ -1197,6 +1263,7 @@ class HPMSEngine:
             "tp_progress":        trail_result.tp_progress,
             "fee_breakeven_move": trail_result.fee_breakeven_move,
             "fib_ratio":          trail_result.current_fib_ratio,
+            "fib_sl_price":       trail_result.fib_sl_price,      # raw Fib SL before BE floor
             "high_watermark":     trail_result.high_watermark,
         }
 

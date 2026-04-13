@@ -79,6 +79,14 @@ class FibTPSL:
     gross_rr:         float         # tp_distance / sl_distance
     levels_above:     List[FibLevel]  # all computed levels above entry
     levels_below:     List[FibLevel]  # all computed levels below entry
+    # ── Source / audit metadata (defaults → backward-compatible) ──────────
+    swings_detected:  int   = 0     # number of swing points found
+    sl_source:        str   = "FIB" # "FIB" | "FIB_RELAXED" | "ATR_FALLBACK" | "PERCENTAGE_FALLBACK"
+    tp_source:        str   = "FIB" # same
+    used_actual_hlv:  bool  = False  # True when caller supplied real OHLCV H/L
+    swing_range_low:  float = 0.0   # lowest swing low used in level generation
+    swing_range_high: float = 0.0   # highest swing high used in level generation
+    atr:              float = 0.0   # ATR used for sizing (debug)
 
 
 @dataclass(slots=True)
@@ -384,8 +392,10 @@ def compute_fib_tp_sl(
     swing_atr_noise: float = 0.5,
     max_swing_pairs: int = 6,
     confluence_tolerance_atr: float = 0.3,
-    preferred_sl_ratios: Tuple[float, ...] = (0.618, 0.786, 0.500, 0.382),
+    preferred_sl_ratios: Tuple[float, ...] = (0.786, 0.618, 0.500, 0.382),
     preferred_tp_ratios: Tuple[float, ...] = (1.272, 1.618, 1.000, 2.000),
+    highs: Optional[np.ndarray] = None,
+    lows:  Optional[np.ndarray] = None,
 ) -> FibTPSL:
     """
     Compute TP and SL from Fibonacci levels derived from structural swing analysis.
@@ -445,9 +455,22 @@ def compute_fib_tp_sl(
     fee_rt_price = current_price * fee_rate * 2.0
 
     # ── Swing detection ───────────────────────────────────────────────────
-    highs, lows, vols = _extract_hlv(closes, volumes)
+    # Use real OHLCV highs/lows when provided by the caller (MUCH better
+    # swing quality than synthesized H/L from close differences).
+    used_actual_hlv = (
+        highs is not None and lows is not None
+        and len(highs) == len(closes) and len(lows) == len(closes)
+    )
+    if used_actual_hlv:
+        h_arr = highs
+        l_arr = lows
+        vols  = volumes
+    else:
+        h_arr, l_arr, vols = _extract_hlv(closes, volumes)
+        logger.debug("compute_fib_tp_sl: synthesising H/L from closes (no OHLCV supplied)")
+
     swings = detect_swings(
-        closes, highs, lows, vols,
+        closes, h_arr, l_arr, vols,
         min_order=swing_min_order,
         max_order=swing_max_order,
         atr_noise_filter=swing_atr_noise,
@@ -464,10 +487,18 @@ def compute_fib_tp_sl(
     # ── SL selection ──────────────────────────────────────────────────────
     sl_buffer = atr * sl_atr_buffer_mult
     sl_max_dist = current_price * sl_cap_pct
-    sl_min_dist = atr * 1.0  # minimum: 1× ATR (outside noise)
+    # Minimum: 0.5 × ATR (was 1.0×) — allows more Fib levels to qualify;
+    # structural buffer is handled by the ATR buffer added beyond the Fib level.
+    sl_min_dist = atr * 0.5
+
+    # Swing range for diagnostics
+    swing_lows  = [s.price for s in swings if s.kind == "low"]
+    swing_highs = [s.price for s in swings if s.kind == "high"]
+    swing_range_low  = float(min(swing_lows))  if swing_lows  else current_price
+    swing_range_high = float(max(swing_highs)) if swing_highs else current_price
 
     sl_candidates = levels_below if is_long else levels_above
-    sl_price, sl_ratio, sl_confluence = _select_sl_level(
+    sl_price, sl_ratio, sl_confluence, sl_relaxed = _select_sl_level(
         candidates=sl_candidates,
         current_price=current_price,
         is_long=is_long,
@@ -477,13 +508,22 @@ def compute_fib_tp_sl(
         preferred_ratios=preferred_sl_ratios,
     )
 
-    # If no Fibonacci level qualified, use ATR-based structural SL
+    sl_source = "FIB"
     if sl_price <= 0:
-        sl_dist = min(atr * 2.0, sl_max_dist)
+        sl_source = "ATR_FALLBACK"
+        # Wider fallback: 3.5× ATR ensures the SL is well beyond noise
+        sl_dist = min(atr * 3.5, sl_max_dist)
         sl_dist = max(sl_dist, sl_min_dist)
         sl_price = (current_price - sl_dist) if is_long else (current_price + sl_dist)
         sl_ratio = 0.0
         sl_confluence = 0.0
+        logger.debug(
+            "compute_fib_tp_sl: no Fib SL found in [%.1f, %.1f] — "
+            "using ATR fallback sl_dist=%.1f",
+            sl_min_dist, sl_max_dist, sl_dist,
+        )
+    elif sl_relaxed:
+        sl_source = "FIB_RELAXED"
 
     sl_distance = abs(current_price - sl_price)
 
@@ -502,13 +542,18 @@ def compute_fib_tp_sl(
         preferred_ratios=preferred_tp_ratios,
     )
 
+    tp_source = "FIB"
     # If no Fibonacci level qualified, use ATR-scaled TP
     if tp_price <= 0:
+        tp_source = "ATR_FALLBACK"
         tp_dist = min(atr * 5.0, tp_max_dist)
         tp_dist = max(tp_dist, tp_min_dist)
         tp_price = (current_price + tp_dist) if is_long else (current_price - tp_dist)
         tp_ratio = 0.0
         tp_confluence = 0.0
+        logger.debug(
+            "compute_fib_tp_sl: no Fib TP found — using ATR fallback tp_dist=%.1f", tp_dist
+        )
 
     tp_distance = abs(tp_price - current_price)
 
@@ -535,6 +580,13 @@ def compute_fib_tp_sl(
         gross_rr=round(gross_rr, 2),
         levels_above=levels_above[:5],
         levels_below=levels_below[:5],
+        swings_detected=len(swings),
+        sl_source=sl_source,
+        tp_source=tp_source,
+        used_actual_hlv=used_actual_hlv,
+        swing_range_low=round(swing_range_low, 1),
+        swing_range_high=round(swing_range_high, 1),
+        atr=round(atr, 2),
     )
 
 
@@ -546,40 +598,25 @@ def _select_sl_level(
     min_dist: float,
     max_dist: float,
     preferred_ratios: Tuple[float, ...],
-) -> Tuple[float, float, float]:
+) -> Tuple[float, float, float, bool]:
     """
     Select the best SL Fibonacci level from candidates.
 
     Priority:
-      1. Preferred ratios (0.618, 0.786, 0.500 are structurally strongest)
+      1. Preferred ratios (0.786, 0.618, 0.500 are structurally strongest)
       2. Within distance bounds (min_dist to max_dist)
       3. Highest confluence score among qualifying levels
 
-    Returns (price, ratio, confluence) or (0, 0, 0) if none qualify.
+    Pass 1 — strict [min_dist, max_dist].
+    Pass 2 — relax max_dist to 2× cap (captures wider structural levels).
+    Pass 3 — take any level beyond 0.5× min_dist (last resort before ATR fallback).
+
+    Returns (price, ratio, confluence, relaxed) — relaxed=True when pass 2 or 3 fired.
     """
     if not candidates:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, False
 
-    # Filter by distance
-    valid = []
-    for lv in candidates:
-        dist = abs(lv.price - current_price)
-        if min_dist <= dist <= max_dist:
-            valid.append(lv)
-
-    if not valid:
-        # Relax: take the nearest level that's at least min_dist away
-        for lv in candidates:
-            dist = abs(lv.price - current_price)
-            if dist >= min_dist * 0.7:  # allow 30% relaxation
-                valid.append(lv)
-                break
-
-    if not valid:
-        return 0.0, 0.0, 0.0
-
-    # Score each valid level: prefer certain ratios, then confluence
-    def score(lv: FibLevel) -> float:
+    def _score(lv: FibLevel) -> float:
         ratio_bonus = 0.0
         for rank, pref_ratio in enumerate(preferred_ratios):
             if abs(lv.ratio - pref_ratio) < 0.01:
@@ -587,14 +624,41 @@ def _select_sl_level(
                 break
         return ratio_bonus + lv.confluence
 
-    best = max(valid, key=score)
-    # Apply buffer: SL sits just beyond the Fib level
-    if is_long:
-        sl_price = best.price - buffer
-    else:
-        sl_price = best.price + buffer
+    def _apply_buffer(lv: FibLevel) -> float:
+        return (lv.price - buffer) if is_long else (lv.price + buffer)
 
-    return sl_price, best.ratio, best.confluence
+    def _filter(lo: float, hi: float) -> List[FibLevel]:
+        return [lv for lv in candidates if lo <= abs(lv.price - current_price) <= hi]
+
+    # Pass 1: strict window
+    valid = _filter(min_dist, max_dist)
+    if valid:
+        best = max(valid, key=_score)
+        return _apply_buffer(best), best.ratio, best.confluence, False
+
+    # Pass 2: relax max to 2× cap — allows structurally wider Fib levels
+    valid = _filter(min_dist, max_dist * 2.0)
+    if valid:
+        best = max(valid, key=_score)
+        logger.debug(
+            "_select_sl_level pass2 (relaxed max=%.1f): found ratio=%.3f dist=%.1f",
+            max_dist * 2.0, best.ratio, abs(best.price - current_price),
+        )
+        return _apply_buffer(best), best.ratio, best.confluence, True
+
+    # Pass 3: any level beyond 0.5× min_dist (avoids placing SL in the noise floor)
+    valid = [lv for lv in candidates if abs(lv.price - current_price) >= min_dist * 0.5]
+    if valid:
+        # Prefer the nearest qualifying level so SL isn't absurdly far
+        valid.sort(key=lambda lv: abs(lv.price - current_price))
+        best = max(valid[:3], key=_score)  # score the 3 nearest, pick best-scored
+        logger.debug(
+            "_select_sl_level pass3 (any>=0.5×min): found ratio=%.3f dist=%.1f",
+            best.ratio, abs(best.price - current_price),
+        )
+        return _apply_buffer(best), best.ratio, best.confluence, True
+
+    return 0.0, 0.0, 0.0, False
 
 
 def _select_tp_level(
@@ -666,12 +730,63 @@ def _percentage_fallback(
         tp_distance=round(tp_dist, 1), sl_distance=round(sl_dist, 1),
         gross_rr=round(tp_dist / sl_dist, 2) if sl_dist > 0 else 0.0,
         levels_above=[], levels_below=[],
+        swings_detected=0,
+        sl_source="PERCENTAGE_FALLBACK",
+        tp_source="PERCENTAGE_FALLBACK",
+        used_actual_hlv=False,
+        swing_range_low=current_price,
+        swing_range_high=current_price,
+        atr=0.0,
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# FIBONACCI TRAILING STOP
-# ═══════════════════════════════════════════════════════════════════════════════
+def format_fib_telegram_section(result: FibTPSL, side: str) -> str:
+    """
+    Return a compact Telegram-ready Markdown string summarising all Fibonacci
+    level decisions for a trade entry.  Append this directly to the entry
+    notification so the user can verify every level without looking at logs.
+
+    Format:
+        📐 *Fibonacci Analysis*
+        SL: $84,123.0 | Fib 0.786 | conf 3.2 | [FIB]
+        TP: $85,400.0 | Fib 1.272 | conf 4.1 | [FIB]
+        Gross R:R  2.34:1 | ATR $42.1 | Swings 8
+        H/L source: REAL OHLCV
+        Swing range: $83,800 – $85,600
+        SL levels ↓  0.786@83980  0.618@84090  0.500@84180
+        TP levels ↑  1.272@85420  1.618@85900  1.000@85060
+    """
+    is_long = side == "long"
+    sl_ratio_str = f"{result.sl_fib_ratio:.3f}" if result.sl_fib_ratio else "n/a"
+    tp_ratio_str = f"{result.tp_fib_ratio:.3f}" if result.tp_fib_ratio else "n/a"
+
+    sl_levels_str = "  ".join(
+        f"{lv.ratio:.3f}@{lv.price:,.0f}"
+        for lv in (result.levels_below if is_long else result.levels_above)[:4]
+    ) or "none"
+    tp_levels_str = "  ".join(
+        f"{lv.ratio:.3f}@{lv.price:,.0f}"
+        for lv in (result.levels_above if is_long else result.levels_below)[:4]
+    ) or "none"
+
+    hlv_label = "✅ REAL OHLCV" if result.used_actual_hlv else "⚠️ synthesised (no H/L)"
+    sl_src_emoji = "✅" if result.sl_source == "FIB" else ("⚠️" if result.sl_source == "FIB_RELAXED" else "❌")
+    tp_src_emoji = "✅" if result.tp_source == "FIB" else ("⚠️" if result.tp_source == "FIB_RELAXED" else "❌")
+
+    lines = [
+        "📐 *Fibonacci Analysis*",
+        f"SL: `${result.sl_price:,.1f}` | Fib `{sl_ratio_str}` | conf `{result.sl_confluence:.1f}` | {sl_src_emoji} `{result.sl_source}`",
+        f"TP: `${result.tp_price:,.1f}` | Fib `{tp_ratio_str}` | conf `{result.tp_confluence:.1f}` | {tp_src_emoji} `{result.tp_source}`",
+        f"R:R `{result.gross_rr:.2f}:1` | ATR `${result.atr:.1f}` | Swings `{result.swings_detected}`",
+        f"H/L data: {hlv_label}",
+        f"Swing range: `${result.swing_range_low:,.0f}` – `${result.swing_range_high:,.0f}`",
+        f"{'SL' if is_long else 'SL'} levels ({'↓' if is_long else '↑'}): `{sl_levels_str}`",
+        f"{'TP' if is_long else 'TP'} levels ({'↑' if is_long else '↓'}): `{tp_levels_str}`",
+    ]
+    return "\n".join(lines)
+
+
+
 
 # Fibonacci retracement ratios for trailing (from tight to wide)
 # As the trade progresses toward TP, we step from wider to tighter retracements

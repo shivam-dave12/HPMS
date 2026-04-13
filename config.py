@@ -81,9 +81,9 @@ FIB_MAX_SWING_PAIRS       = 6       # max swing pairs for multi-scale Fib comput
 FIB_CONFLUENCE_ATR_TOL    = 0.3     # confluence clustering tolerance (fraction of ATR)
 
 # ── Fibonacci TP/SL Caps ──────────────────────────────────────────────────
-FIB_TP_CAP_PCT            = 0.008   # max TP distance as fraction of price (0.8%)
-FIB_SL_CAP_PCT            = 0.004   # max SL distance as fraction of price (0.4%)
-FIB_SL_ATR_BUFFER_MULT    = 0.3     # ATR multiplier for SL buffer beyond Fib level
+FIB_TP_CAP_PCT            = 0.014   # max TP distance as fraction of price (1.4% — was 0.8%)
+FIB_SL_CAP_PCT            = 0.007   # max SL distance as fraction of price (0.7% — was 0.4%)
+FIB_SL_ATR_BUFFER_MULT    = 0.2     # ATR multiplier for SL buffer beyond Fib level (was 0.3)
 FIB_MIN_RR                = 2.0     # minimum gross R:R ratio
 
 # ── Fibonacci Trailing Stop ──────────────────────────────────────────────

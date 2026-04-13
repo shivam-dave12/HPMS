@@ -125,6 +125,10 @@ class HPMSStrategy:
 
             closes       = [c["c"] for c in valid]
             volumes      = [c.get("v", 0.0) for c in valid]
+            # Real OHLCV H/L — critical for accurate Fibonacci swing detection.
+            # Fallback to close if "h"/"l" keys are absent (data-source safety).
+            highs        = [c.get("h", c["c"]) for c in valid]
+            lows         = [c.get("l", c["c"]) for c in valid]
             current_price = closes[-1]
             timestamp     = valid[-1].get("t", time.time() * 1000) / 1000.0
 
@@ -136,7 +140,8 @@ class HPMSStrategy:
                 if close_reason:
                     return None
 
-                signal = self._engine.on_bar_close(closes, volumes, timestamp)
+                signal = self._engine.on_bar_close(closes, volumes, timestamp,
+                                                    highs=highs, lows=lows)
                 if signal:
                     # KDE grace period: skip energy spike check for 2 bars after
                     # a KDE rebuild, as dH/dt spikes artificially on rebuild bars.
@@ -166,10 +171,19 @@ class HPMSStrategy:
                         if trail.get("new_sl") is not None:
                             updated = self._orders.update_sl_price(trail["new_sl"])
                             if updated:
-                                fib_info = f" fib={trail.get('fib_ratio', 0):.3f}" if trail.get("fib_ratio") else ""
+                                fib_ratio  = trail.get("fib_ratio", 0.0)
+                                fib_sl_raw = trail.get("fib_sl_price", 0.0)
+                                hwm        = trail.get("high_watermark", 0.0)
+                                progress   = trail.get("tp_progress", 0.0)
+                                phase      = trail.get("phase", "?")
+                                be_move    = trail.get("fee_breakeven_move", 0.0)
                                 self._push(
-                                    f"🔄 *SL Trailed* → `${trail['new_sl']:,.1f}` "
-                                    f"({trail['phase']}{fib_info}) bar={self._orders.bars_held}"
+                                    f"🔄 *SL Trailed* → `${trail['new_sl']:,.1f}`\n"
+                                    f"Phase: `{phase}` | Fib ratio: `{fib_ratio:.3f}`\n"
+                                    f"Raw Fib SL: `${fib_sl_raw:,.1f}` "
+                                    f"_(SL from {fib_ratio:.3f} retracement of move)_\n"
+                                    f"HWM: `${hwm:,.1f}` | Progress: `{progress:.1%}`\n"
+                                    f"BE floor: `${be_move:.1f}` above entry | Bar: `{self._orders.bars_held}`"
                                 )
 
                     # ── Absolute safety ceiling ──────────────────────────────
@@ -222,7 +236,8 @@ class HPMSStrategy:
                 return None
 
             # ── Run HPMS engine ───────────────────────────────────────────────
-            signal = self._engine.on_bar_close(closes, volumes, timestamp)
+            signal = self._engine.on_bar_close(closes, volumes, timestamp,
+                                               highs=highs, lows=lows)
             self._last_signal = signal
 
             if signal is None or signal.signal_type == SignalType.FLAT:
@@ -396,13 +411,13 @@ class HPMSStrategy:
                     f"🚀 *ENTRY {side.upper()}*\n"
                     f"Size: `{size}c` | Notional: `${notional:.2f}`\n"
                     f"Entry: `${actual_entry:,.1f}`\n"
-                    f"TP: `${signal.tp_price:,.1f}` (`${abs(signal.tp_price - actual_entry):.1f}`)\n"
-                    f"SL: `${signal.sl_price:,.1f}` (`${abs(signal.sl_price - actual_entry):.1f}`)\n"
-                    f"Margin: `${margin_used:.2f}` @ `{leverage}x`\n"
-                    f"Entry fee: `$-{entry_fee:.4f}` _(exact)_\n"
+                    f"TP: `${signal.tp_price:,.1f}` (`+${abs(signal.tp_price - actual_entry):.1f}`)\n"
+                    f"SL: `${signal.sl_price:,.1f}` (`-${abs(signal.sl_price - actual_entry):.1f}`)\n"
+                    f"Margin: `${margin_used:.2f}` @ `{leverage}x` | Fee: `$-{entry_fee:.4f}`\n"
                     f"Conf: `{signal.confidence:.1%}` | Regime: `{signal_regime.name}` "
                     f"trend `{sig_trend_str:+.3f}`\n"
-                    f"Δq: `{signal.predicted_delta_q:+.5f}`"
+                    f"Δq: `{signal.predicted_delta_q:+.5f}`\n"
+                    f"\n{signal.fib_telegram_section}"
                 )
                 self._block_count = 0
             else:
