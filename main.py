@@ -47,49 +47,215 @@ logger = logging.getLogger("hpms")
 
 class _ColoredFormatter(logging.Formatter):
     """
-    Pretty, color-coded terminal formatter.
-    Strips the package prefix from logger names so the column stays narrow.
+    Rich, color-coded terminal formatter with structured elog event rendering.
+
+    For regular log lines:
+        12:34:56.789 INF HPMS     Your message here
+
+    For elog structured JSON events (from logger_core.elog):
+        12:34:56.789 DBG ENGINE   🎯 ENGINE_SIGNAL   signal=LONG  conf=0.870  Δq=+0.00231
+        12:34:56.790 DBG ENGINE   ⏭  ENGINE_SKIP     reason=FLAT  conf=0.120
+
+    For SYSTEM_ milestone events a banner is drawn:
+        ════════════════════════════════════
+        🚀  SYSTEM_START   mode=LIVE  symbol=BTCUSD
+        ════════════════════════════════════
     """
-    _RESET  = "\033[0m"
-    _BOLD   = "\033[1m"
-    _DIM    = "\033[2m"
+
+    # ── ANSI codes ─────────────────────────────────────────────────────────────
+    _RESET   = "\033[0m"
+    _BOLD    = "\033[1m"
+    _DIM     = "\033[2m"
+    _ITALIC  = "\033[3m"
+    # Foreground colors
+    _BLACK   = "\033[30m"
+    _RED     = "\033[31m"
+    _GREEN   = "\033[32m"
+    _YELLOW  = "\033[33m"
+    _BLUE    = "\033[34m"
+    _MAGENTA = "\033[35m"
+    _CYAN    = "\033[36m"
+    _WHITE   = "\033[37m"
+    _GREY    = "\033[90m"
+    # Bright variants
+    _BRED    = "\033[91m"
+    _BGREEN  = "\033[92m"
+    _BYELLOW = "\033[93m"
+    _BBLUE   = "\033[94m"
+    _BMAGENTA= "\033[95m"
+    _BCYAN   = "\033[96m"
+
+    # ── Level display ──────────────────────────────────────────────────────────
     _LEVELS = {
-        logging.DEBUG:    ("\033[36m",  "DBG"),   # cyan
-        logging.INFO:     ("\033[32m",  "INF"),   # green
-        logging.WARNING:  ("\033[33m",  "WRN"),   # yellow
-        logging.ERROR:    ("\033[31m",  "ERR"),   # red
-        logging.CRITICAL: ("\033[35m",  "CRT"),   # magenta
-    }
-    # Short display names for known loggers
-    _NAME_MAP = {
-        "hpms":                       "HPMS",
-        "strategy":                   "STRAT",
-        "hpms_engine":                "ENGINE",
-        "risk_manager":               "RISK",
-        "order_manager":              "ORDER",
-        "telegram_bot":               "TG",
-        "logger_core":                "ELOG",
-        "exchanges.delta.api":        "DAPI",
-        "exchanges.delta.data_manager": "DATA",
-        "exchanges.delta.websocket":  "WS",
+        logging.DEBUG:    ("\033[36m",   "DBG"),   # cyan
+        logging.INFO:     ("\033[32m",   "INF"),   # green
+        logging.WARNING:  ("\033[33m",   "WRN"),   # yellow
+        logging.ERROR:    ("\033[91m",   "ERR"),   # bright red
+        logging.CRITICAL: ("\033[95m",   "CRT"),   # bright magenta
     }
 
+    # ── Short logger names ─────────────────────────────────────────────────────
+    _NAME_MAP = {
+        "hpms":                         "HPMS",
+        "hpms.elog":                    "ELOG",
+        "strategy":                     "STRAT",
+        "hpms_engine":                  "ENGINE",
+        "risk_manager":                 "RISK",
+        "order_manager":                "ORDER",
+        "telegram_bot":                 "TG",
+        "logger_core":                  "ELOG",
+        "exchanges.delta.api":          "DAPI",
+        "exchanges.delta.data_manager": "DATA",
+        "exchanges.delta.websocket":    "WS",
+    }
+
+    # ── Value highlighting rules — applied to elog event fields ───────────────
+    # Certain field values get distinct colors so critical info pops visually.
+    _VALUE_HIGHLIGHTS = {
+        # Signal direction
+        "LONG":     "\033[92m",   # bright green
+        "SHORT":    "\033[91m",   # bright red
+        "FLAT":     "\033[90m",   # grey
+        # Health
+        "ready":    "\033[92m",
+        "True":     "\033[92m",
+        "False":    "\033[91m",
+        "HALTED":   "\033[91m",
+        "OK":       "\033[92m",
+        "LIVE":     "\033[92m",
+        "DRY-RUN":  "\033[93m",
+        "TESTNET":  "\033[93m",
+        # Errors / warnings
+        "error":    "\033[91m",
+        "failed":   "\033[91m",
+        "build_failed": "\033[91m",
+    }
+
+    # Fields that should be omitted from the one-liner (they're in the header)
+    _SKIP_FIELDS = {"event"}
+
+    # ── Field renaming for compact display ────────────────────────────────────
+    _FIELD_ALIAS = {
+        "signal":             "sig",
+        "confidence":         "conf",
+        "predicted_delta_q":  "Δq",
+        "predicted_p_final":  "p_fin",
+        "compute_time_us":    "µs",
+        "component":          "comp",
+        "status":             "stat",
+        "reason":             "why",
+        "network":            "net",
+        "testnet":            "testnet",
+        "dry_run":            "dry",
+    }
+
+    # ── Events that print a full banner ───────────────────────────────────────
+    _BANNER_EVENTS = {
+        "SYSTEM_START", "SYSTEM_SHUTDOWN", "RISK_HALT", "RISK_RESUME",
+    }
+
+    def _colorize_value(self, val_str: str) -> str:
+        """Apply highlight color if the value matches a known keyword."""
+        stripped = val_str.strip("'\"")
+        for keyword, color in self._VALUE_HIGHLIGHTS.items():
+            if stripped == keyword or stripped.lower() == keyword.lower():
+                return color + val_str + self._RESET
+        return val_str
+
+    def _fmt_kv(self, key: str, val) -> str:
+        """Format a single key=value pair with optional color."""
+        alias = self._FIELD_ALIAS.get(key, key)
+        val_str = str(val)
+        # Truncate very long strings
+        if len(val_str) > 60:
+            val_str = val_str[:57] + "…"
+        val_colored = self._colorize_value(val_str)
+        return f"{self._DIM}{alias}{self._RESET}={self._BOLD}{val_colored}{self._RESET}"
+
+    def _render_elog(self, data: dict, ts_header: str, level_color: str, lvl: str, short_name: str) -> str:
+        """Render a structured elog JSON event as a rich, readable terminal line."""
+        import sys
+        try:
+            from logger_core import event_meta
+            emoji, label = event_meta(data["event"])
+        except Exception:
+            emoji, label = "•", data.get("event", "?").lower()
+
+        event_name = data.get("event", "?")
+        is_banner  = event_name in self._BANNER_EVENTS
+
+        # Build key=value pairs (skip "event" key)
+        kv_parts = [
+            self._fmt_kv(k, v)
+            for k, v in data.items()
+            if k not in self._SKIP_FIELDS
+        ]
+        kv_line = "  ".join(kv_parts)
+
+        # Event name display: colored by category
+        if event_name.startswith("ENGINE_"):
+            ev_color = self._CYAN
+        elif event_name.startswith("RISK_"):
+            ev_color = self._YELLOW
+        elif event_name.startswith("ORDER_"):
+            ev_color = self._BLUE
+        elif event_name.startswith("SYSTEM_"):
+            ev_color = self._BGREEN
+        else:
+            ev_color = self._GREY
+
+        ev_display = (
+            f"{ev_color}{self._BOLD}{event_name:<26}{self._RESET}"
+        )
+
+        if is_banner:
+            # Full-width banner for milestone events
+            width = 62
+            banner_line = "═" * width
+            body = f"  {emoji}  {ev_display}  {kv_line}"
+            return (
+                f"\n{self._BGREEN}{banner_line}{self._RESET}\n"
+                f"{ts_header}{ev_display} {kv_line}\n"
+                f"{self._BGREEN}{banner_line}{self._RESET}"
+            )
+        else:
+            # Compact one-liner
+            return f"{ts_header}{emoji}  {ev_display}  {kv_line}"
+
     def format(self, record: logging.LogRecord) -> str:
+        import json as _json
+
         color, lvl = self._LEVELS.get(record.levelno, ("", "???"))
         short_name = self._NAME_MAP.get(record.name, record.name.split(".")[-1][:8])
         ts = self.formatTime(record, "%H:%M:%S")
         ms = f"{record.msecs:03.0f}"
-        header = (
+
+        ts_header = (
             f"{self._DIM}{ts}.{ms}{self._RESET} "
             f"{color}{self._BOLD}{lvl}{self._RESET} "
-            f"{self._DIM}{short_name:<8}{self._RESET} "
+            f"{self._DIM}{short_name:<8}{self._RESET}  "
         )
+
         msg = record.getMessage()
-        # Indent continuation lines
-        msg_indented = msg.replace("\n", "\n" + " " * 24)
+
+        # ── Try to parse as elog JSON ──────────────────────────────────────────
+        # elog messages from hpms.elog are always valid JSON objects with "event".
+        if record.name == "hpms.elog" and msg.startswith("{"):
+            try:
+                data = _json.loads(msg)
+                if "event" in data:
+                    rendered = self._render_elog(data, ts_header, color, lvl, short_name)
+                    if record.exc_info:
+                        rendered += "\n" + self.formatException(record.exc_info)
+                    return rendered
+            except (_json.JSONDecodeError, Exception):
+                pass  # Fall through to plain rendering below
+
+        # ── Plain log line ─────────────────────────────────────────────────────
+        msg_indented = msg.replace("\n", "\n" + " " * 26)
         if record.exc_info:
             msg_indented += "\n" + self.formatException(record.exc_info)
-        return header + msg_indented
+        return ts_header + msg_indented
 
 
 def setup_logging():
@@ -187,12 +353,16 @@ class HPMSRunner:
         elog.log("SYSTEM_START", component="HPMSRunner",
                  mode=mode_str, network=net_str, symbol=config.DELTA_SYMBOL)
 
-        logger.info("=" * 60)
-        logger.info("  HPMS - Hamiltonian Phase-Space Micro-Scalping")
-        logger.info("  Mode:    " + mode_str)
-        logger.info("  Network: " + net_str)
-        logger.info("  Symbol:  " + config.DELTA_SYMBOL)
-        logger.info("=" * 60)
+        banner = (
+            "\n╔══════════════════════════════════════════════════════════╗\n"
+            "║        HPMS — Hamiltonian Phase-Space Micro-Scalping     ║\n"
+            "╠══════════════════════════════════════════════════════════╣\n"
+            "║  Mode    : " + f"{mode_str:<46}" + "║\n"
+            "║  Network : " + f"{net_str:<46}" + "║\n"
+            "║  Symbol  : " + f"{config.DELTA_SYMBOL:<46}" + "║\n"
+            "╚══════════════════════════════════════════════════════════╝"
+        )
+        logger.info(banner)
 
         # ── 0. Validate critical config ───────────────────────────────────────
         if not config.TELEGRAM_BOT_TOKEN:
@@ -319,16 +489,20 @@ class HPMSRunner:
         elog.log("SYSTEM_START", component="HPMSRunner", status="fully_operational")
 
         # Startup notification — built with concatenation, no f-string ternaries
+        mode_icon = "🟡" if self._dry_run else ("🟠" if self._testnet else "🟢")
         self._telegram.send_message(
-            "*HPMS System Online*\n\n"
-            "Mode: " + mode_str + "\n"
-            "Network: " + net_str + "\n"
-            "Symbol: " + config.DELTA_SYMBOL + "\n"
-            "Leverage: " + str(config.RISK_LEVERAGE) + "x\n"
-            "Integrator: " + str(config.HPMS_INTEGRATOR) + "\n"
-            "tau=" + str(config.HPMS_TAU) +
-            " lookback=" + str(config.HPMS_LOOKBACK) +
-            " horizon=" + str(config.HPMS_PREDICTION_HORIZON)
+            mode_icon + " *HPMS System Online*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Mode:       `" + mode_str + "`\n"
+            "Network:    `" + net_str + "`\n"
+            "Symbol:     `" + config.DELTA_SYMBOL + "`\n"
+            "Leverage:   `" + str(config.RISK_LEVERAGE) + "x`\n"
+            "Integrator: `" + str(config.HPMS_INTEGRATOR) + "`\n\n"
+            "*Engine Config:*\n"
+            "  τ=" + str(config.HPMS_TAU) +
+            "  lookback=" + str(config.HPMS_LOOKBACK) +
+            "  horizon=" + str(config.HPMS_PREDICTION_HORIZON) + "\n\n"
+            "_Strategy is now active\\. Use /status for live state\\._"
         )
 
         self._main_loop()
@@ -483,12 +657,21 @@ class HPMSRunner:
     def _health_check(self):
         if not self._data_mgr.is_ready:
             elog.warn("SYSTEM_HEALTH", issue="DataManager_not_ready")
-            self._telegram.send_message("DataManager not ready - restarting streams")
+            self._telegram.send_message(
+                "⚠️ *Health Alert — Data Stream Down*\n\n"
+                "DataManager is not ready\\. Restarting WebSocket streams now\\.\n"
+                "_Check exchange connectivity if this persists\\._"
+            )
             self._data_mgr.restart_streams()
 
         if not self._data_mgr.is_price_fresh(max_stale_seconds=120):
             elog.warn("SYSTEM_HEALTH", issue="price_stale_gt_120s")
-            self._telegram.send_message("Price data stale - check exchange connection")
+            self._telegram.send_message(
+                "⚠️ *Health Alert — Price Data Stale*\n\n"
+                "Last price tick is >120s old\\.\n"
+                "No new entries will be placed until feed recovers\\.\n"
+                "_Check exchange WebSocket connection\\._"
+            )
 
     def shutdown(self):
         elog.log("SYSTEM_SHUTDOWN", component="HPMSRunner")

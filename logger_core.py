@@ -22,6 +22,48 @@ import logging
 _elog_logger = logging.getLogger("hpms.elog")
 
 
+# ── Event-category metadata ────────────────────────────────────────────────────
+# Each entry: (emoji, short human label)
+# Used by _ColoredFormatter in main.py to render pretty terminal output.
+EVENT_META: dict = {
+    # System lifecycle
+    "SYSTEM_START":            ("🚀", "startup"),
+    "SYSTEM_SHUTDOWN":         ("🛑", "shutdown"),
+    "SYSTEM_HEALTH":           ("🏥", "health-check"),
+    "SYSTEM_MAIN_LOOP":        ("🔄", "main-loop"),
+    "SYSTEM_":                 ("⚙️ ", "system"),
+    # Engine — signal path
+    "ENGINE_SIGNAL":           ("🎯", "signal"),
+    "ENGINE_SKIP":             ("⏭ ", "skip"),
+    "ENGINE_KDE_REBUILD":      ("🌊", "kde-rebuild"),
+    "ENGINE_KDE_SKIP":         ("🌊", "kde-skip"),
+    "ENGINE_PHASE_STATE":      ("🌀", "phase-state"),
+    "ENGINE_TRAJECTORY":       ("📐", "trajectory"),
+    "ENGINE_CRITERIA":         ("🔍", "criteria"),
+    "ENGINE_":                 ("🔬", "engine"),
+    # Risk
+    "RISK_HALT":               ("🚨", "HALT"),
+    "RISK_RESUME":             ("✅", "resume"),
+    "RISK_PARAM_UPDATE":       ("⚙️ ", "risk-param"),
+    "RISK_TRADE_OPEN":         ("📥", "trade-open"),
+    "RISK_TRADE_CLOSE":        ("📤", "trade-close"),
+    "RISK_":                   ("🛡 ", "risk"),
+    # Orders
+    "ORDER_ENTRY":             ("📋", "order-entry"),
+    "ORDER_EXIT":              ("📋", "order-exit"),
+    "ORDER_CANCEL":            ("✂️ ", "order-cancel"),
+    "ORDER_":                  ("📋", "order"),
+}
+
+
+def event_meta(event: str):
+    """Return (emoji, label) for the given event name."""
+    for prefix, meta in EVENT_META.items():
+        if event.startswith(prefix):
+            return meta
+    return ("•", event.lower())
+
+
 class _ELog:
     """Lightweight structured JSON event logger."""
 
