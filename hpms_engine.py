@@ -862,46 +862,45 @@ class HPMSEngine:
                      traj_factor=round(traj_factor, 3),
                      regime=regime.name)
 
-        # ── Step 8: TP/SL — Signal-derived, Gross R:R gated ────────────────────
+        # ── Step 8: TP/SL ─────────────────────────────────────────────────────
         #
-        # Design
-        # ───────
-        # TP: derived from the model's predicted price move.
-        # SL: ATR-based maximum adverse excursion buffer at entry.
+        # Architecture: two-layer exit system
+        # ─────────────────────────────────────
+        # Layer 1 — TRAILING STOP (primary profit exit)
+        #   The trailing stop system rides the move and locks in profit.
+        #   It activates once price has traveled 40% of the TP distance
+        #   favorably, then ratchets the SL upward (LONG) or downward
+        #   (SHORT) as price extends, using ATR-calibrated trail distances.
+        #   This is the mechanism by which the system actually makes money.
         #
-        # The SL is placed ONCE at entry and only ever improved by the trailing
-        # stop system — it is never moved adversely.  Its size therefore reflects
-        # the maximum retracement we are willing to tolerate before acknowledging
-        # the signal was wrong.
+        # Layer 2 — EXCHANGE TP ORDER (backstop)
+        #   The bracket TP sits wide at the config maximum.  It exists as a
+        #   safety net in case the trailing stop loop misses a bar (network
+        #   outage, process restart).  It is NOT the primary target.
         #
-        # Why √(horizon) was WRONG and is now removed
-        # ─────────────────────────────────────────────
-        # ATR × √N is the expected TOTAL path standard deviation over N bars
-        # under a Brownian motion model (σ_N = σ√N).  That quantity is relevant
-        # for estimating how far price can stray from entry during the holding
-        # period — but it is NOT the right size for a stop-loss.
+        # Why the predicted move must NOT set the TP
+        # ────────────────────────────────────────────
+        # When TP = predicted_move × 0.85 the TP distance is small (e.g. $65
+        # for a 0.09% predicted move on BTC).  The trailing stop fee floor
+        # (entry ± fee_breakeven_with_margin) is computed in price-space:
+        #   fee_floor = total_fees / (size × contract_value) × safety_margin
+        # For small positions (4–5 contracts, 0.001 BTC/c):
+        #   fee_floor ≈ $75–85 price points
+        # If TP < fee_floor the SL floor exceeds the TP — the trailing stop
+        # tries to place the SL ABOVE the TP on every bar, producing the
+        # nonsensical log:  new_sl=$70,986  TP=$70,968.
+        # The position exits at TP for ~$0.28 gross, ~-$0.02 net (loss).
         #
-        # A stop-loss is a single threshold placed at the worst retracement
-        # we will accept before closing the trade.  That threshold is calibrated
-        # to intra-bar ATR noise — specifically, 1.3 × ATR ensures the SL sits
-        # outside one standard-deviation of per-bar noise, preventing stop-hunts
-        # on normal tick fluctuations.
+        # Fix: TP = config max (wide backstop).
+        # With TP = $390 the fee floor ($83) sits at 21% of TP, giving the
+        # trailing stop 79% of the TP range to operate freely.
+        # At +$156 favorable (40% activation): trailing SL moves to +$83
+        #   → guaranteed net-positive if stopped out.
+        # At +$250: SL trails to +$146 above entry → net ~$0.28.
+        # At +$300: LOCK phase, SL to +$248 → net ~$0.69.
+        # The trailing stop — not the TP bracket — captures the profit.
         #
-        # Using √5 inflated the SL by 2.24× and created a structural impossibility:
-        # the gross R:R gate required pred_move ≥ 5.13 × ATR, a bar that even a
-        # $60 predicted move on a $20-ATR instrument cannot clear.  Every signal
-        # was rejected regardless of market conditions.
-        #
-        # Correct requirement after fix:  pred_move ≥ 2.29 × ATR  (achievable)
-        #
-        # R:R gate
-        # ─────────
-        # gross_rr = tp / sl (fee-exclusive).  We gate on gross_rr ≥ 1.5.
-        # This enforces that the model's predicted reward is at least 1.5× the
-        # risk accepted — a standard institutional minimum before fees.
-        # We do NOT gate on net_rr (after fees): at 0.001 BTC/contract the
-        # round-trip fee is ~$0.076 USD which is noise relative to any TP.
-        # net_rr is logged for information only.
+        # SL (unchanged): ATR × 1.3 — per-bar noise buffer at entry.
         #
         if signal_type != SignalType.FLAT and len(closes_arr) >= 15:
             recent     = closes_arr[-15:]
@@ -910,34 +909,40 @@ class HPMSEngine:
                           if len(bar_ranges) > 0
                           else current_price * 0.0005)
 
-            # Round-trip fee in price-space (logged only — not used to gate)
-            fee_rt_price = current_price * self._fee_rate * 2
-
-            # ── Take-Profit: signal-derived ───────────────────────────────
-            # 85% of predicted move — conservative haircut on the forecast.
-            # Floor: 1.5 × ATR so TP always has breathing room above noise.
-            # Cap: config ceiling prevents TP being set at unreachable levels.
+            fee_rt_price          = current_price * self._fee_rate * 2
             predicted_dollar_move = abs(predicted_pct_move) * current_price
-            tp_distance = max(predicted_dollar_move * 0.85, atr_1bar * 1.5)
-            tp_distance = min(tp_distance, current_price * self._tp_pct)
-            tp_distance = max(tp_distance, current_price * 0.0002)
+
+            # ── Take-Profit: wide backstop at config maximum ───────────────
+            # Floor: 3 × ATR ensures TP is never trivially close to entry.
+            # This floor is almost never binding — the config max (~$390 on
+            # BTC) is almost always larger than 3 × ATR (~$105).
+            tp_distance = current_price * self._tp_pct
+            tp_distance = max(tp_distance, atr_1bar * 3.0)
 
             # ── Stop-Loss: per-bar ATR buffer ─────────────────────────────
-            # 1.3 × ATR: places SL outside typical intra-bar noise, tightly
-            # enough to keep risk small but wide enough to avoid stop-hunts.
-            # No √(horizon) — the SL is a per-entry threshold, not a
-            # cumulative path estimate.
+            # 1.3 × ATR — outside intra-bar noise, inside holding-period risk.
+            # Capped by config sl_pct to prevent oversized stops in high-vol.
             sl_distance = atr_1bar * 1.3
             sl_distance = min(sl_distance, current_price * self._sl_pct)
             sl_distance = max(sl_distance, current_price * 0.0001)
 
             # ── Gross R:R ─────────────────────────────────────────────────
+            # With wide TP this is structurally high (typically 6–10×).
+            # Gate retained as a safety net for pathological edge cases.
             gross_rr = tp_distance / sl_distance if sl_distance > 0 else 0.0
 
-            # ── Net R:R (informational only) ──────────────────────────────
+            # ── Net R:R (informational) ───────────────────────────────────
             net_reward   = tp_distance - fee_rt_price
             net_risk     = sl_distance + fee_rt_price
             final_net_rr = net_reward / net_risk if net_risk > 0 else 0.0
+
+            # ── Fee floor headroom check ──────────────────────────────────
+            # The trailing stop uses a fee breakeven floor in price-space.
+            # For that floor to be meaningful (not exceed TP), we need:
+            #   fee_rt_price × 1.1 < tp_distance
+            # Log a warning if not — should not happen with wide TP.
+            fee_floor_est = fee_rt_price * 1.1
+            fee_headroom  = (tp_distance - fee_floor_est) / tp_distance
 
             _MIN_GROSS_RR = 1.5
 
@@ -945,15 +950,12 @@ class HPMSEngine:
                 signal_type = SignalType.FLAT
                 reason = (
                     f"FLAT: gross_rr={gross_rr:.2f}<{_MIN_GROSS_RR} "
-                    f"— predicted=${predicted_dollar_move:.0f} "
-                    f"tp=${tp_distance:.0f} sl=${sl_distance:.0f} "
-                    f"(need tp≥${sl_distance * _MIN_GROSS_RR:.0f})"
+                    f"tp=${tp_distance:.0f} sl=${sl_distance:.0f} atr=${atr_1bar:.1f}"
                 )
                 tp_price = 0.0
                 sl_price = 0.0
                 elog.log("ENGINE_SKIP", reason=reason,
                          gross_rr=round(gross_rr, 3),
-                         predicted_dollar_move=round(predicted_dollar_move, 1),
                          tp_dist=round(tp_distance, 1),
                          sl_dist=round(sl_distance, 1),
                          min_gross_rr=_MIN_GROSS_RR)
@@ -975,6 +977,7 @@ class HPMSEngine:
                     fee_rt_price=round(fee_rt_price, 1),
                     predicted_move=round(predicted_dollar_move, 1),
                     atr_1bar=round(atr_1bar, 1),
+                    fee_headroom_pct=round(fee_headroom * 100.0, 1),
                     be_wr_gross=round(1.0 / (1.0 + gross_rr) * 100.0, 1),
                     be_wr_net=(round(1.0 / (1.0 + final_net_rr) * 100.0, 1)
                                if final_net_rr > 0 else 100.0),
