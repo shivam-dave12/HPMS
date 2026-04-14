@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 
+from logger_core import elog
+
 logger = logging.getLogger(__name__)
 
 
@@ -36,7 +38,7 @@ class TradeRecord:
 
 
 class RiskManager:
-    """Real-time risk engine. All checks are thread-safe."""
+    """Real-time risk engine.  All state mutations are thread-safe (RLock)."""
 
     def __init__(
         self,
@@ -49,7 +51,7 @@ class RiskManager:
         cooldown_seconds:        float = 30.0,
         max_drawdown_pct:        float = 5.0,
         equity_pct_per_trade:    float = 2.0,
-        auto_resume_seconds:     float = 300.0,
+        auto_resume_seconds:     float = 600.0,
         soft_loss_weight:        float = 0.5,
     ):
         self._max_pos_usd       = max_position_usd
@@ -70,17 +72,15 @@ class RiskManager:
         self._last_trade_time:   float = 0.0
         self._is_halted:         bool  = False
         self._halt_reason:       str   = ""
-        self._halt_time:         float = 0.0   # when halt was triggered
+        self._halt_time:         float = 0.0   # unix ts when halt fired
         self._day_start:         str   = ""
         self._open_trade:        Optional[TradeRecord] = None
 
-        # Auto-resume: CONSECUTIVE_LOSSES halts auto-clear after this many seconds.
-        # Prevents the bot from staying dead for hours over tiny losses.
+        # Auto-resume: CONSECUTIVE_LOSSES / MAX_DRAWDOWN halts auto-clear
+        # after this many seconds.  DAILY_ halts persist until new day.
         self._auto_resume_seconds: float = auto_resume_seconds
 
-        # Graduated cooldown: cooldown increases after consecutive losses.
-        # Base cooldown is self._base_cooldown; actual = base * (1 + consec_losses * 0.5)
-        # So after 3 consecutive losses: cooldown = 10 * (1 + 1.5) = 25s
+        # Graduated cooldown: actual cooldown = base × (1 + consec_losses × 0.5)
         self._base_cooldown:     float = cooldown_seconds
 
         # Loss classification: forced exits (ENERGY_SPIKE, MAX_HOLD) count as
@@ -91,7 +91,7 @@ class RiskManager:
         self._notify_fn: Optional[Callable[[str], None]] = None
 
         self._reset_if_new_day()
-        logger.info("RiskManager initialized")
+        logger.info("RiskManager initialised")
 
     def set_notify_fn(self, fn: Callable[[str], None]):
         """Wire in Telegram send_message so halts push immediately."""
@@ -108,26 +108,34 @@ class RiskManager:
 
     def _reset_if_new_day(self):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        if today != self._day_start:
-            prev_day = self._day_start
-            self._day_start          = today
-            self._trades_today       = []
-            self._daily_pnl          = 0.0
-            self._total_fees         = 0.0
-            self._session_high_pnl   = 0.0
-            self._consecutive_losses = 0
-            # Clear ALL halts on new day — not just DAILY ones.
-            # CONSECUTIVE_LOSSES halts were surviving midnight and blocking
-            # the bot for 7+ hours even after the conditions that caused
-            # the losses (e.g. ENERGY_SPIKE bug) were long gone.
-            if self._is_halted:
-                old_reason = self._halt_reason
-                self._is_halted   = False
-                self._halt_reason = ""
-                logger.info(f"Daily reset cleared halt: {old_reason}")
-            logger.info(f"RiskManager daily reset → {today} (was {prev_day})")
-            if prev_day:  # don't notify on first init
-                self._notify(f"🗓 *Daily Reset* — new trading day: `{today}` (all halts cleared)")
+        if today == self._day_start:
+            return
+
+        prev_day = self._day_start
+        self._day_start          = today
+        self._trades_today       = []
+        self._daily_pnl          = 0.0
+        self._total_fees         = 0.0
+        self._session_high_pnl   = 0.0
+        self._consecutive_losses = 0
+
+        # Clear ALL halts on new day — not just DAILY ones.
+        # CONSECUTIVE_LOSSES halts were surviving midnight and blocking
+        # the bot for 7+ hours even after the root cause was long gone.
+        if self._is_halted:
+            old_reason        = self._halt_reason
+            self._is_halted   = False
+            self._halt_reason = ""
+            logger.info("Daily reset cleared halt: %s", old_reason)
+
+        logger.info("RiskManager daily reset → %s (was %s)", today, prev_day or "init")
+        elog.log("SYSTEM_DAILY_RESET", new_day=today, prev_day=prev_day or "init")
+
+        if prev_day:  # don't notify on first init
+            self._notify(
+                f"🗓 *Daily Reset* — `{today}`\n"
+                f"All halts cleared.  Counters zeroed.  Trading resumes."
+            )
 
     # ─── PRE-TRADE CHECKS ────────────────────────────────────────────────────
 
@@ -136,9 +144,9 @@ class RiskManager:
             self._reset_if_new_day()
 
             # ── Auto-resume from timed halts ──────────────────────────────────
-            # CONSECUTIVE_LOSSES and MAX_DRAWDOWN halts auto-clear after a pause.
+            # CONSECUTIVE_LOSSES and MAX_DRAWDOWN auto-clear after a pause.
             # DAILY_LOSS_LIMIT and DAILY_TRADE_LIMIT remain until new day.
-            # MANUAL/TELEGRAM halts remain until explicit /resume.
+            # MANUAL / TELEGRAM halts remain until explicit /resume.
             if self._is_halted:
                 auto_resumable = self._halt_reason in (
                     "CONSECUTIVE_LOSSES", "MAX_DRAWDOWN",
@@ -146,18 +154,22 @@ class RiskManager:
                 if auto_resumable and self._halt_time > 0:
                     elapsed_halt = time.time() - self._halt_time
                     if elapsed_halt >= self._auto_resume_seconds:
-                        old_reason = self._halt_reason
+                        old_reason               = self._halt_reason
                         self._is_halted          = False
                         self._halt_reason        = ""
                         self._consecutive_losses = 0
+                        elapsed_min              = elapsed_halt / 60
                         logger.info(
-                            f"⏰ Auto-resumed from {old_reason} after "
-                            f"{elapsed_halt:.0f}s pause"
+                            "⏰ Auto-resumed from %s after %.1f min pause",
+                            old_reason, elapsed_min,
                         )
+                        elog.log("RISK_RESUME", reason=old_reason,
+                                 pause_min=round(elapsed_min, 1))
                         self._notify(
-                            f"⏰ *Auto-resumed* from `{old_reason}` "
-                            f"after {elapsed_halt/60:.1f} min pause\n"
-                            f"Consecutive losses reset. Trading resumes."
+                            f"⏰ *Auto-resumed* from `{old_reason}`\n"
+                            f"Pause: `{elapsed_min:.1f}` min  │  "
+                            f"Consecutive losses reset to `0`\n"
+                            f"_Trading resumes on next signal._"
                         )
                     else:
                         remaining = self._auto_resume_seconds - elapsed_halt
@@ -172,8 +184,6 @@ class RiskManager:
                 return False, "POSITION_OPEN"
 
             # ── Graduated cooldown ────────────────────────────────────────────
-            # Cooldown increases with consecutive losses to slow down during
-            # losing streaks without hard-halting.
             effective_cooldown = self._base_cooldown * (
                 1.0 + self._consecutive_losses * 0.5
             )
@@ -187,7 +197,9 @@ class RiskManager:
 
             if len(self._trades_today) >= self._max_daily_trades:
                 self._halt("DAILY_TRADE_LIMIT")
-                return False, f"DAILY_TRADE_LIMIT: {len(self._trades_today)}/{self._max_daily_trades}"
+                return False, (
+                    f"DAILY_TRADE_LIMIT: {len(self._trades_today)}/{self._max_daily_trades}"
+                )
 
             if self._daily_pnl <= -self._max_daily_loss:
                 self._halt("DAILY_LOSS_LIMIT")
@@ -198,11 +210,14 @@ class RiskManager:
                 return False, f"CONSEC_LOSSES: {self._consecutive_losses}"
 
             # ── Drawdown check (equity-relative) ──────────────────────────────
-            # Old bug: drawdown was calculated as % of session_high_pnl.
-            # A $0.50 high followed by $0.49 drop = 98% "drawdown".
-            # Fix: only trigger if session_high_pnl is meaningful (> $1).
+            # Only trigger if session_high_pnl is meaningful (> $1).
+            # A $0.50 session high followed by a $0.49 pullback would otherwise
+            # read as ~98% "drawdown" — a nonsensical false trigger.
             if self._session_high_pnl > 1.0:
-                dd = (self._session_high_pnl - self._daily_pnl) / self._session_high_pnl * 100
+                dd = (
+                    (self._session_high_pnl - self._daily_pnl)
+                    / self._session_high_pnl * 100
+                )
                 if dd > self._max_dd_pct:
                     self._halt("MAX_DRAWDOWN")
                     return False, f"DRAWDOWN: {dd:.1f}%"
@@ -210,87 +225,111 @@ class RiskManager:
             return True, "OK"
 
     def _halt(self, reason: str):
+        """Internal halt — updates state and fires push notification."""
         self._is_halted   = True
         self._halt_reason = reason
         self._halt_time   = time.time()
-        logger.warning(f"⛔ RiskManager HALTED: {reason}")
+
+        logger.warning("⛔ RiskManager HALTED: %s", reason)
+        elog.log("RISK_HALT", reason=reason,
+                 daily_pnl=self._daily_pnl,
+                 consecutive_losses=self._consecutive_losses,
+                 trades_today=len(self._trades_today))
 
         auto_resumable = reason in ("CONSECUTIVE_LOSSES", "MAX_DRAWDOWN")
-        resume_note = (
-            f"\n⏰ Auto-resume in {self._auto_resume_seconds/60:.0f} min"
-            if auto_resumable else
-            "\nUse /resume to reset or /halt for emergency flatten"
+
+        # Build a precise breach line for each halt type
+        if reason == "CONSECUTIVE_LOSSES":
+            breach_line = (
+                f"   Consecutive losses: `{self._consecutive_losses}` "
+                f"/ limit `{self._max_consec_losses}`"
+            )
+        elif reason == "MAX_DRAWDOWN":
+            dd = (
+                (self._session_high_pnl - self._daily_pnl)
+                / self._session_high_pnl * 100
+                if self._session_high_pnl > 0 else 0.0
+            )
+            breach_line = (
+                f"   Drawdown: `{dd:.1f}%` / limit `{self._max_dd_pct}%`\n"
+                f"   Session high: `${self._session_high_pnl:+.4f}` → "
+                f"now: `${self._daily_pnl:+.4f}`"
+            )
+        elif reason == "DAILY_LOSS_LIMIT":
+            breach_line = (
+                f"   Daily loss: `${self._daily_pnl:+.4f}` "
+                f"/ limit `$-{self._max_daily_loss:.2f}`"
+            )
+        elif reason == "DAILY_TRADE_LIMIT":
+            breach_line = (
+                f"   Trades today: `{len(self._trades_today)}` "
+                f"/ limit `{self._max_daily_trades}`"
+            )
+        else:
+            breach_line = f"   Reason: `{reason}`"
+
+        resume_line = (
+            f"⏰ Auto-resume in `{self._auto_resume_seconds / 60:.0f}` min"
+            if auto_resumable
+            else "_Use /resume to clear  │  /halt to emergency flatten_"
         )
+
         self._notify(
             f"⛔ *RISK HALT: {reason}*\n"
-            f"Daily PnL: `${self._daily_pnl:+.2f}`\n"
-            f"Trades today: `{len(self._trades_today)}`\n"
-            f"Consec losses: `{self._consecutive_losses}`"
-            f"{resume_note}"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💥 *Breach:*\n{breach_line}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 *Session at halt:*\n"
+            f"   Trades: `{len(self._trades_today)}`  │  "
+            f"Net P&L: `${self._daily_pnl:+.4f}`\n"
+            f"   Fees: `$-{self._total_fees:.4f}`  │  "
+            f"High: `${self._session_high_pnl:+.4f}`\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{resume_line}"
         )
 
     # ─── POSITION SIZING ─────────────────────────────────────────────────────
 
-    def compute_size(self, price: float, equity_usd: float,
-                     contract_value: float = 0.001,
-                     sl_pct: float = 0.0,
-                     confidence: float = 1.0,
-                     norm_vol: float = 0.0) -> int:
+    def compute_size(
+        self,
+        price:          float,
+        equity_usd:     float,
+        contract_value: float = 0.001,
+        sl_pct:         float = 0.0,
+        confidence:     float = 1.0,
+        norm_vol:       float = 0.0,
+    ) -> int:
         """
         Compute position size — margin-bounded, confidence-weighted, vol-normalised.
 
-        Sizing hierarchy (each step can only reduce the result, never increase it):
+        Sizing hierarchy (each step can only REDUCE the result, never increase it):
 
-        1. MARGIN CAP  — hard physical ceiling: how many contracts can exchange
-                         margin support at current equity and leverage.
-                         max_by_margin = floor(equity × leverage / (price × cv))
+        1. MARGIN CAP  — hard physical ceiling:
+                         max_by_margin = floor(equity × 0.95 × leverage / (price × cv))
                          This is computed first and is never violated.
 
         2. RISK BUDGET — Kelly-style: how many contracts keep the dollar loss on
                          a SL hit within equity_pct% of equity.
-                         base_size = (equity × equity_pct%) / (price × sl_pct × cv)
-                         When sl_pct = 0, falls back to notional-based sizing.
 
-        3. CONFIDENCE  — scale the risk-budget size proportionally to signal
-                         confidence, bounded to [50%, 100%] of the margin cap.
-                         conf_scale ∈ [0.50, 1.00] applied to the margin cap target.
+        3. CONFIDENCE  — scale within [50%, 100%] of the margin cap target.
 
         4. VOL SCALE   — inverse-vol targeting: reduces size in high-vol regimes.
 
         5. HARD CAPS   — max_pos_contracts, max_pos_usd (from config).
-
-        Why the old code was wrong
-        ──────────────────────────
-        Previously compute_size had no margin cap.  The sl_pct path computed
-        contracts purely from the risk budget and then capped at max_pos_contracts
-        (100).  When sl_pct was small (tight SL relative to a volatile instrument),
-        the risk-budget formula produced more contracts than the available margin
-        could support.  The result was passed to strategy.py, where the preflight
-        check detected the over-sizing and skipped the entire signal — even though
-        the signal itself was valid.  Every signal that fired with a tight SL and
-        high confidence was silently discarded.
-
-        The fix: compute the margin cap first, apply it as a hard ceiling, then
-        use confidence to scale within [50%, 100%] of that ceiling.  The preflight
-        check in strategy.py becomes a pure safety net that should never trigger.
         """
         with self._lock:
             if price <= 0 or contract_value <= 0 or equity_usd <= 0:
                 return 1
 
-            # ── Step 1: Margin cap — never violate available margin ───────────
-            # The exchange requires margin = notional / leverage per contract.
-            # We use 95% of available equity to leave a small buffer.
+            # ── Step 1: Margin cap ────────────────────────────────────────────
             max_by_margin = max(
                 1,
                 int(equity_usd * 0.95 * self._leverage / (price * contract_value))
             )
 
             # ── Step 2: Confidence scaling within margin cap ──────────────────
-            # conf_scale ∈ [0.50, 1.00]: at minimum confidence trade half the
-            # margin cap; at maximum confidence use the full cap.
-            # Deliberately capped at 1.0 (not 1.5) because the margin cap is
-            # already the physical limit — we cannot go above it.
+            # conf_scale ∈ [0.50, 1.00]: at minimum confidence → half the margin cap;
+            # at maximum confidence → full cap.
             conf_scale = max(0.50, min(1.00, confidence))
 
             # ── Step 3: Volatility normalisation ─────────────────────────────
@@ -298,22 +337,19 @@ class RiskManager:
             if norm_vol > 0:
                 vol_target = 0.001   # baseline: 0.1% per bar
                 vol_scale  = min(1.0, max(0.3, vol_target / norm_vol))
-                # Capped at 1.0 upward — never increases beyond margin cap
 
             # ── Step 4: Risk-budget sizing (Kelly-style) ──────────────────────
-            # Independently computes the number of contracts such that a full
-            # SL hit costs at most equity_pct% of equity.
             risk_usd = equity_usd * (self._equity_pct / 100.0)
 
             if sl_pct > 0:
-                per_contract_sl_loss = price * sl_pct * contract_value
+                per_contract_sl_loss  = price * sl_pct * contract_value
                 risk_budget_contracts = (
                     int(risk_usd / per_contract_sl_loss)
                     if per_contract_sl_loss > 0 else max_by_margin
                 )
             else:
                 # Fallback: notional-based sizing
-                notional = min(risk_usd * self._leverage, self._max_pos_usd)
+                notional              = min(risk_usd * self._leverage, self._max_pos_usd)
                 per_contract_notional = contract_value * price
                 risk_budget_contracts = (
                     int(notional / per_contract_notional)
@@ -321,32 +357,35 @@ class RiskManager:
                 )
 
             # ── Step 5: Combine all constraints ──────────────────────────────
-            # Target = margin_cap × confidence × vol_scale, further bounded by
-            # the risk budget (we never risk more per-trade than equity_pct%).
-            target = int(max_by_margin * conf_scale * vol_scale)
+            target    = int(max_by_margin * conf_scale * vol_scale)
             contracts = min(target, risk_budget_contracts, self._max_pos_contracts)
 
             # Notional cap: never exceed max_pos_usd total exposure
-            max_by_notional = int(self._max_pos_usd / (price * contract_value)) if price > 0 else contracts
+            max_by_notional = (
+                int(self._max_pos_usd / (price * contract_value))
+                if price > 0 else contracts
+            )
             contracts = min(contracts, max_by_notional)
 
             # Floor at 1 — always take at least one contract if cleared to trade
             contracts = max(contracts, 1)
 
-            # Final sanity: enforce margin cap one last time (guards against any
-            # edge case where the intermediate arithmetic drifted above it)
+            # Final sanity: re-enforce margin cap (guards any edge-case drift)
             contracts = min(contracts, max_by_margin)
 
             logger.debug(
                 "Size: equity=$%.2f lev=%dx max_margin=%dc "
                 "risk_budget=%dc conf=%.0f%% conf_scale=%.2f "
-                "vol_scale=%.2f → %dc "
-                "(margin_req=$%.2f)",
+                "vol_scale=%.2f → %dc (margin_req=$%.2f)",
                 equity_usd, self._leverage, max_by_margin,
                 risk_budget_contracts, confidence * 100, conf_scale,
                 vol_scale, contracts,
                 price * contract_value * contracts / self._leverage,
             )
+            elog.log("RISK_SIZE",
+                     max_margin=max_by_margin, risk_budget=risk_budget_contracts,
+                     confidence=confidence, vol_scale=round(vol_scale, 3),
+                     result=contracts)
             return contracts
 
     # ─── TRADE LIFECYCLE ──────────────────────────────────────────────────────
@@ -355,8 +394,9 @@ class RiskManager:
                       margin_used: float = 0.0):
         with self._lock:
             self._open_trade = TradeRecord(
-                timestamp=time.time(), side=side, entry_price=entry_price,
-                size=size, margin_used=margin_used,
+                timestamp=time.time(), side=side,
+                entry_price=entry_price, size=size,
+                margin_used=margin_used,
             )
             self._last_trade_time = time.time()
 
@@ -364,32 +404,44 @@ class RiskManager:
                        fees: float, net_pnl: float,
                        hold_bars: int, reason: str):
         with self._lock:
-            if self._open_trade:
-                self._open_trade.exit_price = exit_price
-                self._open_trade.gross_pnl  = gross_pnl
-                self._open_trade.fees_usd   = fees
-                self._open_trade.net_pnl    = net_pnl
-                self._open_trade.hold_bars  = hold_bars
-                self._open_trade.reason     = reason
-                self._open_trade.closed     = True
-                self._trades_today.append(self._open_trade)
-                self._open_trade = None
+            # Guard against double-call (race condition where exchange WebSocket
+            # fill event and strategy close callback both fire).
+            # Bug fix: previously PnL counters updated even when _open_trade was
+            # None, causing inflated daily_pnl and incorrect halt triggers.
+            if self._open_trade is None:
+                logger.warning(
+                    "on_trade_close called with no open trade record "
+                    "(possible double-close) — reason=%s  net_pnl=%.4f  IGNORED",
+                    reason, net_pnl,
+                )
+                return
 
-            # Track daily PnL using NET (after fees) — this is real money
+            self._open_trade.exit_price = exit_price
+            self._open_trade.gross_pnl  = gross_pnl
+            self._open_trade.fees_usd   = fees
+            self._open_trade.net_pnl    = net_pnl
+            self._open_trade.hold_bars  = hold_bars
+            self._open_trade.reason     = reason
+            self._open_trade.closed     = True
+            self._trades_today.append(self._open_trade)
+            self._open_trade = None
+
+            # Track daily PnL using NET (after fees) — real money
             self._daily_pnl        += net_pnl
             self._total_fees       += fees
             self._session_high_pnl  = max(self._session_high_pnl, self._daily_pnl)
 
             if net_pnl < 0:
-                is_forced = any(tag in reason for tag in (
-                    "ENERGY_SPIKE", "MAX_HOLD", "SHUTDOWN", "TELEGRAM",
-                ))
+                is_forced = any(
+                    tag in reason
+                    for tag in ("ENERGY_SPIKE", "MAX_HOLD", "SHUTDOWN", "TELEGRAM")
+                )
                 if is_forced:
                     self._consecutive_losses += self._soft_loss_weight
-                    self._consecutive_losses = round(self._consecutive_losses, 1)
+                    self._consecutive_losses  = round(self._consecutive_losses, 1)
                     logger.info(
-                        f"Soft loss ({reason}): consec_losses={self._consecutive_losses} "
-                        f"(weighted +{self._soft_loss_weight})"
+                        "Soft loss (%s): consec_losses=%.1f (+%.1f)",
+                        reason, self._consecutive_losses, self._soft_loss_weight,
                     )
                 else:
                     self._consecutive_losses += 1
@@ -403,22 +455,24 @@ class RiskManager:
     # ─── EXIT CONDITIONS ──────────────────────────────────────────────────────
 
     def check_exit_conditions(
-        self, dH_dt: float, dH_dt_spike: float, bars_held: int,
-        max_hold: int = 0,
+        self,
+        dH_dt:       float,
+        dH_dt_spike: float,
+        bars_held:   int,
+        max_hold:    int = 0,
     ) -> Optional[str]:
         """
         Check exit conditions.
 
-        With the trailing stop system, the ONLY forced exit reasons are:
-          1. Energy spike (Hamiltonian instability)
-          2. Absolute safety ceiling (120 bars) — but ONLY if profitable
+        With the trailing stop system, the ONLY forced exit reason is:
+          1. Energy spike (Hamiltonian instability — |dH/dt| > adaptive threshold)
+          2. Absolute safety ceiling (120 bars) — handled in strategy, only if profitable.
 
-        Time-based exits are GONE. The trailing stop handles profit
-        protection by moving the SL on the exchange.
+        Time-based exits are removed.  The trailing stop protects profit by
+        ratcheting the SL on the exchange.
         """
-        # ── Energy spike (unchanged) ─────────────────────────────────────
         if abs(dH_dt) > dH_dt_spike:
-            return f"ENERGY_SPIKE: |dH/dt|={abs(dH_dt):.4f} > {dH_dt_spike}"
+            return f"ENERGY_SPIKE: |dH/dt|={abs(dH_dt):.4f} > {dH_dt_spike:.4f}"
         return None
 
     # ─── CONTROLS ─────────────────────────────────────────────────────────────
@@ -429,37 +483,47 @@ class RiskManager:
 
     def resume(self) -> str:
         with self._lock:
-            was = self._halt_reason
+            was                      = self._halt_reason
             self._is_halted          = False
             self._halt_reason        = ""
             self._halt_time          = 0.0
             self._consecutive_losses = 0
-            logger.info(f"RiskManager resumed (was halted: {was})")
-            self._notify(f"✅ *Risk resumed* (was: `{was}`) — consecutive losses reset")
+            logger.info("RiskManager resumed (was halted: %s)", was)
+            elog.log("RISK_RESUME", was=was, note="manual_resume")
+            self._notify(
+                f"✅ *Risk resumed*\n"
+                f"Was halted: `{was or 'none'}`\n"
+                f"Consecutive losses → `0`\n"
+                f"_Use /start\\_trading to re-enable the strategy._"
+            )
             return was
 
     def update_param(self, key: str, value) -> bool:
         _MAP = {
-            "max_position_usd":       ("_max_pos_usd",       float),
-            "max_position_contracts": ("_max_pos_contracts",  int),
-            "leverage":               ("_leverage",           int),
-            "max_daily_loss_usd":     ("_max_daily_loss",     float),
-            "max_daily_trades":       ("_max_daily_trades",   int),
-            "max_consecutive_losses": ("_max_consec_losses",  int),
-            "cooldown_seconds":       ("_base_cooldown",      float),
-            "max_drawdown_pct":       ("_max_dd_pct",         float),
-            "equity_pct_per_trade":   ("_equity_pct",         float),
+            "max_position_usd":       ("_max_pos_usd",         float),
+            "max_position_contracts": ("_max_pos_contracts",   int),
+            "leverage":               ("_leverage",            int),
+            "max_daily_loss_usd":     ("_max_daily_loss",      float),
+            "max_daily_trades":       ("_max_daily_trades",    int),
+            "max_consecutive_losses": ("_max_consec_losses",   int),
+            "cooldown_seconds":       ("_base_cooldown",       float),
+            "max_drawdown_pct":       ("_max_dd_pct",          float),
+            "equity_pct_per_trade":   ("_equity_pct",          float),
             "auto_resume_seconds":    ("_auto_resume_seconds", float),
-            "soft_loss_weight":       ("_soft_loss_weight",   float),
+            "soft_loss_weight":       ("_soft_loss_weight",    float),
         }
         if key not in _MAP:
             return False
         attr, typ = _MAP[key]
         try:
-            setattr(self, attr, typ(value))
-            logger.info(f"Risk param updated: {key} = {value}")
+            old_val = getattr(self, attr)
+            new_val = typ(value)
+            setattr(self, attr, new_val)
+            logger.info("Risk param updated: %s = %s (was %s)", key, new_val, old_val)
+            elog.log("RISK_PARAM_UPDATE", key=key, old=str(old_val), new=str(new_val))
             return True
-        except Exception:
+        except Exception as e:
+            logger.warning("Risk param update failed: %s = %s — %s", key, value, e)
             return False
 
     # ─── STATUS ───────────────────────────────────────────────────────────────
@@ -468,12 +532,10 @@ class RiskManager:
         with self._lock:
             self._reset_if_new_day()
 
-            # Compute effective cooldown with graduated scaling
             effective_cooldown = self._base_cooldown * (
                 1.0 + self._consecutive_losses * 0.5
             )
 
-            # Auto-resume remaining time
             auto_resume_remaining = 0.0
             if self._is_halted and self._halt_time > 0:
                 auto_resumable = self._halt_reason in (
@@ -485,13 +547,12 @@ class RiskManager:
                         0.0, self._auto_resume_seconds - elapsed_halt
                     )
 
-            # Compute daily gross PnL (before fees)
             daily_gross = sum(t.gross_pnl for t in self._trades_today)
 
             return {
                 "is_halted":          self._is_halted,
                 "halt_reason":        self._halt_reason,
-                "daily_pnl":          round(self._daily_pnl, 4),      # net (after fees)
+                "daily_pnl":          round(self._daily_pnl, 4),
                 "daily_gross_pnl":    round(daily_gross, 4),
                 "daily_fees":         round(self._total_fees, 4),
                 "session_high_pnl":   round(self._session_high_pnl, 4),
@@ -499,21 +560,23 @@ class RiskManager:
                 "consecutive_losses": self._consecutive_losses,
                 "last_trade_time":    self._last_trade_time,
                 "open_trade":         bool(self._open_trade and not self._open_trade.closed),
-                "cooldown_remaining": max(0.0, effective_cooldown - (time.time() - self._last_trade_time)),
+                "cooldown_remaining": max(
+                    0.0, effective_cooldown - (time.time() - self._last_trade_time)
+                ),
                 "auto_resume_remaining": round(auto_resume_remaining, 0),
                 "params": {
-                    "max_pos_usd":       self._max_pos_usd,
-                    "max_pos_contracts": self._max_pos_contracts,
-                    "leverage":          self._leverage,
-                    "max_daily_loss":    self._max_daily_loss,
-                    "max_daily_trades":  self._max_daily_trades,
-                    "max_consec_losses": self._max_consec_losses,
-                    "cooldown":          self._base_cooldown,
-                    "effective_cooldown": effective_cooldown,
-                    "max_dd_pct":        self._max_dd_pct,
-                    "equity_pct":        self._equity_pct,
-                    "auto_resume_sec":   self._auto_resume_seconds,
-                    "soft_loss_weight":  self._soft_loss_weight,
+                    "max_pos_usd":        self._max_pos_usd,
+                    "max_pos_contracts":  self._max_pos_contracts,
+                    "leverage":           self._leverage,
+                    "max_daily_loss":     self._max_daily_loss,
+                    "max_daily_trades":   self._max_daily_trades,
+                    "max_consec_losses":  self._max_consec_losses,
+                    "cooldown":           self._base_cooldown,
+                    "effective_cooldown": round(effective_cooldown, 1),
+                    "max_dd_pct":         self._max_dd_pct,
+                    "equity_pct":         self._equity_pct,
+                    "auto_resume_sec":    self._auto_resume_seconds,
+                    "soft_loss_weight":   self._soft_loss_weight,
                 },
             }
 
@@ -521,14 +584,18 @@ class RiskManager:
         with self._lock:
             return [
                 {
-                    "time":      datetime.fromtimestamp(t.timestamp, tz=timezone.utc).strftime("%H:%M:%S"),
+                    "time":      datetime.fromtimestamp(
+                        t.timestamp, tz=timezone.utc
+                    ).strftime("%H:%M:%S"),
                     "side":      t.side,
                     "entry":     t.entry_price,
                     "exit":      t.exit_price,
                     "gross_pnl": round(t.gross_pnl, 4),
                     "fees":      round(t.fees_usd, 4),
                     "net_pnl":   round(t.net_pnl, 4),
-                    "roe_pct":   round(t.net_pnl / t.margin_used * 100, 2) if t.margin_used > 0 else 0.0,
+                    "roe_pct":   round(
+                        t.net_pnl / t.margin_used * 100, 2
+                    ) if t.margin_used > 0 else 0.0,
                     "bars":      t.hold_bars,
                     "size":      t.size,
                     "reason":    t.reason,

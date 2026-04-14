@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+import logging.handlers
 import signal
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -60,9 +62,8 @@ class _ColoredFormatter(logging.Formatter):
     _RESET   = "\033[0m"
     _BOLD    = "\033[1m"
     _DIM     = "\033[2m"
-    _ITALIC  = "\033[3m"
 
-    # (color, bold-label, dim-label)
+    # (color, bold-label, dim-bullet)
     _LEVELS = {
         logging.DEBUG:    ("\033[36m",  "DBG", "·"),   # cyan
         logging.INFO:     ("\033[32m",  "INF", "▸"),   # green
@@ -96,7 +97,7 @@ class _ColoredFormatter(logging.Formatter):
         ts = self.formatTime(record, "%H:%M:%S")
         ms = f"{record.msecs:03.0f}"
 
-        # ── Highlight WARNING / ERROR lines with a leading accent bar ─────────
+        # Highlight WARNING / ERROR lines with a leading accent bar
         accent = ""
         if record.levelno >= logging.WARNING:
             accent = f"{color}▌{self._RESET} "
@@ -110,7 +111,6 @@ class _ColoredFormatter(logging.Formatter):
         )
 
         msg = record.getMessage()
-        # Indent continuation lines to align under the message start
         msg_indented = msg.replace("\n", "\n" + self._INDENT)
 
         if record.exc_info:
@@ -119,31 +119,56 @@ class _ColoredFormatter(logging.Formatter):
         return header + msg_indented
 
 
+class _PlainFormatter(logging.Formatter):
+    """Plain formatter for file output — no ANSI codes, full timestamps."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        ts  = datetime.fromtimestamp(record.created, tz=timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S.%f"
+        )[:-3]  # trim to ms
+        return (
+            f"{ts} UTC  {record.levelname:<8}  "
+            f"{record.name:<35}  {record.getMessage()}"
+        )
+
+
 def setup_logging():
     root = logging.getLogger()
     root.setLevel(getattr(logging, config.LOG_LEVEL, logging.DEBUG))
 
+    # ── Console handler (colored) ─────────────────────────────────────────────
     ch = logging.StreamHandler()
     ch.setFormatter(_ColoredFormatter())
-    ch.setLevel(logging.DEBUG)          # handler must not re-filter below root
+    ch.setLevel(logging.DEBUG)
     root.addHandler(ch)
 
+    # ── Rotating file handler (plain text, 10 MB × 5 files) ──────────────────
+    log_dir = Path(__file__).parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+    fh = logging.handlers.RotatingFileHandler(
+        log_dir / "hpms.log",
+        maxBytes=10 * 1024 * 1024,   # 10 MB
+        backupCount=5,
+        encoding="utf-8",
+    )
+    fh.setFormatter(_PlainFormatter())
+    fh.setLevel(logging.DEBUG)
+    root.addHandler(fh)
+
     # ── hpms.elog: ALWAYS at DEBUG regardless of LOG_LEVEL ───────────────────
-    # elog emits structured one-liners for every engine calculation (ENGINE_PHASE_STATE,
-    # ENGINE_CRITERIA, ENGINE_TRAJECTORY, ENGINE_KDE_REBUILD, ENGINE_SIGNAL,
-    # ENGINE_SKIP).  Without an explicit DEBUG level on this logger the
-    # isEnabledFor(DEBUG) guard evaluates False at INFO, silently dropping all
-    # per-bar diagnostics.
+    # elog emits structured one-liners for every engine calculation.
+    # Without an explicit DEBUG level on this logger the isEnabledFor(DEBUG)
+    # guard silently drops all ENGINE_/RISK_/ORDER_ events at LOG_LEVEL=INFO.
     logging.getLogger("hpms.elog").setLevel(logging.DEBUG)
 
     # ── Silence noisy third-party loggers ────────────────────────────────────
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-    logging.getLogger("telegram").setLevel(logging.WARNING)
-    logging.getLogger("telegram.ext").setLevel(logging.WARNING)
-    logging.getLogger("apscheduler").setLevel(logging.WARNING)
-    logging.getLogger("websocket").setLevel(logging.WARNING)
-    logging.getLogger("websockets").setLevel(logging.WARNING)
+    for name in (
+        "httpx", "httpcore", "telegram", "telegram.ext",
+        "apscheduler", "websocket", "websockets",
+    ):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+    logger.info("Logging initialised — console + rotating file (%s)", log_dir / "hpms.log")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -151,32 +176,45 @@ def setup_logging():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class DryRunAPI:
-    """Simulates API calls without touching the exchange."""
+    """
+    Wraps the real DeltaAPI, passing through all read-only calls and
+    simulating write calls (order placement, cancellation, leverage set) so
+    the full code path can be exercised without touching the exchange.
+    """
+
+    # Class-level constant — built once, not rebuilt on every __getattr__ call.
+    # Bug fix: the old code reconstructed this set inside __getattr__ on every
+    # attribute access (every API call), which is wasteful and error-prone.
+    _READ_METHODS: frozenset[str] = frozenset({
+        "get_ticker", "get_tickers", "get_orderbook", "get_candles",
+        "get_balance", "get_positions", "get_position", "get_open_orders",
+        "get_product_id", "prefetch_product_ids", "get_server_time",
+        "get_wallet_balances", "get_products", "get_product",
+        "get_recent_trades", "get_funding_rate", "get_mark_price",
+        "self_test", "_symbol_to_product_id",
+    })
 
     def __init__(self, real_api):
         self._real = real_api
 
-    def __getattr__(self, name):
-        _READ_METHODS = {
-            "get_ticker", "get_tickers", "get_orderbook", "get_candles",
-            "get_balance", "get_positions", "get_position", "get_open_orders",
-            "get_product_id", "prefetch_product_ids", "get_server_time",
-            "get_wallet_balances", "get_products", "get_product",
-            "get_recent_trades", "get_funding_rate", "get_mark_price",
-            "self_test", "_symbol_to_product_id",
-        }
-        if name in _READ_METHODS:
+    def __getattr__(self, name: str):
+        if name in self._READ_METHODS:
             return getattr(self._real, name)
 
-        def fake(*args, **kwargs):
-            elog.log("SYSTEM_START", component="DryRunAPI",
-                     call=name, note="simulated_no_exchange_hit")
+        def _simulated(*args, **kwargs):
+            elog.log(
+                "SYSTEM_START", component="DryRunAPI",
+                call=name, note="simulated_no_exchange_hit",
+            )
             return {
                 "success": True,
-                "result":  {"order_id": "dry_" + str(int(time.time() * 1000)), "status": "simulated"},
-                "error":   None,
+                "result":  {
+                    "order_id": f"dry_{int(time.time() * 1000)}",
+                    "status":   "simulated",
+                },
+                "error": None,
             }
-        return fake
+        return _simulated
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -184,9 +222,9 @@ class DryRunAPI:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class HPMSRunner:
-    """Main application runner."""
+    """Main application runner — wires all components together."""
 
-    def __init__(self, dry_run=False, testnet=False):
+    def __init__(self, dry_run: bool = False, testnet: bool = False):
         self._dry_run  = dry_run
         self._testnet  = testnet or config.DELTA_TESTNET
         self._shutdown = threading.Event()
@@ -194,7 +232,7 @@ class HPMSRunner:
         # Update global state singleton
         STATE.dry_run = dry_run
         STATE.testnet = self._testnet
-        STATE.mode = "DRY-RUN" if dry_run else "LIVE"
+        STATE.mode    = "DRY-RUN" if dry_run else "LIVE"
 
         self._api      = None
         self._data_mgr = None
@@ -204,11 +242,7 @@ class HPMSRunner:
         self._strategy = None
         self._telegram = None
 
-    def start(self):
-        # Pre-compute all display strings OUTSIDE f-strings.
-        # This eliminates the "f-string expression part cannot include a backslash"
-        # SyntaxError that occurs on Python 3.6 - 3.11 when ternary operators
-        # or string literals containing backslashes appear inside {}.
+    def start(self) -> bool:
         mode_str = "DRY-RUN" if self._dry_run else "LIVE"
         net_str  = "TESTNET" if self._testnet  else "MAINNET"
 
@@ -228,14 +262,12 @@ class HPMSRunner:
         # ── 0. Validate critical config ───────────────────────────────────────
         if not config.TELEGRAM_BOT_TOKEN:
             elog.error("SYSTEM_START", error="TELEGRAM_BOT_TOKEN missing",
-                       action="telegram_notifications_disabled", component="config")
-            logger.error("TELEGRAM NOT CONFIGURED — TELEGRAM_BOT_TOKEN is empty; "
-                         "all push notifications will be silently dropped")
+                       note="push_notifications_disabled")
+            logger.error("TELEGRAM NOT CONFIGURED — TELEGRAM_BOT_TOKEN is empty")
         if not config.TELEGRAM_CHAT_ID:
             elog.error("SYSTEM_START", error="TELEGRAM_CHAT_ID missing",
-                       action="telegram_notifications_disabled", component="config")
-            logger.error("TELEGRAM NOT CONFIGURED — TELEGRAM_CHAT_ID is empty; "
-                         "set this to your chat/group ID to receive alerts")
+                       note="push_notifications_disabled")
+            logger.error("TELEGRAM NOT CONFIGURED — TELEGRAM_CHAT_ID is empty")
 
         # ── 1. Exchange API ───────────────────────────────────────────────────
         if self._testnet:
@@ -254,12 +286,11 @@ class HPMSRunner:
         # ── 2. Data Manager ──────────────────────────────────────────────────
         self._data_mgr = DeltaDataManager()
         if not self._data_mgr.start():
-            elog.error("SYSTEM_START", error="DataManager failed to start",
-                       action="aborting_startup",
-                       note="check exchange connectivity and API credentials")
+            elog.error("SYSTEM_START", error="DataManager_failed_to_start",
+                       note="check_exchange_connectivity_and_credentials")
             return False
-        elog.log("SYSTEM_START", component="DeltaDataManager", status="ready",
-                 note="websocket_streams_active")
+        elog.log("SYSTEM_START", component="DeltaDataManager",
+                 status="ready", note="websocket_streams_active")
 
         # ── 3. HPMS Engine ────────────────────────────────────────────────────
         self._engine = HPMSEngine(
@@ -302,7 +333,7 @@ class HPMSRunner:
             cooldown_seconds=config.RISK_COOLDOWN_SECONDS,
             max_drawdown_pct=config.RISK_MAX_DRAWDOWN_PCT,
             equity_pct_per_trade=config.RISK_EQUITY_PCT_PER_TRADE,
-            auto_resume_seconds=getattr(config, "RISK_AUTO_RESUME_SECONDS", 300.0),
+            auto_resume_seconds=getattr(config, "RISK_AUTO_RESUME_SECONDS", 600.0),
             soft_loss_weight=getattr(config, "RISK_SOFT_LOSS_WEIGHT", 0.5),
         )
 
@@ -312,7 +343,6 @@ class HPMSRunner:
             symbol=config.DELTA_SYMBOL,
             contract_value=getattr(config, "TRADE_CONTRACT_VALUE", 0.001),
         )
-        # Wire real-time fill/order events from WebSocket into OrderManager
         self._orders.register_with_data_manager(self._data_mgr)
 
         # ── 6. Telegram Bot ──────────────────────────────────────────────────
@@ -341,7 +371,10 @@ class HPMSRunner:
         )
         self._telegram._strategy = self._strategy
 
-        # ── 8. Set leverage on exchange ───────────────────────────────────────
+        # ── 8. Wire RiskManager → Telegram for halt push notifications ────────
+        self._risk.set_notify_fn(self._telegram.send_message)
+
+        # ── 9. Set leverage on exchange ───────────────────────────────────────
         try:
             self._api.set_leverage(symbol=config.DELTA_SYMBOL, leverage=config.RISK_LEVERAGE)
             elog.log("RISK_PARAM_UPDATE", key="leverage",
@@ -351,42 +384,49 @@ class HPMSRunner:
             elog.error("SYSTEM_START", error=str(e), stage="set_leverage",
                        note="leverage_may_differ_from_config")
 
-        # ── 9. Start Telegram ─────────────────────────────────────────────────
+        # ── 10. Start Telegram ─────────────────────────────────────────────────
         self._telegram.start()
 
-        # ── 10. Start strategy (sets STATE.trading_enabled = True) ────────────
+        # ── 11. Start strategy (sets STATE.trading_enabled = True) ────────────
         self._strategy.start()
 
-        elog.log("SYSTEM_START", component="HPMSRunner", status="fully_operational",
-                 mode=mode_str, network=net_str)
+        elog.log("SYSTEM_START", component="HPMSRunner",
+                 status="fully_operational", mode=mode_str, network=net_str)
 
         # ── Startup notification ───────────────────────────────────────────────
-        mode_icon    = "🧪" if self._dry_run else "⚡"
-        network_icon = "🔬" if self._testnet  else "🌐"
+        now_utc    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        mode_icon  = "🧪" if self._dry_run else "⚡"
+        net_icon   = "🔬" if self._testnet  else "🌐"
+
         self._telegram.send_message(
             "🚀 *HPMS System Online*\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            + mode_icon    + " Mode:        `" + mode_str                          + "`\n"
-            + network_icon + " Network:     `" + net_str                           + "`\n"
-            "📊 Symbol:     `" + config.DELTA_SYMBOL                               + "`\n"
-            "🔢 Leverage:   `" + str(config.RISK_LEVERAGE)                         + "x`\n"
-            "⚙️ Integrator: `" + str(config.HPMS_INTEGRATOR)                       + "`\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🔬 *Engine Config*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            + mode_icon + " Mode:          `" + mode_str                                    + "`\n"
+            + net_icon  + " Network:       `" + net_str                                     + "`\n"
+            "⏱ Started:       `" + now_utc                                                  + "`\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📊 *Instrument*\n"
+            "  Symbol:       `" + config.DELTA_SYMBOL                                       + "`\n"
+            "  Leverage:     `" + str(config.RISK_LEVERAGE)                                 + "x`\n"
+            "  Contract:     `" + str(getattr(config, "TRADE_CONTRACT_VALUE", 0.001))       + "` BTC\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🔬 *Engine*\n"
             "  τ=`"         + str(config.HPMS_TAU)                 + "`  "
             "lookback=`"    + str(config.HPMS_LOOKBACK)            + "`  "
             "horizon=`"     + str(config.HPMS_PREDICTION_HORIZON)  + "`\n"
             "  KDE bw=`"    + str(config.HPMS_KDE_BANDWIDTH)       + "`  "
-            "rebuild=`"     + str(config.HPMS_KDE_REBUILD_INTERVAL) + "` bars\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "rebuild=`"     + str(config.HPMS_KDE_REBUILD_INTERVAL) + "` bars  "
+            "integrator=`"  + str(config.HPMS_INTEGRATOR)          + "`\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "🛡 *Risk Limits*\n"
-            "  Max loss/day: `$" + str(config.RISK_MAX_DAILY_LOSS_USD) + "`  "
-            "Max trades: `"       + str(config.RISK_MAX_DAILY_TRADES)  + "`\n"
-            "  Cooldown: `"       + str(config.RISK_COOLDOWN_SECONDS)  + "s`  "
-            "Equity/trade: `"     + str(config.RISK_EQUITY_PCT_PER_TRADE) + "%`\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "_Warming up engine with REST candle history…_\n"
-            "_Use /status for the live dashboard or /thinking for decision detail._"
+            "  Max loss/day:  `$" + str(config.RISK_MAX_DAILY_LOSS_USD) + "`\n"
+            "  Max trades:    `"  + str(config.RISK_MAX_DAILY_TRADES)   + "` / day\n"
+            "  Cooldown:      `"  + str(config.RISK_COOLDOWN_SECONDS)   + "s`\n"
+            "  Equity/trade:  `"  + str(config.RISK_EQUITY_PCT_PER_TRADE) + "%`  "
+            "Min R:R: `"          + str(getattr(config, "FIB_MIN_RR", 2.5))  + ":1`\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "_Warming up — engine priming from REST candle history…_\n"
+            "_Use /status for dashboard  /thinking for decision trace_"
         )
 
         self._main_loop()
@@ -397,25 +437,22 @@ class HPMSRunner:
     def _warm_start(self):
         """
         Feed REST warmup candles into the engine in a rolling window so the
-        engine builds a full H-EMA history (needs ≥2 bars) before going live.
+        engine builds a full H-EMA history before going live.
 
-        Also discovers the real timestamp key used by the DataManager
-        (some implementations use "t", others use "timestamp", "close_time",
-        etc.) so the main loop's bar-detection works correctly.
-
-        Returns (last_ts_value, ts_key) so the main loop can detect new bars.
+        Auto-detects the timestamp key used by the DataManager (some
+        implementations use "t", others "timestamp", "close_time", etc.)
+        so the main loop's bar-detection works correctly.
         """
         try:
             candles = self._data_mgr.get_candles("1m", limit=300)
             if not candles:
                 logger.warning(
                     "[WARM_START] DataManager returned no candles — "
-                    "engine will start cold and wait for the first live bar to close"
+                    "engine will start cold and wait for the first live bar"
                 )
                 return
 
             # ── Auto-detect timestamp key ─────────────────────────────────────
-            # Try common field names; pick the one with the largest non-zero value.
             ts_candidates = ["t", "timestamp", "close_time", "time",
                              "open_time", "ts", "closeTime"]
             last_c  = candles[-1]
@@ -436,11 +473,7 @@ class HPMSRunner:
             )
 
             # ── Rolling warm-up: feed candles one window at a time ────────────
-            # The engine needs on_bar_close called with the FULL slice ending at
-            # bar N, not just the last bar.  We call it once per bar in the
-            # second half of the warmup so the H-EMA history fills up properly.
             n     = len(candles)
-            # Process the last 30 bars as rolling windows so dH/dt history builds
             start = max(1, n - 30)
             logger.info(
                 "[WARM_START] Replaying bars %d–%d of %d REST candles "
@@ -461,18 +494,12 @@ class HPMSRunner:
         except Exception as e:
             logger.error("[WARM_START] Warmup failed — engine will start cold: %s",
                          e, exc_info=True)
-            return
 
     def _main_loop(self):
         """
         Polls DataManager for new 1m candles and feeds them to the strategy.
-        Uses TIMESTAMP-based bar detection — immune to deque maxlen rollover.
-
-        IMPORTANT: get_candles() may return an empty list during the first
-        ~60 s if the DataManager's live buffer is separate from the REST
-        warmup buffer and no WebSocket bar has closed yet.  The warm_start()
-        call above pre-populates the engine from REST data so the system is
-        active from second 0.
+        Uses wall-clock minute-boundary detection — immune to deque maxlen
+        rollover and timestamp format differences across exchange APIs.
         """
         # Prime the engine with REST warmup data immediately
         self._strategy.set_warming_up(True)
@@ -483,13 +510,9 @@ class HPMSRunner:
         last_health_check     = time.time()
         poll_n                = 0
 
-        # Candle timestamps from this DataManager are always 0 (timestamp field
-        # absent or zero in the normalised candle dict).  Use minute-boundary
-        # wall-clock detection instead: fire on_bar_close once per calendar minute.
-        # This is drift-free and works regardless of the exchange API format.
         last_bar_minute = int(time.time() / 60)
         logger.info(
-            "[LOOP] Live poll started — using wall-clock minute-boundary bar detection.  "
+            "[LOOP] Live poll started — wall-clock minute-boundary bar detection.  "
             "current_minute=%d  (fires once per 60-second bar close)",
             last_bar_minute,
         )
@@ -502,20 +525,19 @@ class HPMSRunner:
                 if not candles:
                     if poll_n % 20 == 1:
                         logger.debug(
-                            "[LOOP] poll #%d — no candles from DataManager yet "
-                            "(WebSocket buffer is still filling up; this clears once the "
-                            "first live bar is received)", poll_n
+                            "[LOOP] poll #%d — no candles yet "
+                            "(WebSocket buffer still filling; clears on first live bar)",
+                            poll_n,
                         )
                 else:
                     current_minute = int(time.time() / 60)
                     last_close     = candles[-1].get("c", 0)
 
                     if current_minute > last_bar_minute:
-                        # Brief pause to let the WebSocket is_closed=True event for
-                        # the just-finished bar arrive and finalize candles[-1] before
-                        # we snapshot the deque.  WS latency is <100ms; 200ms is a
-                        # safe margin that still leaves >99% of the minute available
-                        # for signal computation and order placement (Bug 6 fix).
+                        # Brief pause to let the WebSocket is_closed=True event
+                        # arrive and finalize candles[-1] before we snapshot.
+                        # WS latency is <100ms; 200ms leaves >99% of the minute
+                        # available for signal computation and order placement.
                         time.sleep(0.20)
                         candles = self._data_mgr.get_candles("1m", limit=300)
                         logger.info(
@@ -542,40 +564,36 @@ class HPMSRunner:
 
             except Exception as e:
                 logger.error(
-                    "[LOOP] Unhandled exception in main loop (will retry in 5s): %s",
+                    "[LOOP] Unhandled exception in main loop (retrying in 5s): %s",
                     e, exc_info=True,
                 )
-                elog.error("SYSTEM_MAIN_LOOP", error=str(e), stage="main_loop",
-                           note="retrying_after_5s")
+                elog.error("SYSTEM_MAIN_LOOP", error=str(e),
+                           stage="main_loop", note="retrying_after_5s")
                 time.sleep(5)
 
     def _health_check(self):
         if not self._data_mgr.is_ready:
             elog.warn("SYSTEM_HEALTH", issue="DataManager_not_ready",
-                      action="restarting_websocket_streams",
-                      note="signal_processing_paused_until_streams_recover")
+                      action="restarting_websocket_streams")
             self._telegram.send_message(
                 "⚠️ *Health Alert: Data Feed Down*\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 "DataManager is reporting *not ready* — WebSocket streams appear "
                 "to have dropped.\n\n"
                 "🔄 *Action:* Automatically restarting streams now.\n"
-                "_No new signals will fire until the feed recovers._\n"
-                "_Use /market to verify data once reconnected._"
+                "_No new signals until the feed recovers.  Use /market to verify._"
             )
             self._data_mgr.restart_streams()
 
         if not self._data_mgr.is_price_fresh(max_stale_seconds=120):
             elog.warn("SYSTEM_HEALTH", issue="price_stale_gt_120s",
-                      action="alerting_operator",
-                      note="last_price_is_more_than_120s_old_no_new_signals_safe")
+                      action="alerting_operator")
             self._telegram.send_message(
                 "⚠️ *Health Alert: Stale Price Data*\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 "Last price tick is *>120 seconds old* — the exchange feed "
                 "may be degraded or the WebSocket has silently disconnected.\n\n"
-                "🔎 *What this means:* Signal generation is safe-halted until "
-                "fresh data arrives.  No trades will be entered.\n"
+                "🔎 Signal generation is safe-halted until fresh data arrives.\n"
                 "_Check /market for data status, or /price for the last known price._"
             )
 
@@ -586,23 +604,41 @@ class HPMSRunner:
 
         if self._strategy:
             self._strategy.stop()
+
         if self._orders and self._orders.is_in_position:
             elog.warn("SYSTEM_SHUTDOWN", note="closing_open_position_before_exit",
                       action="market_close_at_current_price")
             price = self._data_mgr.get_last_price() if self._data_mgr else 0
             self._orders.close_position(reason="SHUTDOWN", current_price=price)
+
         if self._data_mgr:
             self._data_mgr.stop()
+
         if self._telegram:
             net_str  = "TESTNET" if self._testnet  else "MAINNET"
+            now_utc  = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+
+            # Pull final session stats for shutdown message
+            shutdown_pnl  = ""
+            if self._risk:
+                rs = self._risk.get_status()
+                shutdown_pnl = (
+                    "\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "📊 *Final Session Stats*\n"
+                    "  Trades: `" + str(rs.get("trades_today", 0)) + "`  "
+                    "Net P&L: `$" + f"{rs.get('daily_pnl', 0):+.4f}" + "`\n"
+                    "  Fees:   `$-" + f"{rs.get('daily_fees', 0):.4f}" + "`"
+                )
+
             self._telegram.send_message(
                 "🛑 *HPMS System Shutdown*\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 "Mode:    `" + STATE.mode + "`\n"
-                "Network: `" + net_str    + "`\n\n"
-                "_All positions have been handled.  "
-                "System is now offline._\n"
-                "_Restart with `python main.py` when ready._"
+                "Network: `" + net_str    + "`\n"
+                "Time:    `" + now_utc    + "`"
+                + shutdown_pnl + "\n\n"
+                "_All positions handled.  System offline._\n"
+                "_Restart: `python main.py`_"
             )
             self._telegram.stop()
 
@@ -613,20 +649,22 @@ class HPMSRunner:
 
 def main():
     parser = argparse.ArgumentParser(description="HPMS Trading System")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--testnet", action="store_true")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Simulate orders — no exchange interaction")
+    parser.add_argument("--testnet", action="store_true",
+                        help="Connect to Delta testnet instead of mainnet")
     args = parser.parse_args()
 
     setup_logging()
 
     runner = HPMSRunner(dry_run=args.dry_run, testnet=args.testnet)
 
-    def handle_signal(signum, frame):
+    def _handle_signal(signum, frame):
         runner.shutdown()
         sys.exit(0)
 
-    signal.signal(signal.SIGINT,  handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT,  _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
 
     try:
         runner.start()
@@ -635,6 +673,8 @@ def main():
     except Exception as e:
         elog.error("SYSTEM_SHUTDOWN", error=str(e), stage="fatal",
                    note="unhandled_exception_forced_exit")
+        logger.critical("Fatal unhandled exception — forcing shutdown: %s", e,
+                        exc_info=True)
         runner.shutdown()
         sys.exit(1)
 

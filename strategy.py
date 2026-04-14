@@ -20,10 +20,14 @@ import time
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
-from hpms_engine import HPMSEngine, HPMSSignal, SignalType
+import numpy as _np                                          # module-level — not per-bar
+
+from hpms_engine import HPMSEngine, HPMSSignal, SignalType   # module-level
+from hpms_engine import RegimeType                           # module-level — was inside hot path
 from risk_manager import RiskManager, TradeRecord
 from order_manager import OrderManager
 from state import STATE
+from logger_core import elog
 
 logger = logging.getLogger(__name__)
 
@@ -70,10 +74,11 @@ class HPMSStrategy:
         # Energy spike exit confirmation: require 2 consecutive bars above threshold
         self._consecutive_energy_spikes = 0
 
-        # Entry tracking for ROE% computation
-        self._last_entry_size:  int   = 0
-        self._last_entry_price: float = 0.0
-        self._last_margin_used: float = 0.0
+        # Entry tracking for ROE% computation and exit notification
+        self._last_entry_size:   int   = 0
+        self._last_entry_price:  float = 0.0
+        self._last_margin_used:  float = 0.0
+        self._entry_time:        float = 0.0   # unix seconds at entry (for hold duration)
 
         # Throttle "blocked" console log lines so they don't spam
         self._last_block_log_bar = 0
@@ -89,22 +94,27 @@ class HPMSStrategy:
         self._enabled = True
         STATE.trading_enabled = True
         logger.info("HPMSStrategy STARTED")
-        self._push("⚡ *Strategy STARTED* — looking for signals on "
-                   f"`{getattr(self._config, 'DELTA_SYMBOL', 'BTCUSD')}`")
+        symbol = getattr(self._config, "DELTA_SYMBOL", "BTCUSD")
+        self._push(
+            "⚡ *Strategy STARTED*\n"
+            f"Scanning `{symbol}` for HPMS signals\n"
+            "_All filters and risk gates are active_"
+        )
 
     def stop(self):
         self._enabled = False
         STATE.trading_enabled = False
         logger.info("HPMSStrategy STOPPED")
-        self._push("⏹ *Strategy STOPPED* — no new entries (open positions remain)")
+        self._push("⏹ *Strategy STOPPED* — no new entries _(open positions remain)_")
 
     def set_warming_up(self, value: bool):
         """
-        Call with True before warm-start replay, False after.
+        Call True before warm-start replay, False after.
         While warming_up the engine is primed normally but NO orders are placed.
         """
         self._warming_up = value
-        logger.info(f"HPMSStrategy warming_up={'ON (replay mode — orders suppressed)' if value else 'OFF (live trading active)'}")
+        label = "ON (replay mode — orders suppressed)" if value else "OFF (live trading active)"
+        logger.info("HPMSStrategy warming_up=%s", label)
 
     @property
     def is_enabled(self) -> bool:
@@ -119,16 +129,16 @@ class HPMSStrategy:
         with self._lock:
             self._bar_count += 1
 
-            valid    = [c for c in candles_1m if c.get("c", 0) > 0]
+            valid = [c for c in candles_1m if c.get("c", 0) > 0]
             if not valid:
                 return None
 
-            closes       = [c["c"] for c in valid]
-            volumes      = [c.get("v", 0.0) for c in valid]
+            closes        = [c["c"] for c in valid]
+            volumes       = [c.get("v", 0.0) for c in valid]
             # Real OHLCV H/L — critical for accurate Fibonacci swing detection.
             # Fallback to close if "h"/"l" keys are absent (data-source safety).
-            highs        = [c.get("h", c["c"]) for c in valid]
-            lows         = [c.get("l", c["c"]) for c in valid]
+            highs         = [c.get("h", c["c"]) for c in valid]
+            lows          = [c.get("l", c["c"]) for c in valid]
             current_price = closes[-1]
             timestamp     = valid[-1].get("t", time.time() * 1000) / 1000.0
 
@@ -141,18 +151,19 @@ class HPMSStrategy:
                     return None
 
                 signal = self._engine.on_bar_close(closes, volumes, timestamp,
-                                                    highs=highs, lows=lows)
+                                                   highs=highs, lows=lows)
                 if signal:
                     # KDE grace period: skip energy spike check for 2 bars after
                     # a KDE rebuild, as dH/dt spikes artificially on rebuild bars.
-                    kde_grace = getattr(self._config, "HPMS_KDE_REBUILD_INTERVAL", 3)
+                    kde_grace      = getattr(self._config, "HPMS_KDE_REBUILD_INTERVAL", 3)
                     bars_since_kde = getattr(signal, "bars_since_kde", kde_grace)
-                    in_kde_grace = bars_since_kde < 2
+                    in_kde_grace   = bars_since_kde < 2
 
-                    # Use adaptive threshold if available, else config
+                    # Adaptive spike threshold — takes the higher of the adaptive
+                    # estimate (mean + 3σ of recent |dH/dt| history) and the config floor.
                     adaptive_spike = self._engine.get_adaptive_dH_spike_threshold()
-                    config_spike = getattr(self._config, "TRADE_DH_DT_EXIT_SPIKE", 0.15)
-                    exit_spike = max(adaptive_spike, config_spike)
+                    config_spike   = getattr(self._config, "TRADE_DH_DT_EXIT_SPIKE", 0.15)
+                    exit_spike     = max(adaptive_spike, config_spike)
 
                     # ── Trailing stop management ─────────────────────────────
                     if getattr(self._config, "TRAILING_ENABLED", True):
@@ -171,39 +182,49 @@ class HPMSStrategy:
                         if trail.get("new_sl") is not None:
                             updated = self._orders.update_sl_price(trail["new_sl"])
                             if updated:
-                                fib_ratio  = trail.get("fib_ratio", 0.0)
-                                fib_sl_raw = trail.get("fib_sl_price", 0.0)
-                                hwm        = trail.get("high_watermark", 0.0)
-                                progress   = trail.get("tp_progress", 0.0)
-                                phase      = trail.get("phase", "?")
-                                be_move    = trail.get("fee_breakeven_move", 0.0)
+                                new_sl    = trail["new_sl"]
+                                fib_ratio = trail.get("fib_ratio", 0.0)
+                                hwm       = trail.get("high_watermark", 0.0)
+                                progress  = trail.get("tp_progress", 0.0)
+                                phase     = trail.get("phase", "?")
+                                be_move   = trail.get("fee_breakeven_move", 0.0)
+                                entry_px  = self._orders.entry_price
+
+                                # SL movement direction and distance from entry
+                                sl_dist    = abs(new_sl - entry_px)
+                                sl_sign    = "+" if new_sl > entry_px else "-"
+
+                                elog.log("TRADE_TRAIL",
+                                         side=self._orders._position_side,
+                                         new_sl=new_sl,
+                                         phase=phase,
+                                         fib_ratio=fib_ratio,
+                                         tp_progress=progress,
+                                         bars=self._orders.bars_held)
+
                                 self._push(
-                                    f"🔄 *SL Trailed* → `${trail['new_sl']:,.1f}`\n"
-                                    f"Phase: `{phase}` | Fib ratio: `{fib_ratio:.3f}`\n"
-                                    f"Raw Fib SL: `${fib_sl_raw:,.1f}` "
-                                    f"_(SL from {fib_ratio:.3f} retracement of move)_\n"
-                                    f"HWM: `${hwm:,.1f}` | Progress: `{progress:.1%}`\n"
-                                    f"BE floor: `${be_move:.1f}` above entry | Bar: `{self._orders.bars_held}`"
+                                    f"📏 *SL Trailed* → `${new_sl:,.1f}` "
+                                    f"(`{sl_sign}${sl_dist:.1f}` from entry)\n"
+                                    f"Phase: `{phase}`  │  Fib: `{fib_ratio:.3f}`  │  Bar: `{self._orders.bars_held}`\n"
+                                    f"HWM: `${hwm:,.1f}`  │  Progress: `{progress:.0%}`  │  BE≥`${entry_px + be_move:,.1f}`"
                                 )
 
                     # ── Absolute safety ceiling ──────────────────────────────
                     abs_max = getattr(self._config, "TRAILING_ABSOLUTE_MAX_BARS", 120)
                     if self._orders.bars_held >= abs_max:
-                        # Only force exit if profitable (SL handles losses)
                         is_long = self._orders._position_side == "long"
-                        if is_long:
-                            pnl = current_price - self._orders.entry_price
-                        else:
-                            pnl = self._orders.entry_price - current_price
+                        pnl     = (current_price - self._orders.entry_price if is_long
+                                   else self._orders.entry_price - current_price)
                         if pnl > 0:
-                            reason = f"ABSOLUTE_MAX: {self._orders.bars_held}>={abs_max} (profitable)"
-                            logger.info(f"Safety ceiling exit: {reason}")
+                            reason = (
+                                f"ABSOLUTE_MAX: {self._orders.bars_held}>={abs_max} (profitable)"
+                            )
+                            logger.info("Safety ceiling exit: %s", reason)
                             self._orders.close_position(
                                 reason=reason, current_price=current_price
                             )
                             self._consecutive_energy_spikes = 0
                             return None
-                        # else: let trailing SL or exchange SL handle it
 
                     # ── Energy spike check ───────────────────────────────────
                     exit_reason = self._risk.check_exit_conditions(
@@ -214,22 +235,24 @@ class HPMSStrategy:
                     if exit_reason:
                         if in_kde_grace:
                             logger.debug(
-                                f"Energy spike suppressed (KDE grace, "
-                                f"bars_since_kde={bars_since_kde}): {exit_reason}"
+                                "Energy spike suppressed (KDE grace, "
+                                "bars_since_kde=%d): %s", bars_since_kde, exit_reason,
                             )
                             self._consecutive_energy_spikes = 0
                         else:
                             self._consecutive_energy_spikes += 1
                             if self._consecutive_energy_spikes >= 2:
-                                logger.info(f"Force-exit triggered (confirmed): {exit_reason}")
+                                logger.info(
+                                    "Force-exit triggered (confirmed): %s", exit_reason
+                                )
                                 self._orders.close_position(
                                     reason=exit_reason, current_price=current_price
                                 )
                                 self._consecutive_energy_spikes = 0
                             else:
                                 logger.info(
-                                    f"Energy spike detected ({self._consecutive_energy_spikes}/2 "
-                                    f"for confirmation): {exit_reason}"
+                                    "Energy spike detected (%d/2 for confirmation): %s",
+                                    self._consecutive_energy_spikes, exit_reason,
                                 )
                     else:
                         self._consecutive_energy_spikes = 0
@@ -241,15 +264,16 @@ class HPMSStrategy:
             self._last_signal = signal
 
             if signal is None or signal.signal_type == SignalType.FLAT:
-                # Engine already emits per-bar INFO diagnostics in on_bar_close
                 return signal
 
             # ── Signal present: try to trade ──────────────────────────────────
             sig_name = signal.signal_type.name
             logger.info(
-                f"bar={self._bar_count} SIGNAL {sig_name} | "
-                f"conf={signal.confidence:.1%} Δq={signal.predicted_delta_q:+.5f} "
-                f"|dH/dt|={abs(signal.dH_dt):.5f} compute={signal.compute_time_us:.0f}µs"
+                "bar=%d SIGNAL %s | conf=%.1f%% Δq=%+.5f "
+                "|dH/dt|=%.5f compute=%.0fµs",
+                self._bar_count, sig_name,
+                signal.confidence * 100, signal.predicted_delta_q,
+                abs(signal.dH_dt), signal.compute_time_us,
             )
 
             # During warm-start replay the engine is primed but no real orders fire
@@ -269,20 +293,11 @@ class HPMSStrategy:
                 return signal
 
             # ── Regime filter ─────────────────────────────────────────────────
-            # Two independent checks:
-            #
-            # 1. CHOPPY + low confidence: edge is insufficient in a directionless
-            #    market.  Unchanged from previous logic.
-            #
-            # 2. TRENDING + signal opposes the measured trend direction: a counter-
-            #    trend entry into confirmed momentum requires materially higher
-            #    confidence (≥ 0.70) to justify overriding the regime signal.
-            #    Production logs showed ALL LONG signals occurring with negative
-            #    trend_strength (bearish regime), yet passing the filter because
-            #    only CHOPPY was checked.  This adds the missing TRENDING gate.
-            from hpms_engine import RegimeType, SignalType as _ST
-            signal_regime    = getattr(signal, "regime",          RegimeType.UNKNOWN)
-            sig_trend_str    = getattr(signal, "trend_strength",  0.0)
+            signal_regime  = getattr(signal, "regime",         RegimeType.UNKNOWN)
+            # Guard against None — getattr with default returns 0.0 but the
+            # attribute could theoretically be explicitly set to None by the engine.
+            _raw_trend     = getattr(signal, "trend_strength", 0.0)
+            sig_trend_str  = float(_raw_trend) if _raw_trend is not None else 0.0
 
             if signal_regime == RegimeType.CHOPPY and signal.confidence < 0.55:
                 self._log_blocked(
@@ -292,8 +307,8 @@ class HPMSStrategy:
 
             if signal_regime == RegimeType.TRENDING:
                 trend_aligns = (
-                    (signal.signal_type == _ST.LONG  and sig_trend_str > 0) or
-                    (signal.signal_type == _ST.SHORT and sig_trend_str < 0)
+                    (signal.signal_type == SignalType.LONG  and sig_trend_str > 0) or
+                    (signal.signal_type == SignalType.SHORT and sig_trend_str < 0)
                 )
                 if not trend_aligns and signal.confidence < 0.70:
                     self._log_blocked(
@@ -304,7 +319,7 @@ class HPMSStrategy:
                     )
                     return signal
 
-            # ── Position sizing (confidence-weighted, vol-normalized) ─────────
+            # ── Position sizing (confidence-weighted, vol-normalised) ─────────
             balance = self._api.get_balance("USD")
             equity  = balance.get("available", 0.0)
             if equity <= 0:
@@ -317,45 +332,45 @@ class HPMSStrategy:
             if len(candles_1m) >= 15:
                 recent_closes = [c["c"] for c in candles_1m[-15:] if c.get("c", 0) > 0]
                 if len(recent_closes) >= 2:
-                    import numpy as _np
-                    _rc = _np.array(recent_closes)
-                    _atr = float(_np.mean(_np.abs(_np.diff(_rc))))
-                    _mid = float(_np.mean(_rc))
+                    _rc   = _np.array(recent_closes)
+                    _atr  = float(_np.mean(_np.abs(_np.diff(_rc))))
+                    _mid  = float(_np.mean(_rc))
                     norm_vol = _atr / _mid if _mid > 0 else 0.0
 
+            sl_pct = (
+                abs(current_price - signal.sl_price) / current_price
+                if signal.sl_price > 0 else 0.0
+            )
             size = self._risk.compute_size(
                 current_price, equity,
                 contract_value=getattr(self._config, "TRADE_CONTRACT_VALUE", 0.001),
-                sl_pct=abs(current_price - signal.sl_price) / current_price if signal.sl_price > 0 else 0.0,
+                sl_pct=sl_pct,
                 confidence=signal.confidence,
                 norm_vol=norm_vol,
             )
             side = "long" if signal.signal_type == SignalType.LONG else "short"
 
             # ── Pre-flight margin safety clamp ────────────────────────────────
-            # compute_size() now enforces the margin cap internally, so this
-            # block should never trigger in normal operation.  It is retained
-            # as a belt-and-suspenders guard: if, for any reason, the computed
-            # size would exceed 95% of available equity when converted to margin,
-            # we clamp size down to the maximum safe value rather than skipping
-            # the signal entirely.  A valid signal is NEVER discarded due to size.
+            # compute_size() enforces the margin cap internally, so this block
+            # should never trigger in normal operation.  Retained as a safety net:
+            # if the computed size would exceed 95% of available equity when
+            # converted to margin, clamp size down rather than discard the signal.
             contract_value = getattr(self._orders, "_contract_value", 0.001)
             leverage       = getattr(self._config, "RISK_LEVERAGE", 10)
             margin_needed  = (current_price * contract_value * size) / max(leverage, 1)
 
             if margin_needed > equity * 0.95:
-                # Compute the largest size that fits within 95% of equity
-                safe_size = max(1, int(equity * 0.95 * leverage / (current_price * contract_value)))
+                safe_size = max(
+                    1, int(equity * 0.95 * leverage / (current_price * contract_value))
+                )
                 logger.warning(
                     "MARGIN_PREFLIGHT: clamping size %d→%d "
                     "(need $%.2f, have $%.2f @ %dx) — trade PROCEEDS at safe size",
                     size, safe_size, margin_needed, equity, leverage,
                 )
-                size = safe_size
+                size          = safe_size
                 margin_needed = (current_price * contract_value * size) / max(leverage, 1)
 
-                # If even 1 contract exceeds margin, the account is too small
-                # to open any position — skip with an actionable message.
                 if margin_needed > equity * 0.95:
                     logger.warning(
                         "MARGIN_PREFLIGHT: even 1 contract requires $%.2f "
@@ -364,8 +379,8 @@ class HPMSStrategy:
                     )
                     self._push(
                         f"⚠️ *Cannot open position* — 1 contract costs "
-                        f"`${margin_needed:.2f}` margin but available equity is "
-                        f"`${equity:.2f}` @ `{leverage}x` leverage.\n"
+                        f"`${margin_needed:.2f}` margin but equity is "
+                        f"`${equity:.2f}` @ `{leverage}x`.\n"
                         f"Deposit funds or reduce leverage to continue trading."
                     )
                     return signal
@@ -382,47 +397,76 @@ class HPMSStrategy:
             )
 
             if result.get("success"):
-                # Use ACTUAL entry price from order manager (API fill price)
-                actual_entry = self._orders.entry_price or current_price
+                actual_entry   = self._orders.entry_price or current_price
                 contract_value = getattr(self._config, "TRADE_CONTRACT_VALUE", 0.001)
-                leverage = getattr(self._config, "RISK_LEVERAGE", 10)
-                margin_used = (actual_entry * contract_value * size) / max(leverage, 1)
-                notional = actual_entry * contract_value * size
+                leverage       = getattr(self._config, "RISK_LEVERAGE", 10)
+                notional       = actual_entry * contract_value * size
+                margin_used    = notional / max(leverage, 1)
+                entry_fee      = getattr(self._orders, "_entry_fee_usd", 0.0)
 
-                # Use EXACT entry fee from API (stored by order manager)
-                entry_fee = getattr(self._orders, "_entry_fee_usd", 0.0)
+                # Derived trade geometry
+                tp_dist    = abs(signal.tp_price - actual_entry)
+                sl_dist    = abs(signal.sl_price - actual_entry)
+                tp_pct     = tp_dist / actual_entry * 100
+                sl_pct_val = sl_dist / actual_entry * 100
+                rr         = tp_dist / sl_dist if sl_dist > 0 else 0.0
+                tp_sign    = "+" if signal.tp_price > actual_entry else "-"
+                sl_sign    = "-" if signal.sl_price < actual_entry else "+"
 
                 self._risk.on_trade_open(side, actual_entry, size, margin_used)
                 self._engine.reset_trail_watermark()
                 self._consecutive_energy_spikes = 0
-                self._last_entry_size  = size
-                self._last_entry_price = actual_entry
-                self._last_margin_used = margin_used
+                self._last_entry_size   = size
+                self._last_entry_price  = actual_entry
+                self._last_margin_used  = margin_used
+                self._entry_time        = time.time()
+
+                now_utc = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+
+                # Daily session snapshot for context
+                daily = self._risk.get_status()
+                trades_before = daily["trades_today"]  # includes this just-opened one
+
+                elog.log("TRADE_ENTRY",
+                         side=side, size=size,
+                         entry_price=actual_entry,
+                         tp_price=signal.tp_price, sl_price=signal.sl_price,
+                         confidence=signal.confidence,
+                         note=f"rr={rr:.2f}  bar={self._bar_count}")
 
                 logger.info(
-                    f"TRADE OPEN ▶ {side.upper()} {size}c @ ${actual_entry:,.1f} "
-                    f"TP=${signal.tp_price:,.1f} SL=${signal.sl_price:,.1f} "
-                    f"margin=${margin_used:.2f} fee=$-{entry_fee:.4f} "
-                    f"conf={signal.confidence:.1%} regime={signal_regime.name} "
-                    f"trend={sig_trend_str:+.3f} "
-                    f"id={result.get('order_id', '')}"
+                    "TRADE OPEN ▶ %s %dc @ $%,.1f  TP=$%,.1f  SL=$%,.1f  "
+                    "RR=%.2f  margin=$%.2f  fee=$-%.4f  conf=%.1f%%  "
+                    "regime=%s  trend=%+.3f  id=%s",
+                    side.upper(), size, actual_entry,
+                    signal.tp_price, signal.sl_price, rr,
+                    margin_used, entry_fee, signal.confidence * 100,
+                    signal_regime.name, sig_trend_str,
+                    result.get("order_id", ""),
                 )
+
                 self._push(
-                    f"🚀 *ENTRY {side.upper()}*\n"
-                    f"Size: `{size}c` | Notional: `${notional:.2f}`\n"
-                    f"Entry: `${actual_entry:,.1f}`\n"
-                    f"TP: `${signal.tp_price:,.1f}` (`+${abs(signal.tp_price - actual_entry):.1f}`)\n"
-                    f"SL: `${signal.sl_price:,.1f}` (`-${abs(signal.sl_price - actual_entry):.1f}`)\n"
-                    f"Margin: `${margin_used:.2f}` @ `{leverage}x` | Fee: `$-{entry_fee:.4f}`\n"
-                    f"Conf: `{signal.confidence:.1%}` | Regime: `{signal_regime.name}` "
+                    f"🚀 *ENTRY {side.upper()}*  ⏱ `{now_utc}`\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📍 `{size}c` × `${actual_entry:,.1f}`\n"
+                    f"   Notional: `${notional:,.2f}`  │  Margin: `${margin_used:.2f}` @ `{leverage}x`\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🎯 TP: `${signal.tp_price:,.1f}` (`{tp_sign}${tp_dist:.1f}` / `+{tp_pct:.2f}%`)\n"
+                    f"🛑 SL: `${signal.sl_price:,.1f}` (`{sl_sign}${sl_dist:.1f}` / `-{sl_pct_val:.2f}%`)\n"
+                    f"⚖️ R:R: `{rr:.2f}:1`  │  Fee in: `$-{entry_fee:.4f}`\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🔬 Conf: `{signal.confidence:.1%}`  │  Δq: `{signal.predicted_delta_q:+.5f}`\n"
+                    f"   dH/dt: `{signal.dH_dt:.5f}`  │  Regime: `{signal_regime.name}` "
                     f"trend `{sig_trend_str:+.3f}`\n"
-                    f"Δq: `{signal.predicted_delta_q:+.5f}`\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 Session: `{trades_before}` trades  │  Daily net: "
+                    f"`${daily['daily_pnl']:+.4f}`\n"
                     f"\n{signal.fib_telegram_section}"
                 )
                 self._block_count = 0
             else:
                 err = result.get("error", "unknown")
-                logger.error(f"Entry FAILED: {err}")
+                logger.error("Entry FAILED: %s", err)
                 self._push(f"❌ *Entry failed*: `{err}`")
 
             return signal
@@ -439,12 +483,13 @@ class HPMSStrategy:
         self._block_count += 1
         sig_name = signal.signal_type.name
 
-        if (self._block_count == 1                  # always log the first block
+        if (self._block_count == 1
                 or self._block_count % _BLOCK_LOG_INTERVAL == 0
-                or reason != self._last_block_reason):  # or when reason changes
+                or reason != self._last_block_reason):
             logger.info(
-                f"bar={self._bar_count} BLOCKED ({self._block_count}x) "
-                f"{sig_name} conf={signal.confidence:.1%} | {reason}"
+                "bar=%d BLOCKED (%dx) %s conf=%.1f%% | %s",
+                self._bar_count, self._block_count,
+                sig_name, signal.confidence * 100, reason,
             )
             self._last_block_reason = reason
 
@@ -460,6 +505,7 @@ class HPMSStrategy:
                 best_ask = float(asks[0][0])
                 if best_bid > 0:
                     spread_pct = (best_ask - best_bid) / best_bid
+                    # Config value is in percent (e.g. 0.04 means 0.04%)
                     max_spread = getattr(self._config, "FILTER_SPREAD_MAX_PCT", 0.05) / 100.0
                     if spread_pct > max_spread:
                         return f"SPREAD {spread_pct:.4%} > {max_spread:.4%}"
@@ -474,8 +520,11 @@ class HPMSStrategy:
 
         if len(candles_1m) >= 10:
             recent  = candles_1m[-10:]
-            atr     = sum(c.get("h", c.get("c", 0)) - c.get("l", c.get("c", 0)) for c in recent) / len(recent)
-            mid     = candles_1m[-1]["c"]
+            atr     = sum(
+                c.get("h", c.get("c", 0)) - c.get("l", c.get("c", 0))
+                for c in recent
+            ) / len(recent)
+            mid = candles_1m[-1]["c"]
             if mid > 0:
                 atr_pct = atr / mid * 100
                 vol_min = getattr(self._config, "FILTER_VOLATILITY_MIN_PCT", 0.01)
@@ -493,31 +542,61 @@ class HPMSStrategy:
                          fees: float, net_pnl: float,
                          bars_held: int, reason: str):
         self._risk.on_trade_close(exit_price, gross_pnl, fees, net_pnl,
-                                   bars_held, reason)
+                                  bars_held, reason)
 
-        daily = self._risk.get_status()
-        emoji = "💰" if net_pnl >= 0 else "🔻"
+        daily    = self._risk.get_status()
+        emoji    = "💰" if net_pnl >= 0 else "🔻"
+        roe_pct  = (net_pnl / self._last_margin_used * 100) if self._last_margin_used > 0 else 0.0
 
-        # ROE% = net_pnl / margin_used
-        roe_pct = (net_pnl / self._last_margin_used * 100) if self._last_margin_used > 0 else 0.0
+        # Price move from entry to exit
+        entry_px = self._last_entry_price
+        move_usd = exit_price - entry_px
+        move_pct = move_usd / entry_px * 100 if entry_px > 0 else 0.0
+        # For short trades, a negative price move is a positive result
+        side_str  = "LONG" if (net_pnl >= 0) == (move_usd >= 0) else "SHORT"
+        # Actual hold time in minutes
+        hold_mins = (time.time() - self._entry_time) / 60.0 if self._entry_time > 0 else 0.0
+
+        # Streak emoji — show the last 5 trade outcomes
+        trade_log = self._risk.get_trade_log(5)
+        streak_icons = " ".join(
+            "✅" if t["net_pnl"] >= 0 else "❌"
+            for t in trade_log
+        )
+
+        now_utc = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+
+        elog.log("TRADE_EXIT",
+                 reason=reason,
+                 exit_price=exit_price,
+                 net_pnl=net_pnl,
+                 roe_pct=roe_pct,
+                 bars=bars_held)
 
         logger.info(
-            f"TRADE CLOSE ■ reason={reason} exit=${exit_price:,.1f} "
-            f"gross=${gross_pnl:+.4f} fees=$-{fees:.4f} net=${net_pnl:+.4f} "
-            f"ROE={roe_pct:+.2f}% bars={bars_held} "
-            f"daily_net=${daily['daily_pnl']:+.4f} "
-            f"trades={daily['trades_today']} consec_loss={daily['consecutive_losses']}"
+            "TRADE CLOSE ■ reason=%s  exit=$%,.1f  entry=$%,.1f  "
+            "gross=$%+.4f  fees=$-%.4f  net=$%+.4f  ROE=%+.2f%%  "
+            "bars=%d  daily_net=$%+.4f  trades=%d  consec_loss=%.1f",
+            reason, exit_price, entry_px,
+            gross_pnl, fees, net_pnl, roe_pct,
+            bars_held,
+            daily["daily_pnl"], daily["trades_today"], daily["consecutive_losses"],
         )
+
         self._push(
-            f"{emoji} *EXIT: {reason}*\n"
-            f"Exit: `${exit_price:,.1f}`\n"
-            f"Gross: `${gross_pnl:+.4f}` | Fees: `$-{fees:.4f}`\n"
-            f"*Net: `${net_pnl:+.4f}`* | ROE: `{roe_pct:+.2f}%`\n"
-            f"Held: `{bars_held}` bars\n"
-            f"Daily: gross `${daily.get('daily_gross_pnl', 0):+.4f}` "
-            f"net `${daily['daily_pnl']:+.4f}` "
-            f"fees `$-{daily.get('daily_fees', 0):.4f}`\n"
-            f"Trades: `{daily['trades_today']}`"
+            f"{emoji} *EXIT: {reason}*  ⏱ `{now_utc}`\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📍 Entry: `${entry_px:,.1f}` → Exit: `${exit_price:,.1f}`\n"
+            f"   Move: `{move_usd:+.1f}` USD  /  `{move_pct:+.2f}%`\n"
+            f"   Held: `{bars_held}` bars  /  `{hold_mins:.1f}` min\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💵 Gross: `${gross_pnl:+.4f}`  │  Fees: `$-{fees:.4f}`\n"
+            f"{'✅' if net_pnl >= 0 else '❌'} *Net P&L: `${net_pnl:+.4f}`*  │  ROE: `{roe_pct:+.2f}%`\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 Session today:\n"
+            f"   Trades: `{daily['trades_today']}`  │  Net: `${daily['daily_pnl']:+.4f}`\n"
+            f"   Fees: `$-{daily['daily_fees']:.4f}`  │  High: `${daily['session_high_pnl']:+.4f}`\n"
+            f"   Streak: {streak_icons}  │  Consec loss: `{daily['consecutive_losses']}`"
         )
 
     # ─── NOTIFICATIONS ────────────────────────────────────────────────────────
@@ -527,7 +606,7 @@ class HPMSStrategy:
             try:
                 self._notify(text)
             except Exception as e:
-                logger.debug(f"Telegram notify error: {e}")
+                logger.debug("Telegram notify error: %s", e)
 
     # ─── STATUS ───────────────────────────────────────────────────────────────
 
