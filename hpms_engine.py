@@ -230,9 +230,25 @@ def _detect_regime(closes: np.ndarray, lookback: int = 30) -> Tuple[RegimeType, 
     mid_price = np.mean(window)
     norm_vol = (atr / mid_price * 100) if mid_price > 0 else 0.0
 
-    if norm_vol > 0.15:  # high volatility regime
+    # RC4 fix: regime classification thresholds.
+    #
+    # Original thresholds misclassified almost every session:
+    #   VOLATILE: norm_vol > 0.15% → ATR > $127/bar at $85k.  This is extreme
+    #     crash territory that never occurs during normal 1m BTC trading.
+    #     Result: VOLATILE never fired.
+    #   TRENDING: efficiency > 0.35 → 13% of pure random walks qualify.
+    #     Result: noise triggered TRENDING, giving spurious c5=0.9 confidence
+    #     boosts that bypassed the CHOPPY filter.
+    #   Net: 85%+ of sessions were CHOPPY → c5=0.4 → most signals blocked.
+    #
+    # Calibrated thresholds:
+    #   VOLATILE: norm_vol > 0.07% → ATR > ~$60/bar — genuine elevated vol on
+    #     1m BTC (covers 95th-percentile bars, not just crash outliers).
+    #   TRENDING: efficiency > 0.45 → only ~5% of random walks qualify,
+    #     requiring genuine directional movement across the lookback window.
+    if norm_vol > 0.07:   # ATR > ~$60/bar at $85k — real elevated volatility
         return RegimeType.VOLATILE, trend_strength
-    elif efficiency > 0.35:  # trending
+    elif efficiency > 0.45:  # ~5% of random walks — genuine trend required
         return RegimeType.TRENDING, trend_strength
     else:  # choppy
         return RegimeType.CHOPPY, trend_strength
@@ -949,6 +965,7 @@ class HPMSEngine:
                 closes=closes_arr,
                 volumes=volumes_arr,
                 fee_rate=self._fee_rate,
+                predicted_pct_move=predicted_pct_move,
                 min_rr=self._fib_min_rr,
                 sl_atr_buffer_mult=self._fib_sl_atr_buffer,
                 tp_cap_pct=self._fib_tp_cap_pct,

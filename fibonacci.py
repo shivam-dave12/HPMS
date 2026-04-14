@@ -211,12 +211,26 @@ def _extract_hlv(closes: np.ndarray, volumes: np.ndarray) -> Tuple[np.ndarray, n
     """
     diffs = np.zeros_like(closes)
     diffs[1:] = np.abs(np.diff(closes))
-    half_range = diffs * 0.5
-    # Ensure minimum range from ATR-like measure
-    min_range = np.mean(diffs[diffs > 0]) * 0.3 if np.any(diffs > 0) else 1.0
-    half_range = np.maximum(half_range, min_range)
+    # Use a rolling-ATR estimate rather than the per-bar close difference.
+    #
+    # Root cause (RC2): half_range = |Δclose| × 0.5 gives H/L spans of ~$46 on
+    # BTC 1m bars where real wicks average ~$90.  All swing detection ran on
+    # these compressed synthetic candles, producing pivot points too close to
+    # the current price and SLs that sat inside wick noise.
+    #
+    # Fix: half_range = rolling_ATR × 0.80
+    #   H/L = ATR × 1.60 — empirically matches BTC 1m wick distribution.
+    #   Swing ranges double, giving structurally meaningful Fibonacci levels.
+    atr_window = min(20, max(2, len(diffs)))
+    recent_diffs = diffs[-atr_window:]
+    rolling_atr = (
+        float(np.mean(recent_diffs[recent_diffs > 0]))
+        if np.any(recent_diffs > 0)
+        else 1.0
+    )
+    half_range = np.full_like(closes, rolling_atr * 0.80)
     highs = closes + half_range
-    lows = closes - half_range
+    lows  = closes - half_range
     return highs, lows, volumes
 
 
@@ -383,6 +397,7 @@ def compute_fib_tp_sl(
     closes: np.ndarray,
     volumes: np.ndarray,
     fee_rate: float,
+    predicted_pct_move: float = 0.0,
     min_rr: float = 2.0,
     sl_atr_buffer_mult: float = 0.3,
     tp_cap_pct: float = 0.008,
@@ -528,9 +543,41 @@ def compute_fib_tp_sl(
     sl_distance = abs(current_price - sl_price)
 
     # ── TP selection ──────────────────────────────────────────────────────
-    tp_max_dist = current_price * tp_cap_pct
-    tp_min_dist = sl_distance * min_rr  # ensure minimum R:R
-    tp_min_dist = max(tp_min_dist, fee_rt_price * 3.0)  # must exceed 3× fees
+    #
+    # RC1 fix: TP ceiling is anchored to the engine's predicted move.
+    #
+    # Root cause: Fib extensions of detected swings were $250–$600 for a $42
+    # predicted move because the extension ratio (1.272–1.618) applied to the
+    # SWING RANGE, not to the prediction.  The trade physically cannot reach a
+    # $400 TP in a 5-bar horizon when the predicted move is $42.
+    #
+    # RC3 fix: tp_min_dist proportional to ATR, not to per-BTC fee math.
+    # fee_rt_price × 3.0 imposed a $270 floor regardless of prediction size,
+    # forcing TP to 6× the prediction.  Position sizing in risk_manager handles
+    # fee economics; the TP just needs to exceed the noise floor (1 ATR).
+    #
+    # New TP architecture:
+    #   1. Compute prediction-derived target distance (pred_dist).
+    #   2. Hard ceiling = pred_dist × 3.5 — Fib levels beyond this are
+    #      structurally valid but unreachable in the prediction horizon.
+    #   3. Fib selection runs inside [tp_min_dist, tp_max_dist].
+    #      If a Fib level qualifies → use it (highest-confluence wins).
+    #   4. Fallback priority:
+    #      a) If pred_dist is in bounds → snap to nearest Fib within
+    #         confluence_tol × ATR of pred_dist; else use pred_dist directly.
+    #      b) Last resort: ATR × 3.0 (structurally modest, never > tp_max_dist).
+    pred_dist = abs(predicted_pct_move) * current_price
+
+    # Cap TP at 3.5× the predicted move (when prediction is actionable)
+    if pred_dist > atr * 0.5:
+        tp_pred_cap = pred_dist * 3.5
+    else:
+        tp_pred_cap = current_price * tp_cap_pct
+
+    tp_max_dist = min(current_price * tp_cap_pct, tp_pred_cap)
+    # Proportional floor: must maintain min R:R, and must clear the ATR noise band.
+    # No per-BTC fee floor — that was RC3.
+    tp_min_dist = max(sl_distance * min_rr, atr * 1.0)
 
     tp_candidates = levels_above if is_long else levels_below
     tp_price, tp_ratio, tp_confluence = _select_tp_level(
@@ -543,30 +590,71 @@ def compute_fib_tp_sl(
     )
 
     tp_source = "FIB"
-    # If no Fibonacci level qualified, use ATR-scaled TP
     if tp_price <= 0:
-        tp_source = "ATR_FALLBACK"
-        tp_dist = min(atr * 5.0, tp_max_dist)
-        tp_dist = max(tp_dist, tp_min_dist)
-        tp_price = (current_price + tp_dist) if is_long else (current_price - tp_dist)
-        tp_ratio = 0.0
-        tp_confluence = 0.0
-        logger.debug(
-            "compute_fib_tp_sl: no Fib TP found — using ATR fallback tp_dist=%.1f", tp_dist
-        )
+        # No Fib level in window — resolve via prediction target then ATR
+        if pred_dist >= tp_min_dist:
+            # Try to snap to a Fib level within confluence_tol × ATR of pred_dist
+            tol = confluence_tolerance_atr * atr
+            snap_candidates = [
+                lv for lv in tp_candidates
+                if abs(abs(lv.price - current_price) - pred_dist) <= tol
+            ]
+            if snap_candidates:
+                best_snap = max(snap_candidates, key=lambda lv: lv.confluence)
+                tp_price      = best_snap.price
+                tp_ratio      = best_snap.ratio
+                tp_confluence = best_snap.confluence
+                tp_source     = "FIB_SNAP"
+                logger.debug(
+                    "compute_fib_tp_sl: snap to Fib %.3f@%.1f near pred_dist=%.1f",
+                    tp_ratio, tp_price, pred_dist,
+                )
+            else:
+                # Use the prediction target directly — it's within the prediction
+                # horizon and the most economically honest choice.
+                tp_dist = min(pred_dist, tp_max_dist)
+                tp_price     = (current_price + tp_dist) if is_long else (current_price - tp_dist)
+                tp_ratio     = 0.0
+                tp_confluence = 0.0
+                tp_source     = "PRED_TARGET"
+                logger.debug(
+                    "compute_fib_tp_sl: using prediction target tp_dist=%.1f (pred_pct=%.5f)",
+                    tp_dist, predicted_pct_move,
+                )
+        else:
+            # Prediction too small (or zero) — fall back to ATR-scaled target.
+            # tp_max_dist is the unconditional ceiling.  Do NOT apply tp_min_dist
+            # here: if sl_distance is wide enough that tp_min_dist > tp_max_dist,
+            # the R:R gate below will correctly reject the trade.  Forcing
+            # tp_dist = max(tp_dist, tp_min_dist) would silently breach tp_max_dist,
+            # producing a TP that is physically unreachable in the prediction horizon.
+            tp_source    = "ATR_FALLBACK"
+            tp_dist      = min(atr * 3.0, tp_max_dist)
+            tp_price     = (current_price + tp_dist) if is_long else (current_price - tp_dist)
+            tp_ratio     = 0.0
+            tp_confluence = 0.0
+            logger.debug(
+                "compute_fib_tp_sl: no Fib TP and pred_dist=%.1f < tp_min=%.1f "
+                "— ATR fallback tp_dist=%.1f",
+                pred_dist, tp_min_dist, tp_dist,
+            )
 
     tp_distance = abs(tp_price - current_price)
 
     # ── R:R validation ────────────────────────────────────────────────────
     gross_rr = tp_distance / sl_distance if sl_distance > 0 else 0.0
 
-    # If R:R is below minimum, widen TP or tighten SL (prefer widening TP)
+    # Attempt to widen TP to recover minimum R:R — only when the required
+    # TP distance fits within tp_max_dist.  When it doesn't fit, gross_rr
+    # remains below min_rr and the engine's R:R gate rejects the trade.
+    # We do NOT force TP beyond tp_max_dist to satisfy R:R — that would
+    # place TP outside the prediction horizon and negate the whole architecture.
     if gross_rr < min_rr and sl_distance > 0:
         needed_tp_dist = sl_distance * min_rr
         if needed_tp_dist <= tp_max_dist:
             tp_distance = needed_tp_dist
-            tp_price = (current_price + tp_distance) if is_long else (current_price - tp_distance)
-            gross_rr = min_rr
+            tp_price    = (current_price + tp_distance) if is_long else (current_price - tp_distance)
+            gross_rr    = min_rr
 
     return FibTPSL(
         tp_price=round(tp_price, 1),
@@ -672,29 +760,23 @@ def _select_tp_level(
     """
     Select the best TP Fibonacci level from candidates.
 
-    Priority:
-      1. Within distance bounds
-      2. Preferred extension ratios (1.272, 1.618 are the primary institutional targets)
-      3. Highest confluence
+    Both min_dist and max_dist are hard bounds — no uncapped fallback.
+    The caller (compute_fib_tp_sl) owns the fallback logic and will apply
+    the prediction-target or ATR fallback when nothing qualifies here.
+
+    Priority among qualifying levels:
+      1. Preferred extension ratios (1.272, 1.618 are primary institutional targets)
+      2. Highest confluence score
 
     Returns (price, ratio, confluence) or (0, 0, 0) if none qualify.
     """
     if not candidates:
         return 0.0, 0.0, 0.0
 
-    valid = []
-    for lv in candidates:
-        dist = abs(lv.price - current_price)
-        if min_dist <= dist <= max_dist:
-            valid.append(lv)
-
-    if not valid:
-        # Take the nearest extension level that's at least min_dist away
-        for lv in candidates:
-            dist = abs(lv.price - current_price)
-            if dist >= min_dist and lv.kind == "extension":
-                valid.append(lv)
-                break
+    valid = [
+        lv for lv in candidates
+        if min_dist <= abs(lv.price - current_price) <= max_dist
+    ]
 
     if not valid:
         return 0.0, 0.0, 0.0
@@ -770,8 +852,8 @@ def format_fib_telegram_section(result: FibTPSL, side: str) -> str:
     ) or "none"
 
     hlv_label = "✅ REAL OHLCV" if result.used_actual_hlv else "⚠️ synthesised (no H/L)"
-    sl_src_emoji = "✅" if result.sl_source == "FIB" else ("⚠️" if result.sl_source == "FIB_RELAXED" else "❌")
-    tp_src_emoji = "✅" if result.tp_source == "FIB" else ("⚠️" if result.tp_source == "FIB_RELAXED" else "❌")
+    sl_src_emoji = "✅" if result.sl_source == "FIB" else ("⚠️" if result.sl_source in ("FIB_RELAXED",) else "❌")
+    tp_src_emoji = "✅" if result.tp_source == "FIB" else ("⚠️" if result.tp_source in ("FIB_RELAXED", "FIB_SNAP", "PRED_TARGET") else "❌")
 
     lines = [
         "📐 *Fibonacci Analysis*",
