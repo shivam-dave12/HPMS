@@ -435,11 +435,11 @@ class HPMSStrategy:
                          note=f"rr={rr:.2f}  bar={self._bar_count}")
 
                 logger.info(
-                    "TRADE OPEN ▶ %s %dc @ $%,.1f  TP=$%,.1f  SL=$%,.1f  "
+                    "TRADE OPEN ▶ %s %dc @ $%s  TP=$%s  SL=$%s  "
                     "RR=%.2f  margin=$%.2f  fee=$-%.4f  conf=%.1f%%  "
                     "regime=%s  trend=%+.3f  id=%s",
-                    side.upper(), size, actual_entry,
-                    signal.tp_price, signal.sl_price, rr,
+                    side.upper(), size, f"{actual_entry:,.1f}",
+                    f"{float(signal.tp_price):,.1f}", f"{float(signal.sl_price):,.1f}", rr,
                     margin_used, entry_fee, signal.confidence * 100,
                     signal_regime.name, sig_trend_str,
                     result.get("order_id", ""),
@@ -574,10 +574,10 @@ class HPMSStrategy:
                  bars=bars_held)
 
         logger.info(
-            "TRADE CLOSE ■ reason=%s  exit=$%,.1f  entry=$%,.1f  "
+            "TRADE CLOSE ■ reason=%s  exit=$%s  entry=$%s  "
             "gross=$%+.4f  fees=$-%.4f  net=$%+.4f  ROE=%+.2f%%  "
             "bars=%d  daily_net=$%+.4f  trades=%d  consec_loss=%.1f",
-            reason, exit_price, entry_px,
+            reason, f"{exit_price:,.1f}", f"{entry_px:,.1f}",
             gross_pnl, fees, net_pnl, roe_pct,
             bars_held,
             daily["daily_pnl"], daily["trades_today"], daily["consecutive_losses"],
