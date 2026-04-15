@@ -17,8 +17,11 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional
+
+# ── Indian Standard Time (UTC +5:30) — all user-facing timestamps use IST ────
+_IST = timezone(timedelta(hours=5, minutes=30), name="IST")
 
 import numpy as _np                                          # module-level — not per-bar
 
@@ -421,7 +424,7 @@ class HPMSStrategy:
                 self._last_margin_used  = margin_used
                 self._entry_time        = time.time()
 
-                now_utc = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+                now_ist = datetime.now(_IST).strftime("%H:%M:%S IST")
 
                 # Daily session snapshot for context
                 daily = self._risk.get_status()
@@ -446,7 +449,7 @@ class HPMSStrategy:
                 )
 
                 self._push(
-                    f"🚀 *ENTRY {side.upper()}*  ⏱ `{now_utc}`\n"
+                    f"🚀 *ENTRY {side.upper()}*  ⏱ `{now_ist}`\n"
                     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"📍 `{size}c` × `${actual_entry:,.1f}`\n"
                     f"   Notional: `${notional:,.2f}`  │  Margin: `${margin_used:.2f}` @ `{leverage}x`\n"
@@ -564,7 +567,7 @@ class HPMSStrategy:
             for t in trade_log
         )
 
-        now_utc = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+        now_ist = datetime.now(_IST).strftime("%H:%M:%S IST")
 
         elog.log("TRADE_EXIT",
                  reason=reason,
@@ -584,7 +587,7 @@ class HPMSStrategy:
         )
 
         self._push(
-            f"{emoji} *EXIT: {reason}*  ⏱ `{now_utc}`\n"
+            f"{emoji} *EXIT: {reason}*  ⏱ `{now_ist}`\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📍 Entry: `${entry_px:,.1f}` → Exit: `${exit_price:,.1f}`\n"
             f"   Move: `{move_usd:+.1f}` USD  /  `{move_pct:+.2f}%`\n"
