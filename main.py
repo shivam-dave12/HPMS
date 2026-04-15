@@ -23,7 +23,7 @@ import signal
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -42,6 +42,9 @@ from exchanges.delta.data_manager import DeltaDataManager
 
 logger = logging.getLogger("hpms")
 
+# ── Indian Standard Time (UTC +5:30) — used for all log timestamps ───────────
+_IST = timezone(timedelta(hours=5, minutes=30), name="IST")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING SETUP
@@ -52,11 +55,12 @@ class _ColoredFormatter(logging.Formatter):
     Rich, color-coded terminal formatter.
 
     Layout:
-      HH:MM:SS.mmm  ▸  LVL  MODULE    message…
+      HH:MM:SS.mmm IST  ▸  LVL  MODULE    message…
 
     Level colors:  DEBUG=cyan  INFO=green  WARNING=yellow  ERROR=red  CRITICAL=magenta
     Module column: always 8 chars wide, dimmed for readability.
     Continuation lines are indented to align under the message.
+    All timestamps shown in Indian Standard Time (IST, UTC+5:30).
     """
 
     _RESET   = "\033[0m"
@@ -87,14 +91,16 @@ class _ColoredFormatter(logging.Formatter):
         "exchanges.delta.websocket":    "WS",
     }
 
-    # Indent width = timestamp(12) + space(1) + bullet(1) + space(2) + lvl(3) + space(2) + name(8) + space(2)
+    # Indent width = timestamp(16 incl. " IST") + space(1) + bullet(1) + space(2) + lvl(3) + space(2) + name(8) + space(2)
     _INDENT = " " * 31
 
     def format(self, record: logging.LogRecord) -> str:
         color, lvl, bullet = self._LEVELS.get(record.levelno, ("", "???", "·"))
         short_name = self._NAME_MAP.get(record.name, record.name.split(".")[-1][:8])
 
-        ts = self.formatTime(record, "%H:%M:%S")
+        # Convert record timestamp to IST
+        ts_ist = datetime.fromtimestamp(record.created, tz=_IST)
+        ts = ts_ist.strftime("%H:%M:%S")
         ms = f"{record.msecs:03.0f}"
 
         # Highlight WARNING / ERROR lines with a leading accent bar
@@ -103,7 +109,7 @@ class _ColoredFormatter(logging.Formatter):
             accent = f"{color}▌{self._RESET} "
 
         header = (
-            f"{self._DIM}{ts}.{ms}{self._RESET} "
+            f"{self._DIM}{ts}.{ms} IST{self._RESET} "
             f"{color}{bullet}{self._RESET}  "
             f"{color}{self._BOLD}{lvl}{self._RESET}  "
             f"{self._DIM}{short_name:<8}{self._RESET}  "
@@ -120,14 +126,14 @@ class _ColoredFormatter(logging.Formatter):
 
 
 class _PlainFormatter(logging.Formatter):
-    """Plain formatter for file output — no ANSI codes, full timestamps."""
+    """Plain formatter for file output — no ANSI codes, full timestamps in IST."""
 
     def format(self, record: logging.LogRecord) -> str:
-        ts  = datetime.fromtimestamp(record.created, tz=timezone.utc).strftime(
+        ts = datetime.fromtimestamp(record.created, tz=_IST).strftime(
             "%Y-%m-%d %H:%M:%S.%f"
         )[:-3]  # trim to ms
         return (
-            f"{ts} UTC  {record.levelname:<8}  "
+            f"{ts} IST  {record.levelname:<8}  "
             f"{record.name:<35}  {record.getMessage()}"
         )
 
@@ -394,7 +400,7 @@ class HPMSRunner:
                  status="fully_operational", mode=mode_str, network=net_str)
 
         # ── Startup notification ───────────────────────────────────────────────
-        now_utc    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        now_ist    = datetime.now(_IST).strftime("%Y-%m-%d %H:%M:%S IST")
         mode_icon  = "🧪" if self._dry_run else "⚡"
         net_icon   = "🔬" if self._testnet  else "🌐"
 
@@ -403,7 +409,7 @@ class HPMSRunner:
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             + mode_icon + " Mode:          `" + mode_str                                    + "`\n"
             + net_icon  + " Network:       `" + net_str                                     + "`\n"
-            "⏱ Started:       `" + now_utc                                                  + "`\n"
+            "⏱ Started:       `" + now_ist                                                  + "`\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "📊 *Instrument*\n"
             "  Symbol:       `" + config.DELTA_SYMBOL                                       + "`\n"
@@ -616,7 +622,7 @@ class HPMSRunner:
 
         if self._telegram:
             net_str  = "TESTNET" if self._testnet  else "MAINNET"
-            now_utc  = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+            now_ist  = datetime.now(_IST).strftime("%H:%M:%S IST")
 
             # Pull final session stats for shutdown message
             shutdown_pnl  = ""
@@ -635,7 +641,7 @@ class HPMSRunner:
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 "Mode:    `" + STATE.mode + "`\n"
                 "Network: `" + net_str    + "`\n"
-                "Time:    `" + now_utc    + "`"
+                "Time:    `" + now_ist    + "`"
                 + shutdown_pnl + "\n\n"
                 "_All positions handled.  System offline._\n"
                 "_Restart: `python main.py`_"

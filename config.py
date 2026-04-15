@@ -222,7 +222,7 @@ TRAILING_WARMUP_BARS          = 3        # ↑ was 2 — 3 bars of development f
 TRAILING_BE_ACTIVATION_PCT    = 0.25     # ↑ was 0.20 — activate at 25% of TP
 TRAILING_BE_FEE_MARGIN        = 1.25     # ↑ was 1.10 — genuine net-zero breakeven
 TRAILING_MIN_STEP_TICKS       = 1.0      # ↑ was 0.5 — fewer API calls
-TRAILING_ABSOLUTE_MAX_BARS    = 120      # keep — 2-hour hard ceiling, exits ONLY if profitable
+TRAILING_ABSOLUTE_MAX_BARS    = 180      # keep — 3-hour hard ceiling, exits ONLY if profitable
 
 # ── Trade execution ───────────────────────────────────────────────────────
 #

@@ -9,12 +9,21 @@ circuit-breaker event fires an immediate push notification.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional, Tuple
+
+# ── Indian Standard Time (UTC +5:30) ─────────────────────────────────────────
+_IST = timezone(timedelta(hours=5, minutes=30), name="IST")
+
+# Persistent trade log — survives daily resets and process restarts.
+# Each line is a JSON object (one trade per line / newline-delimited JSON).
+_ALL_TRADES_FILE = "hpms_all_trades.json"
 
 from logger_core import elog
 
@@ -424,6 +433,33 @@ class RiskManager:
             self._open_trade.reason     = reason
             self._open_trade.closed     = True
             self._trades_today.append(self._open_trade)
+
+            # ── Persist to disk so /overallpnl survives restarts/daily resets ─
+            try:
+                rec = self._open_trade
+                entry = {
+                    "timestamp":   rec.timestamp,
+                    "ist_time":    datetime.fromtimestamp(rec.timestamp, tz=_IST)
+                                   .strftime("%Y-%m-%d %H:%M:%S IST"),
+                    "side":        rec.side,
+                    "entry_price": rec.entry_price,
+                    "exit_price":  rec.exit_price,
+                    "size":        rec.size,
+                    "gross_pnl":   round(rec.gross_pnl, 6),
+                    "fees_usd":    round(rec.fees_usd, 6),
+                    "net_pnl":     round(rec.net_pnl, 6),
+                    "roe_pct":     round(
+                        rec.net_pnl / rec.margin_used * 100, 3
+                    ) if rec.margin_used > 0 else 0.0,
+                    "hold_bars":   rec.hold_bars,
+                    "reason":      rec.reason,
+                    "margin_used": round(rec.margin_used, 4),
+                }
+                with open(_ALL_TRADES_FILE, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(entry) + "\n")
+            except Exception as _e:
+                logger.warning("Could not persist trade to %s: %s", _ALL_TRADES_FILE, _e)
+
             self._open_trade = None
 
             # Track daily PnL using NET (after fees) — real money
@@ -585,8 +621,8 @@ class RiskManager:
             return [
                 {
                     "time":      datetime.fromtimestamp(
-                        t.timestamp, tz=timezone.utc
-                    ).strftime("%H:%M:%S"),
+                        t.timestamp, tz=_IST
+                    ).strftime("%H:%M:%S IST"),
                     "side":      t.side,
                     "entry":     t.entry_price,
                     "exit":      t.exit_price,
@@ -602,3 +638,28 @@ class RiskManager:
                 }
                 for t in self._trades_today[-last_n:]
             ]
+
+    def get_all_trades_ever(self) -> List[Dict]:
+        """
+        Return every trade recorded since the bot first ran, loaded from the
+        persistent newline-delimited JSON file on disk.  Trades recorded
+        during the current session that have not yet been flushed are already
+        in the file (written in on_trade_close), so this is always complete.
+
+        Returns an empty list if the file does not exist or cannot be parsed.
+        """
+        trades: List[Dict] = []
+        if not os.path.exists(_ALL_TRADES_FILE):
+            return trades
+        try:
+            with open(_ALL_TRADES_FILE, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        try:
+                            trades.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            pass  # skip corrupted lines
+        except Exception as e:
+            logger.warning("Could not read %s: %s", _ALL_TRADES_FILE, e)
+        return trades

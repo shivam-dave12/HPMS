@@ -52,10 +52,13 @@ import asyncio
 import logging
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
+
+# ── Indian Standard Time (UTC +5:30) ─────────────────────────────────────────
+_IST = timezone(timedelta(hours=5, minutes=30), name="IST")
 
 try:
     from telegram import Update, BotCommand
@@ -95,9 +98,9 @@ def _md_safe(text: str) -> str:
     return str(text).replace("`", "'").replace("*", "x").replace("_", "-")
 
 
-def _utc_now() -> str:
-    """Current UTC time as HH:MM:SS UTC."""
-    return datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+def _ist_now() -> str:
+    """Current Indian Standard Time as HH:MM:SS IST."""
+    return datetime.now(_IST).strftime("%H:%M:%S IST")
 
 
 def _streak_icons(trade_log: List[Dict], n: int = 5) -> str:
@@ -213,6 +216,7 @@ class TelegramBot:
             "filter":        self._cmd_filter,
             "trades":        self._cmd_trades,
             "pnl":           self._cmd_pnl,
+            "overallpnl":    self._cmd_overall_pnl,
             "balance":       self._cmd_balance,
             "position":      self._cmd_position,
             "risk":          self._cmd_risk,
@@ -281,6 +285,7 @@ class TelegramBot:
                     BotCommand("market",        "Price, spread, ATR, data readiness"),
                     BotCommand("filter",        "Filter gate pass/fail vs market"),
                     BotCommand("pnl",           "Daily P&L summary"),
+                    BotCommand("overallpnl",    "All-time P&L since bot started (survives resets)"),
                     BotCommand("trades",        "Recent trade log"),
                     BotCommand("position",      "Open position + unrealised PnL"),
                     BotCommand("risk",          "Risk gate status"),
@@ -466,7 +471,7 @@ class TelegramBot:
             streak = _streak_icons(self._risk.get_trade_log(5) if self._risk else [])
 
             return (
-                f"📡 *HPMS Periodic Report*  ⏱ `{_utc_now()}`\n"
+                f"📡 *HPMS Periodic Report*  ⏱ `{_ist_now()}`\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"{strat_icon} Strategy: `{'ON' if strat_on else 'OFF'}`   "
                 f"{halt_icon} Risk: `{'HALTED' if is_halted else 'OK'}`\n"
@@ -506,6 +511,7 @@ class TelegramBot:
                 "/filter — Filter gate status\n"
                 "/risk — Risk gate status\n"
                 "/pnl — Daily P&L\n"
+                "/overallpnl — All-time P&L since bot started\n"
                 "/trades — Trade log\n"
                 "/position — Open position\n"
                 "/balance — Balance\n"
@@ -549,7 +555,7 @@ class TelegramBot:
         msg = await update.message.reply_text("⏱ …")
         rtt = (time.time() - t0) * 1000
         await msg.edit_text(
-            f"🏓 Pong — `{rtt:.0f}ms` RTT — `{_utc_now()}`"
+            f"🏓 Pong — `{rtt:.0f}ms` RTT — `{_ist_now()}`"
         )
 
     async def _cmd_price(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -580,7 +586,7 @@ class TelegramBot:
             pass
 
         await update.message.reply_text(
-            f"💹 *Price*  ⏱ `{_utc_now()}`\n\n"
+            f"💹 *Price*  ⏱ `{_ist_now()}`\n\n"
             f"`${price:,.1f}`{spread_txt}\n"
             f"Feed: {'🟢 fresh' if fresh_ok else '🟡 stale'}",
             parse_mode="Markdown",
@@ -640,7 +646,7 @@ class TelegramBot:
             streak = _streak_icons(self._risk.get_trade_log(5) if self._risk else [])
 
             await update.message.reply_text(
-                f"📊 *HPMS Dashboard*  ⏱ `{_utc_now()}`\n"
+                f"📊 *HPMS Dashboard*  ⏱ `{_ist_now()}`\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"Strategy:  `{'▶ ON — entering new trades' if s.get('enabled') else '⏸ OFF — no new entries'}`\n"
                 f"Data feed: `{'🟢 Ready' if dm_ok else '🔴 Not Ready'}`\n"
@@ -688,7 +694,7 @@ class TelegramBot:
         if not await self._guard(update):
             return
         try:
-            lines = [f"🧠 *HPMS Decision Stack*  ⏱ `{_utc_now()}`"]
+            lines = [f"🧠 *HPMS Decision Stack*  ⏱ `{_ist_now()}`"]
             price = self._data.get_last_price() if self._data else 0
             if price:
                 lines.append(f"Price at query: `${price:,.1f}`")
@@ -938,7 +944,7 @@ class TelegramBot:
                 pass
 
             lines = [
-                f"📈 *Market Snapshot*  ⏱ `{_utc_now()}`\n",
+                f"📈 *Market Snapshot*  ⏱ `{_ist_now()}`\n",
                 f"Price:   `${price:,.1f}`",
                 f"Data:    {_gate(dm_ok)} ready  {_gate(fresh_ok)} fresh\n",
                 f"Spread:  {spread_txt}",
@@ -1022,7 +1028,7 @@ class TelegramBot:
             return
         try:
             price = self._data.get_last_price() if self._data else 0
-            lines = [f"🔍 *Filter Gate @ `${price:,.1f}`*  ⏱ `{_utc_now()}`\n"]
+            lines = [f"🔍 *Filter Gate @ `${price:,.1f}`*  ⏱ `{_ist_now()}`\n"]
             lines.append(self._build_filter_inline())
             await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
         except Exception as e:
@@ -1069,7 +1075,7 @@ class TelegramBot:
             streak = _streak_icons(self._risk.get_trade_log(5))
 
             await update.message.reply_text(
-                f"🛡 *Risk Gate Status*  ⏱ `{_utc_now()}`\n"
+                f"🛡 *Risk Gate Status*  ⏱ `{_ist_now()}`\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"{gate_icon} *Can trade: `{reason}`*\n\n"
                 f"Halted:     `{halt_info}`\n"
@@ -1114,7 +1120,7 @@ class TelegramBot:
         sl_pct  = sl_dist / s.entry_price * 100
 
         await update.message.reply_text(
-            f"🔬 *Last Signal*  ⏱ `{_utc_now()}`\n\n"
+            f"🔬 *Last Signal*  ⏱ `{_ist_now()}`\n\n"
             f"Type:       *{s.signal_type.name}*\n"
             f"Confidence: `{s.confidence:.1%}`\n"
             f"Predicted Δq: `{s.predicted_delta_q:+.6f}`\n"
@@ -1140,7 +1146,7 @@ class TelegramBot:
         dH_max = getattr(self._config, "SIGNAL_DH_DT_MAX", 0.05) if self._config else 0.05
         dH_ok  = abs(ps.dH_dt) <= dH_max
         await update.message.reply_text(
-            f"🌀 *Phase-Space State*  ⏱ `{_utc_now()}`\n\n"
+            f"🌀 *Phase-Space State*  ⏱ `{_ist_now()}`\n\n"
             f"q (position):   `{ps.q:+.6f}`\n"
             f"p (momentum):   `{ps.p:+.6f}`\n"
             f"H (energy):     `{ps.H:.6f}`\n"
@@ -1159,7 +1165,7 @@ class TelegramBot:
         ps = d.get("phase_state", {})
         hs = d.get("H_smoothing", {})
         text = (
-            f"🔧 *Engine Diagnostics*  ⏱ `{_utc_now()}`\n\n"
+            f"🔧 *Engine Diagnostics*  ⏱ `{_ist_now()}`\n\n"
             f"Landscape built: `{d.get('landscape_built')}`\n"
             f"KDE rebuild: `{d.get('bars_since_kde_build')}`/`{d.get('kde_rebuild_interval')}` bars\n"
             f"History len: `{d.get('history_len')}` bars\n"
@@ -1189,7 +1195,7 @@ class TelegramBot:
             return
 
         cfg   = self._config
-        lines = [f"⚙️ *Engine Parameters*  ⏱ `{_utc_now()}`\n"]
+        lines = [f"⚙️ *Engine Parameters*  ⏱ `{_ist_now()}`\n"]
 
         sections = {
             "Phase Space": [
@@ -1254,7 +1260,7 @@ class TelegramBot:
             await update.message.reply_text("📋 No trades today yet")
             return
 
-        lines = [f"📋 *Recent Trades*  ⏱ `{_utc_now()}`\n"]
+        lines = [f"📋 *Recent Trades*  ⏱ `{_ist_now()}`\n"]
         total_gross = total_fees = total_net = 0.0
 
         for t in trades:
@@ -1308,7 +1314,7 @@ class TelegramBot:
         streak = _streak_icons(self._risk.get_trade_log(5) if self._risk else [])
 
         await update.message.reply_text(
-            f"{pnl_icon} *Daily P&L*  ⏱ `{_utc_now()}`\n"
+            f"{pnl_icon} *Daily P&L*  ⏱ `{_ist_now()}`\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"Gross:        `${gross_pnl:+.4f}`\n"
             f"Total fees:   `$-{fees:.4f}`\n"
@@ -1323,15 +1329,359 @@ class TelegramBot:
             parse_mode="Markdown",
         )
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # /overallpnl — ALL-TIME P&L REPORT (persists across resets & restarts)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    async def _cmd_overall_pnl(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """
+        Full lifetime P&L report built from the persistent trade log on disk.
+
+        Survives:
+          • Daily midnight resets (daily counters clear, file does not)
+          • Process restarts / crashes
+          • Manual /resume or /resetrisk calls
+
+        Sections
+        ────────
+        1. LIFETIME SUMMARY   — total net P&L, gross, fees, trade count,
+                                win rate, profit factor, avg per trade,
+                                best/worst trade, max drawdown from peak equity
+
+        2. PER-DAY BREAKDOWN  — each IST calendar day with its own
+                                gross / fees / net / trades / win-rate
+
+        3. BY EXIT REASON     — groups every exit reason (TP_HIT, SL_HIT,
+                                ENERGY_SPIKE, MAX_HOLD, TELEGRAM_CLOSE, etc.)
+                                ranked by net contribution
+
+        4. LONG vs SHORT      — side-by-side P&L stats for each direction
+
+        5. BEST / WORST 5     — top 5 and bottom 5 individual trades
+
+        6. RECENT 10          — last 10 trades newest-first with full detail
+        """
+        if not await self._guard(update):
+            return
+
+        try:
+            # ── Load from disk ────────────────────────────────────────────────
+            all_trades: List[Dict] = (
+                self._risk.get_all_trades_ever() if self._risk else []
+            )
+
+            if not all_trades:
+                await update.message.reply_text(
+                    "📊 *Overall P&L*\n\n"
+                    "No completed trades recorded yet.\n"
+                    "_Trades are saved to disk the moment they close and "
+                    "persist across daily resets and restarts._",
+                    parse_mode="Markdown",
+                )
+                return
+
+            # ── Helper: safe field getters ────────────────────────────────────
+            def _net(t: Dict) -> float:
+                return float(t.get("net_pnl", 0))
+
+            def _gross(t: Dict) -> float:
+                return float(t.get("gross_pnl", 0))
+
+            def _fee(t: Dict) -> float:
+                return float(t.get("fees_usd", 0))
+
+            def _roe(t: Dict) -> float:
+                return float(t.get("roe_pct", 0))
+
+            def _bars(t: Dict) -> int:
+                return int(t.get("hold_bars", 0))
+
+            def _side(t: Dict) -> str:
+                return str(t.get("side", "?")).lower()
+
+            def _reason(t: Dict) -> str:
+                """Shorten exit reason to a tidy label."""
+                r = str(t.get("reason", "UNKNOWN"))
+                for tag in ("TP_HIT", "SL_HIT", "ENERGY_SPIKE", "MAX_HOLD",
+                            "TELEGRAM_CLOSE", "TELEGRAM_HALT", "SHUTDOWN",
+                            "TRAIL", "BREAKEVEN"):
+                    if tag in r:
+                        return tag
+                return r.split(":")[0][:18]
+
+            def _day(t: Dict) -> str:
+                """Return the IST calendar date string YYYY-MM-DD."""
+                ts = t.get("timestamp", 0)
+                if ts:
+                    try:
+                        from datetime import timezone as _tz, timedelta as _td
+                        _ist_local = _tz(_td(hours=5, minutes=30))
+                        return datetime.fromtimestamp(
+                            float(ts), tz=_ist_local
+                        ).strftime("%Y-%m-%d")
+                    except Exception:
+                        pass
+                # Fallback: parse from ist_time field
+                ist_time = t.get("ist_time", "")
+                if len(ist_time) >= 10:
+                    return ist_time[:10]
+                return "unknown"
+
+            # ── Sort trades chronologically ───────────────────────────────────
+            sorted_ts = sorted(all_trades, key=lambda t: t.get("timestamp", 0))
+
+            # ── SECTION 1: LIFETIME SUMMARY ───────────────────────────────────
+            n           = len(all_trades)
+            total_net   = sum(_net(t)   for t in all_trades)
+            total_gross = sum(_gross(t) for t in all_trades)
+            total_fees  = sum(_fee(t)   for t in all_trades)
+            total_bars  = sum(_bars(t)  for t in all_trades)
+
+            winners   = [t for t in all_trades if _net(t) >= 0]
+            losers    = [t for t in all_trades if _net(t) <  0]
+            n_wins    = len(winners)
+            n_losses  = len(losers)
+            win_rate  = n_wins / n * 100 if n > 0 else 0.0
+
+            avg_net   = total_net   / n if n else 0.0
+            avg_fee   = total_fees  / n if n else 0.0
+            avg_bars  = total_bars  / n if n else 0.0
+
+            avg_win   = sum(_net(t) for t in winners) / n_wins   if n_wins   else 0.0
+            avg_loss  = sum(_net(t) for t in losers)  / n_losses if n_losses else 0.0
+
+            gross_wins   = sum(_net(t) for t in winners)
+            gross_losses = abs(sum(_net(t) for t in losers))
+            profit_factor = (gross_wins / gross_losses) if gross_losses > 0 else float("inf")
+
+            best_trade  = max(all_trades, key=_net)
+            worst_trade = min(all_trades, key=_net)
+
+            first_trade = sorted_ts[0]
+            last_trade  = sorted_ts[-1]
+            first_ist   = first_trade.get("ist_time", "?")
+            last_ist    = last_trade.get("ist_time",  "?")
+
+            # Max drawdown from running peak equity
+            equity = 0.0
+            peak   = 0.0
+            max_dd = 0.0
+            for t in sorted_ts:
+                equity += _net(t)
+                if equity > peak:
+                    peak = equity
+                dd = peak - equity
+                if dd > max_dd:
+                    max_dd = dd
+
+            pnl_icon = "💰" if total_net >= 0 else "🔻"
+            pf_txt   = f"{profit_factor:.2f}" if profit_factor != float("inf") else "∞"
+
+            part1_lines = [
+                f"{pnl_icon} *HPMS — All-Time P&L Report*",
+                f"⏱ `{_ist_now()}`",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                "",
+                "📈 *1. LIFETIME SUMMARY*",
+                f"  Period:        `{first_ist[:16]}` → `{last_ist[:16]}`",
+                f"  Total trades:  `{n}`  (✅ {n_wins} wins  /  ❌ {n_losses} losses)",
+                f"  Win rate:      `{win_rate:.1f}%`",
+                f"  Profit factor: `{pf_txt}`  _(gross wins ÷ gross losses)_",
+                "",
+                f"  Gross P&L:     `${total_gross:+.4f}`",
+                f"  Total fees:    `$-{total_fees:.4f}`",
+                f"  *Net P&L:      `${total_net:+.4f}`*",
+                "",
+                f"  Avg net/trade: `${avg_net:+.4f}`",
+                f"  Avg win:       `${avg_win:+.4f}`",
+                f"  Avg loss:      `${avg_loss:+.4f}`",
+                f"  Avg fee/trade: `$-{avg_fee:.4f}`",
+                f"  Avg hold:      `{avg_bars:.1f}` bars",
+                "",
+                f"  Best trade:    `${_net(best_trade):+.4f}`  "
+                f"({best_trade.get('ist_time','?')[:16]}  "
+                f"{_side(best_trade).upper()}  {_reason(best_trade)})",
+                f"  Worst trade:   `${_net(worst_trade):+.4f}`  "
+                f"({worst_trade.get('ist_time','?')[:16]}  "
+                f"{_side(worst_trade).upper()}  {_reason(worst_trade)})",
+                f"  Max equity DD: `${max_dd:.4f}`  _(peak-to-trough drawdown)_",
+                "",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                "📅 *2. PER-DAY BREAKDOWN (IST dates)*",
+            ]
+
+            days: Dict[str, List[Dict]] = {}
+            for t in sorted_ts:
+                days.setdefault(_day(t), []).append(t)
+
+            running_net = 0.0
+            for day_str in sorted(days.keys()):
+                day_trades = days[day_str]
+                d_net   = sum(_net(t)   for t in day_trades)
+                d_gross = sum(_gross(t) for t in day_trades)
+                d_fees  = sum(_fee(t)   for t in day_trades)
+                d_wins  = sum(1 for t in day_trades if _net(t) >= 0)
+                d_n     = len(day_trades)
+                d_wr    = d_wins / d_n * 100 if d_n else 0.0
+                running_net += d_net
+                d_icon  = "💰" if d_net >= 0 else "🔻"
+                part1_lines.append(
+                    f"  {d_icon} `{day_str}`  "
+                    f"net=`${d_net:+.4f}`  "
+                    f"gross=`${d_gross:+.4f}`  "
+                    f"fees=`$-{d_fees:.4f}`  "
+                    f"trades=`{d_n}`  "
+                    f"wr=`{d_wr:.0f}%`  "
+                    f"cumul=`${running_net:+.4f}`"
+                )
+
+            # ── SECTION 2 ─────────────────────────────────────────────────────
+            reasons: Dict[str, List[float]] = {}
+            for t in all_trades:
+                key = _reason(t)
+                reasons.setdefault(key, []).append(_net(t))
+
+            part2_lines = [
+                "",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                "🏷 *3. BY EXIT REASON*",
+                "  _(sorted by net P&L contribution, best first)_",
+            ]
+            for rkey in sorted(reasons, key=lambda k: sum(reasons[k]), reverse=True):
+                vals   = reasons[rkey]
+                r_net  = sum(vals)
+                r_n    = len(vals)
+                r_wins = sum(1 for v in vals if v >= 0)
+                r_wr   = r_wins / r_n * 100 if r_n else 0.0
+                r_avg  = r_net / r_n if r_n else 0.0
+                r_icon = "💰" if r_net >= 0 else "🔻"
+                part2_lines.append(
+                    f"  {r_icon} `{rkey:<18}`  "
+                    f"n=`{r_n}`  "
+                    f"net=`${r_net:+.4f}`  "
+                    f"avg=`${r_avg:+.4f}`  "
+                    f"wr=`{r_wr:.0f}%`"
+                )
+
+            # ── SECTION 3: LONG vs SHORT ──────────────────────────────────────
+            longs  = [t for t in all_trades if _side(t) == "long"]
+            shorts = [t for t in all_trades if _side(t) == "short"]
+
+            def _side_block(trades_list: List[Dict], label: str) -> List[str]:
+                if not trades_list:
+                    return [f"  {label}: no trades yet"]
+                sn     = len(trades_list)
+                s_net  = sum(_net(t)   for t in trades_list)
+                s_fees = sum(_fee(t)   for t in trades_list)
+                s_wins = sum(1 for t in trades_list if _net(t) >= 0)
+                s_wr   = s_wins / sn * 100 if sn else 0.0
+                s_avg  = s_net / sn if sn else 0.0
+                s_icon = "💰" if s_net >= 0 else "🔻"
+                s_wr_w = sum(_net(t) for t in trades_list if _net(t) >= 0) / s_wins \
+                         if s_wins else 0.0
+                s_wr_l = sum(_net(t) for t in trades_list if _net(t) < 0) / (sn - s_wins) \
+                         if (sn - s_wins) > 0 else 0.0
+                return [
+                    f"  {s_icon} *{label}*  trades=`{sn}`  wr=`{s_wr:.0f}%`",
+                    f"       net=`${s_net:+.4f}`  avg=`${s_avg:+.4f}`  "
+                    f"fees=`$-{s_fees:.4f}`",
+                    f"       avg win=`${s_wr_w:+.4f}`  avg loss=`${s_wr_l:+.4f}`",
+                ]
+
+            part2_lines += [
+                "",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                "📊 *4. LONG vs SHORT*",
+            ]
+            part2_lines += _side_block(longs, "LONG")
+            part2_lines += _side_block(shorts, "SHORT")
+
+            # ── SECTION 4: BEST / WORST 5 ─────────────────────────────────────
+            top5 = sorted(all_trades, key=_net, reverse=True)[:5]
+            bot5 = sorted(all_trades, key=_net)[:5]
+
+            def _trade_line(t: Dict, rank: int, icon: str) -> str:
+                return (
+                    f"  {icon} `{rank}.` "
+                    f"`{t.get('ist_time','?')[:16]}`  "
+                    f"*{_side(t).upper()}* `{t.get('size','?')}c`  "
+                    f"`${float(t.get('entry_price',0)):,.0f}`→"
+                    f"`${float(t.get('exit_price',0)):,.0f}`  "
+                    f"net=`${_net(t):+.4f}`  "
+                    f"roe=`{_roe(t):+.1f}%`  "
+                    f"_{_reason(t)}_"
+                )
+
+            part2_lines += [
+                "",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                "🏆 *5. BEST 5 TRADES*",
+            ]
+            for i, t in enumerate(top5, 1):
+                part2_lines.append(_trade_line(t, i, "🟢"))
+
+            part2_lines += ["", "💀 *WORST 5 TRADES*"]
+            for i, t in enumerate(bot5, 1):
+                part2_lines.append(_trade_line(t, i, "🔴"))
+
+            # ── SECTION 5: RECENT 10 ─────────────────────────────────────────
+            recent10    = list(reversed(sorted_ts[-10:]))
+            r_total_net = sum(_net(t) for t in recent10)
+            r_icon      = "💰" if r_total_net >= 0 else "🔻"
+
+            part3_lines = [
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                "🕐 *6. RECENT 10 TRADES* _(newest first)_",
+            ]
+            for t in recent10:
+                t_icon   = "💰" if _net(t) >= 0 else "🔻"
+                entry_px = float(t.get("entry_price", 0))
+                exit_px  = float(t.get("exit_price",  0))
+                move     = exit_px - entry_px
+                if _side(t) == "short":
+                    move = -move
+                move_pct = move / entry_px * 100 if entry_px else 0.0
+                part3_lines.append(
+                    f"{t_icon} `{t.get('ist_time','?')[:16]}`  "
+                    f"*{_side(t).upper()}* `{t.get('size','?')}c`  "
+                    f"`${entry_px:,.1f}`→`${exit_px:,.1f}` "
+                    f"(`{move_pct:+.2f}%`)  "
+                    f"net=`${_net(t):+.4f}`  roe=`{_roe(t):+.1f}%`  "
+                    f"fee=`$-{_fee(t):.4f}`  `{_bars(t)}b`  "
+                    f"_{_reason(t)}_"
+                )
+            part3_lines.append(
+                f"\n{r_icon} *Last 10 net total: `${r_total_net:+.4f}`*"
+            )
+            part3_lines.append(
+                "\n_/trades for today's session  ·  /pnl for daily summary_"
+            )
+
+            # ── SEND IN 3 PARTS (Telegram 4096-char limit) ───────────────────
+            for part in (
+                "\n".join(part1_lines),
+                "\n".join(part2_lines),
+                "\n".join(part3_lines),
+            ):
+                try:
+                    await update.message.reply_text(part, parse_mode="Markdown")
+                except Exception:
+                    plain = part.replace("`", "").replace("*", "").replace("_", "")
+                    await update.message.reply_text(plain)
+
+        except Exception as e:
+            logger.error("Overall P&L error: %s", e, exc_info=True)
+            await update.message.reply_text(f"❌ Overall P&L error: {e}")
+
     async def _cmd_balance(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not await self._guard(update):
             return
-        b     = self._api.get_balance("USD") if self._api else {}
-        avail = b.get("available", 0)
+        b      = self._api.get_balance("USD") if self._api else {}
+        avail  = b.get("available", 0)
         locked = b.get("locked", 0)
         total  = avail + locked
         await update.message.reply_text(
-            f"💳 *Balance*  ⏱ `{_utc_now()}`\n\n"
+            f"💳 *Balance*  ⏱ `{_ist_now()}`\n\n"
             f"Available: `${avail:.2f}`\n"
             f"Locked:    `${locked:.2f}`\n"
             f"Total:     `${total:.2f}`",
@@ -1393,7 +1743,7 @@ class TelegramBot:
 
         side_icon = "🟢" if p.get("side") == "long" else "🔴"
         await update.message.reply_text(
-            f"{side_icon} *Open Position*  ⏱ `{_utc_now()}`\n"
+            f"{side_icon} *Open Position*  ⏱ `{_ist_now()}`\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"Side:     `{p['side'].upper()}`\n"
             f"Size:     `{size}` contracts\n"
@@ -1413,7 +1763,7 @@ class TelegramBot:
         ob   = self._data.get_orderbook() if self._data else {}
         bids = ob.get("bids", [])[:5]
         asks = ob.get("asks", [])[:5]
-        lines = [f"📗 *Orderbook (Top 5)*  ⏱ `{_utc_now()}`\n```"]
+        lines = [f"📗 *Orderbook (Top 5)*  ⏱ `{_ist_now()}`\n```"]
         for a in reversed(asks):
             try:
                 lines.append(f"  ASK ${float(a[0]):>10,.1f}  {int(float(a[1])):>8,}")
@@ -1453,7 +1803,7 @@ class TelegramBot:
         self._strategy.start()
         price = self._data.get_last_price() if self._data else 0
         await update.message.reply_text(
-            f"⚡ *Strategy STARTED*  ⏱ `{_utc_now()}`\n"
+            f"⚡ *Strategy STARTED*  ⏱ `{_ist_now()}`\n"
             f"Price: `${price:,.1f}`\n"
             f"_Scanning for signals on next bar close._",
             parse_mode="Markdown",
@@ -1476,7 +1826,7 @@ class TelegramBot:
             if pos.get("in_position") else "\nNo open positions."
         )
         await update.message.reply_text(
-            f"⏸ *Strategy STOPPED*  ⏱ `{_utc_now()}`\n"
+            f"⏸ *Strategy STOPPED*  ⏱ `{_ist_now()}`\n"
             f"No new entries will be placed.{pos_note}",
             parse_mode="Markdown",
         )
@@ -1495,7 +1845,7 @@ class TelegramBot:
             result = self._orders.emergency_flatten()
             actions += result.get("actions", [])
         await update.message.reply_text(
-            f"⛔ *EMERGENCY HALT*  ⏱ `{_utc_now()}`\n\n"
+            f"⛔ *EMERGENCY HALT*  ⏱ `{_ist_now()}`\n\n"
             "Actions taken:\n" +
             "\n".join(f"• {a}" for a in actions) +
             "\n\n_Use /resume then /start\\_trading to re-enable._",
@@ -1511,7 +1861,7 @@ class TelegramBot:
         was = self._risk.resume()
         rs  = self._risk.get_status()
         await update.message.reply_text(
-            f"✅ *Risk resumed*  ⏱ `{_utc_now()}`\n"
+            f"✅ *Risk resumed*  ⏱ `{_ist_now()}`\n"
             f"Was halted: `{was or 'none'}`\n"
             f"Consecutive losses → `0`\n"
             f"Daily PnL: `${rs.get('daily_pnl', 0):+.4f}`  │  "
@@ -1536,7 +1886,7 @@ class TelegramBot:
             if pos.get("in_position") else "\nNo open position."
         )
         await update.message.reply_text(
-            f"🔄 *Risk lockout cleared*  ⏱ `{_utc_now()}`\n"
+            f"🔄 *Risk lockout cleared*  ⏱ `{_ist_now()}`\n"
             f"Was: `{was or 'none'}`  →  Consecutive losses: `0`\n"
             f"Daily trades: `{rs.get('trades_today', 0)}`  │  "
             f"Daily PnL: `${rs.get('daily_pnl', 0):+.4f}`"
@@ -1554,7 +1904,7 @@ class TelegramBot:
         result  = self._orders.emergency_flatten()
         actions = result.get("actions", [])
         await update.message.reply_text(
-            f"🔨 *Flatten complete*  ⏱ `{_utc_now()}`\n" +
+            f"🔨 *Flatten complete*  ⏱ `{_ist_now()}`\n" +
             ("\n".join(f"• {a}" for a in actions)
              if actions else "• No open orders/positions"),
             parse_mode="Markdown",
@@ -1575,7 +1925,7 @@ class TelegramBot:
         )
         if result.get("success"):
             await update.message.reply_text(
-                f"✅ *Position closed*  ⏱ `{_utc_now()}`\n"
+                f"✅ *Position closed*  ⏱ `{_ist_now()}`\n"
                 f"PnL: `${result.get('pnl_usd', 0):+.4f}`",
                 parse_mode="Markdown",
             )
@@ -1661,7 +2011,7 @@ class TelegramBot:
     async def _cmd_params(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not await self._guard(update):
             return
-        lines = [f"⚙️ *All Tunable Parameters*  ⏱ `{_utc_now()}`\n"]
+        lines = [f"⚙️ *All Tunable Parameters*  ⏱ `{_ist_now()}`\n"]
         if self._engine:
             lines.append("*Engine:*")
             for k, v in self._engine.get_params().items():
@@ -1920,7 +2270,7 @@ class TelegramBot:
                     except Exception:
                         pass
             await update.message.reply_text(
-                f"📊 *Current Leverage*  ⏱ `{_utc_now()}`\n\n"
+                f"📊 *Current Leverage*  ⏱ `{_ist_now()}`\n\n"
                 f"Exchange:    `{exch_lev}x`\n"
                 f"RiskManager: `{risk_lev}x`\n"
                 f"Config:      `{cfg_lev}x`\n\n"
