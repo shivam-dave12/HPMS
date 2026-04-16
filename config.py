@@ -105,7 +105,7 @@ HPMS_TRAJECTORY_LOG_DEPTH = 20
 #   horizon — those trades have no directional conviction and statistically break
 #   even at best after fees.
 #
-SIGNAL_DELTA_Q_THRESHOLD  = 0.0008   # ↑ was 0.0006 — higher floor for delta_q
+SIGNAL_DELTA_Q_THRESHOLD  = 0.0010   # ↑ was 0.0008 — higher floor for delta_q
 SIGNAL_DH_DT_MAX          = 0.06     # ↓ was 0.08 — tighter energy stability ref
 SIGNAL_H_PERCENTILE       = 99.5     # keep — blocks top 0.5% chaos states
 SIGNAL_MIN_MOMENTUM       = 0.0001   # ↑ was 0.00005 — filter flat-horizon signals
@@ -295,7 +295,7 @@ TRADE_CONTRACT_VALUE      = 0.001   # 0.001 BTC per contract (Delta BTCUSD perpe
 #
 RISK_MAX_POSITION_USD       = 500.0   # keep — notional cap per trade
 RISK_MAX_POSITION_CONTRACTS = 100     # keep
-RISK_LEVERAGE               = 50      # KEEP
+RISK_LEVERAGE               = 25      # KEEP
 RISK_MAX_DAILY_LOSS_USD     = 150.0   # ↓ was 200.0 — tighter daily breaker
 RISK_MAX_DAILY_TRADES       = 50      # ↓ was 100 — quality over quantity
 RISK_MAX_CONSECUTIVE_LOSSES = 5       # keep — halt after 5 consecutive losses
